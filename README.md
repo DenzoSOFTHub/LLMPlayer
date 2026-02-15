@@ -1,233 +1,245 @@
 # LLMPlayer
 
-Motore di inferenza LLM in puro Java per eseguire modelli GGUF in locale. Zero dipendenze esterne — utilizza solo il JDK. Supporta le architetture Llama, Qwen2, Qwen3, DeepSeek2 e GLM4 con formati quantizzati (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, BF16, F16, F32).
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, BF16, F16, F32).
 
-## Requisiti
+## Requirements
 
-- **Java 8** — funzionalita' base (niente SIMD, niente GPU)
-- **Java 21+** — aggiunge SIMD (Vector API), memory mapping ottimizzato (Panama FFI), accelerazione GPU (OpenCL)
-- **Java 25** — aggiunge parallelismo avanzato (StructuredTaskScope, virtual thread matmul)
-- **Maven 3.x** — per la compilazione
-- **Driver OpenCL** — solo se si vuole usare la GPU (es. `libOpenCL.so` su Linux)
+- **Java 8** — base functionality (no SIMD, no GPU)
+- **Java 21+** — adds SIMD (Vector API), optimized memory mapping (Panama FFI), GPU acceleration (OpenCL)
+- **Java 25** — adds advanced parallelism (StructuredTaskScope, virtual thread matmul)
+- **Maven 3.x** — for building
+- **OpenCL drivers** — only needed for GPU usage (e.g. `libOpenCL.so` on Linux)
 
-## Compilazione
+## Building
 
-Il progetto ha tre profili Maven che includono set diversi di sorgenti:
+The project has three Maven profiles that include different source sets:
 
 ```bash
-# Profilo java25 (default) — include tutto: java/ + java21/ + java25/
+# java25 profile (default) — includes everything: java/ + java21/ + java25/
 mvn clean compile
 
-# Profilo java21 — include java/ + java21/ (no StructuredTaskScope, no virtual thread matmul)
+# java21 profile — includes java/ + java21/ (no StructuredTaskScope, no virtual thread matmul)
 mvn clean compile -Pjava21
 
-# Profilo java8 — include solo java/ (no Vector API, no Panama FFI, no GPU)
+# java8 profile — includes only java/ (no Vector API, no Panama FFI, no GPU)
 mvn clean compile -Pjava8
 ```
 
-## Esecuzione
+## Running
 
-### Con Java 8
+### With Java 8
 
-Dopo aver compilato con `-Pjava8`:
+After building with `-Pjava8`:
 
 ```bash
-java -cp target/classes it.denzosoft.llmplayer.LLMPlayer [opzioni]
+java -cp target/classes it.denzosoft.llmplayer.LLMPlayer [options]
 ```
 
-Nessun flag JVM aggiuntivo necessario. Non sono disponibili l'accelerazione SIMD, la GPU e le ottimizzazioni di memory mapping — il sistema usa `MappedByteBuffer` e operazioni scalari come fallback.
+No additional JVM flags needed. SIMD acceleration, GPU, and optimized memory mapping are not available — the system uses `MappedByteBuffer` and scalar operations as fallback.
 
-### Con Java 21+
+### With Java 21+
 
-Dopo aver compilato con `-Pjava21`:
+After building with `-Pjava21`:
 
 ```bash
 java --add-modules jdk.incubator.vector \
      --enable-native-access=ALL-UNNAMED \
      -cp target/classes \
-     it.denzosoft.llmplayer.LLMPlayer [opzioni]
+     it.denzosoft.llmplayer.LLMPlayer [options]
 ```
 
-I tre flag JVM sono obbligatori:
-- `--add-modules jdk.incubator.vector` — abilita la Vector API per le operazioni SIMD sui tensori
-- `--enable-native-access=ALL-UNNAMED` — abilita Panama FFI per il memory mapping e i binding OpenCL
+The JVM flags are mandatory:
+- `--add-modules jdk.incubator.vector` — enables the Vector API for SIMD tensor operations
+- `--enable-native-access=ALL-UNNAMED` — enables Panama FFI for memory mapping and OpenCL bindings
 
-### Con Java 25
+### With Java 25
 
-Dopo aver compilato con il profilo default:
+After building with the default profile:
 
 ```bash
 java --add-modules jdk.incubator.vector \
      --enable-native-access=ALL-UNNAMED \
      --enable-preview \
      -cp target/classes \
-     it.denzosoft.llmplayer.LLMPlayer [opzioni]
+     it.denzosoft.llmplayer.LLMPlayer [options]
 ```
 
-Il flag `--enable-preview` abilita `StructuredTaskScope` per la generazione batch parallela e i virtual thread per il matmul multi-thread.
+The `--enable-preview` flag enables `StructuredTaskScope` for parallel batch generation and virtual threads for multi-threaded matmul.
 
-### Script di avvio (Java 25)
+### Launch scripts (Java 25)
 
-Per comodita', sono disponibili script pre-configurati con tutti i flag:
+Pre-configured scripts with all required flags are available:
 
 ```bash
 # Linux / macOS
-./run.sh [opzioni]
+./run.sh [options]
 
 # Windows
-run.bat [opzioni]
+run.bat [options]
 ```
 
-## Modalita' di utilizzo
+## Usage Modes
 
-### GUI Desktop (default)
+### Desktop GUI (default)
 
-Lanciare senza argomenti per aprire l'interfaccia Swing:
+Launch without arguments to open the Swing interface:
 
 ```bash
 ./run.sh
 ```
 
-La GUI permette di:
-- Selezionare un modello GGUF dalla directory (default: `gguf/`)
-- Configurare temperatura, top-k, top-p, repetition penalty, contesto e max token
-- Chat interattiva con streaming token-by-token
-- Monitoraggio in tempo reale di CPU e RAM
-- Avviare/fermare il web server integrato
+The GUI allows you to:
+- Select a GGUF model from a directory (default: `gguf/`)
+- Configure temperature, top-k, top-p, repetition penalty, context length and max tokens
+- Interactive chat with token-by-token streaming
+- Real-time CPU and RAM monitoring
+- Start/stop the integrated web server
 
-### CLI — Prompt singolo
-
-```bash
-./run.sh --model percorso/modello.gguf --prompt "Spiega cos'e' l'intelligenza artificiale" --max-tokens 512
-```
-
-L'output viene stampato in streaming token per token. Al termine vengono mostrate le statistiche (token generati, velocita', tempo).
-
-### CLI — Chat interattiva
+### CLI — Single prompt
 
 ```bash
-./run.sh --model percorso/modello.gguf --interactive
+./run.sh --model path/to/model.gguf --prompt "Explain what artificial intelligence is" --max-tokens 512
 ```
 
-Digitare i messaggi e premere Invio. Comandi speciali: `quit` o `exit` per uscire, `info` per i dettagli del modello.
+Output is printed as a token-by-token stream. Statistics (tokens generated, speed, time) are shown at the end.
+
+### CLI — Interactive chat
+
+```bash
+./run.sh --model path/to/model.gguf --interactive
+```
+
+Type your messages and press Enter. Special commands: `quit` or `exit` to leave, `info` for model details.
 
 ### Web UI
 
 ```bash
-./run.sh --web --port 8080 --gguf-dir ./modelli
+./run.sh --web --port 8080 --gguf-dir ./models
 ```
 
-Apre un server HTTP su `http://localhost:8080` con un'interfaccia web e API REST. La porta e' configurabile (default: 8080).
+Starts an HTTP server at `http://localhost:8080` with a web interface and REST API. The port is configurable (default: 8080).
 
-### Informazioni modello
+### Model info
 
 ```bash
-./run.sh --model percorso/modello.gguf --info
+./run.sh --model path/to/model.gguf --info
 ```
 
-Stampa i metadati del modello (architettura, layer, dimensioni, vocabolario) e termina.
+Prints model metadata (architecture, layers, dimensions, vocabulary) and exits.
 
-## Accelerazione GPU (OpenCL)
+## GPU Acceleration (OpenCL)
 
-Richiede Java 21+ e driver OpenCL installati.
+Requires Java 21+ and installed OpenCL drivers.
 
-### Elencare i dispositivi disponibili
+### List available devices
 
 ```bash
 ./run.sh --gpu-list
 ```
 
-Mostra tutti i dispositivi OpenCL rilevati (GPU, CPU OpenCL, acceleratori) con nome e memoria. Se non vengono trovati dispositivi, verificare che i driver OpenCL siano installati (`libOpenCL.so` su Linux, driver GPU del produttore su Windows/macOS).
+Shows all detected OpenCL devices (GPUs, OpenCL CPUs, accelerators) with name and memory. If no devices are found, verify that OpenCL drivers are installed (`libOpenCL.so` on Linux, vendor GPU drivers on Windows/macOS).
 
-### Abilitare la GPU
+### Enable GPU
 
 ```bash
-# Usa il primo dispositivo GPU (device 0)
-./run.sh --model modello.gguf --gpu --prompt "Ciao" --max-tokens 256
+# Use the first GPU device (device 0)
+./run.sh --model model.gguf --gpu --prompt "Hello" --max-tokens 256
 
-# Usa un dispositivo specifico
-./run.sh --model modello.gguf --gpu-device 1 --prompt "Ciao" --max-tokens 256
+# Use a specific device
+./run.sh --model model.gguf --gpu-device 1 --prompt "Hello" --max-tokens 256
 ```
 
-Il flag `--gpu-device N` seleziona il dispositivo per indice (come mostrato da `--gpu-list`) e abilita automaticamente la GPU. Il flag `--gpu` da solo usa il device 0.
+The `--gpu-device N` flag selects a device by index (as shown by `--gpu-list`) and automatically enables the GPU. The `--gpu` flag alone uses device 0.
 
-### Come funziona
+### How it works
 
-Quando la GPU e' abilitata, il sistema:
-1. Inizializza un contesto OpenCL sul dispositivo selezionato
-2. Registra un `GpuBufferManager` globale nel `TensorFactory`
-3. Per ogni tensore creato durante il caricamento del modello, tenta prima la variante GPU (es. `Q4_KGpuTensor`), poi ricade sulla variante CPU se non disponibile
-4. Le operazioni pesanti (matmul, RMSNorm, softmax, SiLU, ecc.) vengono eseguite tramite kernel OpenCL compilati on-demand
+When GPU is enabled, the system:
+1. Initializes an OpenCL context on the selected device
+2. Registers a global `GpuBufferManager` in `TensorFactory`
+3. For each tensor created during model loading, attempts the GPU variant first (e.g. `Q4_KGpuTensor`), then falls back to the CPU variant if unavailable
+4. Compute-heavy operations (matmul, RMSNorm, softmax, SiLU, etc.) are executed via OpenCL kernels compiled on-demand
 
-I formati quantizzati supportati su GPU sono: F32, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0. Gli altri formati ricadono automaticamente sulla CPU.
+GPU-supported quantized formats: F32, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0. Other formats automatically fall back to CPU.
 
-Se Java e' < 21 o i driver OpenCL non sono presenti, il sistema stampa un avviso e prosegue in modalita' solo CPU.
+If Java is < 21 or OpenCL drivers are not present, the system prints a warning and continues in CPU-only mode.
 
-## Cosa cambia tra i profili Java
+### MoE-optimized GPU placement
 
-| Funzionalita' | Java 8 | Java 21 | Java 25 |
+For MoE architectures (Qwen3MoE, DeepSeek2) with `--gpu-layers -1` (auto-detect, the default), the system uses an optimized placement strategy inspired by KTransformers (SOSP'25):
+
+- **Attention tensors** go on GPU across **all** layers
+- **Expert tensors** (`ffn_*_exps`, ~80-90% of layer weight) stay on CPU
+- **Router and shared expert tensors** go on GPU (small)
+
+This maximizes GPU utilization because expert tensors are large but only top-K are activated per token, while attention is compute-bound and benefits from GPU acceleration on every token. With 6 GB VRAM, standard first-N-layers fits only ~2/48 layers for Qwen3-Coder-30B, while MoE-optimized fits 100% of attention using just ~540 MB.
+
+Explicit `--gpu-layers N` always uses first-N-layers to preserve backward compatibility.
+
+## Java Profile Feature Comparison
+
+| Feature | Java 8 | Java 21 | Java 25 |
 |---|:---:|:---:|:---:|
-| Inferenza base (tutte le architetture) | Si | Si | Si |
-| GUI Desktop (Swing) | Si | Si | Si |
-| Web Server | Si | Si | Si |
-| Tutti i formati di quantizzazione (CPU) | Si | Si | Si |
-| Operazioni tensore SIMD (Vector API) | No | Si | Si |
-| Memory mapping ottimizzato (Panama FFI) | No | Si | Si |
-| Accelerazione GPU (OpenCL) | No | Si | Si |
-| Virtual thread matmul | No | No | Si |
-| Generazione batch parallela (StructuredTaskScope) | No | No | Si |
+| Base inference (all architectures) | Yes | Yes | Yes |
+| Desktop GUI (Swing) | Yes | Yes | Yes |
+| Web Server | Yes | Yes | Yes |
+| All quantization formats (CPU) | Yes | Yes | Yes |
+| SIMD tensor operations (Vector API) | No | Yes | Yes |
+| Optimized memory mapping (Panama FFI) | No | Yes | Yes |
+| GPU acceleration (OpenCL) | No | Yes | Yes |
+| Virtual thread matmul | No | No | Yes |
+| Parallel batch generation (StructuredTaskScope) | No | No | Yes |
 
-Il degradamento e' automatico: le classi Java 21/25 vengono caricate via riflessione (`Class.forName`). Se non sono disponibili, il sistema usa i fallback Java 8 (operazioni scalari, `MappedByteBuffer`, thread pool standard) senza errori.
+Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.forName`). If unavailable, the system uses Java 8 fallbacks (scalar operations, `MappedByteBuffer`, standard thread pool) without errors.
 
-## Opzioni CLI
+## CLI Options
 
-| Opzione | Alias | Tipo | Default | Descrizione |
+| Option | Alias | Type | Default | Description |
 |---|---|---|---|---|
-| `--model` | `-m` | String | — | Percorso del file GGUF |
-| `--prompt` | `-p` | String | — | Prompt per generazione singola |
-| `--interactive` | `-i` | Flag | false | Modalita' chat interattiva |
-| `--max-tokens` | `-n` | Intero | 256 | Numero massimo di token da generare |
-| `--temperature` | `-t` | Float | 0.7 | Temperatura di campionamento (0 = deterministico, >1 = piu' casuale) |
-| `--top-k` | — | Intero | 40 | Mantiene solo i K token piu' probabili |
-| `--top-p` | — | Float | 0.9 | Nucleus sampling: soglia di probabilita' cumulativa |
-| `--repetition-penalty` | — | Float | 1.1 | Penalita' per token ripetuti (>1 riduce le ripetizioni) |
-| `--seed` | — | Long | casuale | Seed per riproducibilita' |
-| `--threads` | — | Intero | num CPU | Numero di thread di lavoro |
-| `--context-length` | `-c` | Intero | 2048 | Lunghezza massima del contesto (token) |
-| `--info` | — | Flag | false | Mostra info modello e termina |
-| `--web` | `-w` | Flag | false | Avvia il server web |
-| `--port` | — | Intero | 8080 | Porta del server web |
-| `--gguf-dir` | — | String | `gguf` | Directory dei file GGUF |
-| `--gpu` | — | Flag | false | Abilita accelerazione GPU |
-| `--gpu-device` | — | Intero | 0 | Indice del dispositivo GPU |
-| `--gpu-list` | — | Flag | false | Elenca i dispositivi GPU e termina |
-| `--help` | `-h` | Flag | false | Mostra l'aiuto |
+| `--model` | `-m` | String | — | Path to the GGUF file |
+| `--prompt` | `-p` | String | — | Prompt for single generation |
+| `--interactive` | `-i` | Flag | false | Interactive chat mode |
+| `--max-tokens` | `-n` | Integer | 256 | Maximum number of tokens to generate |
+| `--temperature` | `-t` | Float | 0.7 | Sampling temperature (0 = deterministic, >1 = more random) |
+| `--top-k` | — | Integer | 40 | Keep only the K most probable tokens |
+| `--top-p` | — | Float | 0.9 | Nucleus sampling: cumulative probability threshold |
+| `--repetition-penalty` | — | Float | 1.1 | Penalty for repeated tokens (>1 reduces repetition) |
+| `--seed` | — | Long | random | Seed for reproducibility |
+| `--threads` | — | Integer | num CPUs | Number of worker threads |
+| `--context-length` | `-c` | Integer | 2048 | Maximum context length (tokens) |
+| `--info` | — | Flag | false | Show model info and exit |
+| `--web` | `-w` | Flag | false | Start the web server |
+| `--port` | — | Integer | 8080 | Web server port |
+| `--gguf-dir` | — | String | `gguf` | GGUF file directory |
+| `--gpu` | — | Flag | false | Enable GPU acceleration |
+| `--gpu-device` | — | Integer | 0 | GPU device index |
+| `--gpu-list` | — | Flag | false | List GPU devices and exit |
+| `--help` | `-h` | Flag | false | Show help |
 
-## API REST (modalita' web)
+## REST API (web mode)
 
-Quando si avvia con `--web`, il server espone le seguenti API:
+When started with `--web`, the server exposes the following APIs:
 
-### Modelli
+### Models
 
-| Endpoint | Metodo | Descrizione |
+| Endpoint | Method | Description |
 |---|---|---|
-| `/api/models` | GET | Elenco dei file GGUF nella directory |
-| `/api/models/load` | POST | Carica un modello: `{"path": "...", "contextLength": 2048}` |
-| `/api/models/unload` | POST | Scarica il modello corrente |
-| `/api/models/info` | GET | Metadati del modello caricato |
+| `/api/models` | GET | List GGUF files in the directory |
+| `/api/models/load` | POST | Load a model: `{"path": "...", "contextLength": 2048}` |
+| `/api/models/unload` | POST | Unload the current model |
+| `/api/models/info` | GET | Loaded model metadata (includes `gpuLayers`, `gpuDeviceName`, `moeOptimizedGpu`) |
 
 ### Chat
 
-| Endpoint | Metodo | Descrizione |
+| Endpoint | Method | Description |
 |---|---|---|
-| `/api/chat` | POST | Generazione con streaming (Server-Sent Events) |
-| `/api/chat/stop` | POST | Interrompe la generazione in corso |
+| `/api/chat` | POST | Generation with streaming (Server-Sent Events) |
+| `/api/chat/stop` | POST | Stop the current generation |
 
-Richiesta `/api/chat`:
+`/api/chat` request:
 ```json
 {
-  "prompt": "Il tuo messaggio",
-  "systemMessage": "Messaggio di sistema opzionale",
+  "prompt": "Your message",
+  "systemMessage": "Optional system message",
   "temperature": 0.7,
   "maxTokens": 256,
   "topK": 40,
@@ -236,23 +248,23 @@ Richiesta `/api/chat`:
 }
 ```
 
-La risposta e' uno stream SSE:
+Response is an SSE stream:
 ```
-data: {"token": "ciao", "done": false}
-data: {"token": " mondo", "done": false}
+data: {"token": "hello", "done": false}
+data: {"token": " world", "done": false}
 data: {"done": true, "stats": {"tokenCount": 10, "promptTokenCount": 5, "tokensPerSecond": 25.5, "timeMs": 392}}
 ```
 
-## API Java
+## Java API
 
 ```java
-// Caricamento
-LLMEngine engine = LLMEngine.load(Path.of("modello.gguf"), 2048);
+// Loading
+LLMEngine engine = LLMEngine.load(Path.of("model.gguf"), 2048);
 
-// Generazione singola
+// Single generation
 GenerationResponse resp = engine.generate(
     GenerationRequest.builder()
-        .prompt("Ciao, come stai?")
+        .prompt("Hello, how are you?")
         .maxTokens(256)
         .samplerConfig(SamplerConfig.builder()
             .temperature(0.7f)
@@ -264,35 +276,54 @@ GenerationResponse resp = engine.generate(
 );
 System.out.println(resp.text());
 
-// Generazione con streaming
+// Streaming generation
 engine.generate(request, (token, id) -> {
     System.out.print(token);
-    return true;  // restituire false per interrompere
+    return true;  // return false to stop
 });
 
-// Generazione batch (usa StructuredTaskScope su Java 25, thread pool altrimenti)
-List<GenerationResponse> risposte = engine.generateBatch(listaRichieste);
+// Batch generation (uses StructuredTaskScope on Java 25, thread pool otherwise)
+List<GenerationResponse> responses = engine.generateBatch(requestList);
 
-// Caricamento con GPU
+// Loading with GPU
 GpuConfig gpu = new GpuConfig();
 gpu.setEnabled(true);
 gpu.setDeviceId(0);
-LLMEngine engineGpu = LLMEngine.load(Path.of("modello.gguf"), 2048, gpu);
+LLMEngine gpuEngine = LLMEngine.load(Path.of("model.gguf"), 2048, gpu);
 
-// Pulizia
+// Cleanup
 engine.close();
 ```
 
-`LLMEngine` e' thread-safe: i pesi del modello sono immutabili (memory-mapped) e ogni chiamata a `generate()` crea il proprio stato di inferenza.
+`LLMEngine` is thread-safe: model weights are immutable (memory-mapped) and each `generate()` call creates its own inference state.
 
-## Architetture supportate
+## Supported Architectures
 
-| Architettura | Chiave GGUF | Tokenizer | Template chat |
+| Architecture | GGUF Key | Tokenizer | Chat Template |
 |---|---|---|---|
 | Llama (1/2/3) | `llama` | BPE (gpt2) / SentencePiece | `<\|start_header_id\|>user<\|end_header_id\|>` |
 | Qwen2 | `qwen2` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
+| Qwen3 MoE | `qwen3moe` | BPE (gpt2) | `<\|im_start\|>user` |
 | DeepSeek2 | `deepseek2` | BPE (gpt2) | `User: ... Assistant:` |
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
+| Phi-3/4 | `phi3` | BPE (gpt2) | `<\|user\|>` |
+| Mistral3/Devstral | `mistral3` | SentencePiece | `[INST]` |
 
-L'architettura viene rilevata automaticamente dal campo `general.architecture` nei metadati GGUF.
+The architecture is automatically detected from the `general.architecture` field in GGUF metadata.
+
+## Benchmarks
+
+### MoE-optimized GPU placement
+
+Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM), Java 25, SimdVectorOps.
+
+| Model | Type | GPU Strategy | Layers on GPU | VRAM Used | tok/s | Quality |
+|-------|------|--------------|---------------|-----------|-------|---------|
+| Qwen3-Coder-30B-A3B Q4_K_M | MoE (128 experts, top-8) | MoE-optimized | 48/48 attn | 540 MB | 1.7 | Perplexity 0.98, Coherence 0.99 |
+| DeepSeek-Coder-V2-Lite Q4_K_M | MoE (64 experts, top-6+2shared) | MoE-optimized | 27/27 attn | 517 MB | 2.1 | Perplexity 0.85, Coherence 1.00 |
+| Llama-3.2-3B Q3_K_L | Dense | Full offload | 28/28 all | 1731 MB | 5.9 | Perplexity 0.96, Coherence 0.95 |
+
+Test: `--prompt "Write a Java class that calculates factorial" --max-tokens 40 --context-length 256 --gpu --gpu-device 1`.
+
+Key takeaway: MoE-optimized placement puts 100% of attention on GPU using only ~540 MB VRAM for a 17.3 GB model. With standard first-N-layers, only ~2/48 layers would fit in 6 GB VRAM for Qwen3-Coder-30B.
