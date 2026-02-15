@@ -1,0 +1,27 @@
+# Build output
+target/
+
+# Model files
+gguf/
+*.gguf
+
+# IDE
+.idea/
+*.iml
+.vscode/
+nbactions.xml
+nb-configuration.xml
+
+# Shell scripts
+*.sh
+*.bat
+
+# Test result logs
+test-results-*.md
+
+# Claude Code local settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
