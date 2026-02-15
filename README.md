@@ -68,15 +68,29 @@ The `--enable-preview` flag enables `StructuredTaskScope` for parallel batch gen
 
 ### Launch scripts (Java 25)
 
-Pre-configured scripts with all required flags are available:
+These scripts are not included in the repository (excluded via `.gitignore`). Create them locally after cloning:
 
+**`run.sh`** (Linux / macOS):
 ```bash
-# Linux / macOS
-./run.sh [options]
-
-# Windows
-run.bat [options]
+#!/bin/bash
+# LLMPlayer launcher - includes all required JVM flags
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec java \
+  --add-modules jdk.incubator.vector \
+  --enable-native-access=ALL-UNNAMED \
+  --enable-preview \
+  -cp "$DIR/target/classes" \
+  it.denzosoft.llmplayer.LLMPlayer "$@"
 ```
+
+**`run.bat`** (Windows):
+```batch
+@echo off
+REM LLMPlayer launcher - includes all required JVM flags
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --enable-preview -cp "%~dp0target\classes" it.denzosoft.llmplayer.LLMPlayer %*
+```
+
+After creating, make the shell script executable: `chmod +x run.sh`
 
 ## Usage Modes
 
