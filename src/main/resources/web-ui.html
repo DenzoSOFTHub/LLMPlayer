@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLMPlayer</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg-base: #1e1e2e;
+    --bg-sidebar: #181825;
+    --bg-surface: #313244;
+    --bg-input: #45475a;
+    --text-primary: #cdd6f4;
+    --text-secondary: #a6adc8;
+    --text-muted: #6c7086;
+    --accent: #89b4fa;
+    --accent-hover: #74c7ec;
+    --green: #a6e3a1;
+    --red: #f38ba8;
+    --yellow: #f9e2af;
+    --border: #45475a;
+    --user-bubble: #45475a;
+    --assistant-bubble: #313244;
+    --radius: 8px;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+}
+
+/* Sidebar */
+.sidebar {
+    width: 300px;
+    min-width: 300px;
+    background: var(--bg-sidebar);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 16px;
+    overflow-y: auto;
+}
+
+.sidebar h1 {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sidebar h1 .version {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+    margin-bottom: 4px;
+}
+
+select, input[type="number"], input[type="text"], textarea {
+    width: 100%;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+select:focus, input:focus, textarea:focus {
+    border-color: var(--accent);
+}
+
+textarea {
+    resize: vertical;
+    min-height: 60px;
+    font-family: inherit;
+}
+
+.btn-row {
+    display: flex;
+    gap: 8px;
+}
+
+button {
+    background: var(--accent);
+    color: #1e1e2e;
+    border: none;
+    border-radius: var(--radius);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+}
+
+button:hover { background: var(--accent-hover); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+button.btn-secondary {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+}
+button.btn-secondary:hover { background: var(--bg-input); }
+
+button.btn-danger {
+    background: var(--red);
+    color: #1e1e2e;
+}
+
+.model-info {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.model-info .label {
+    color: var(--text-muted);
+}
+
+.model-info .value {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.param-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+.param-row label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.param-row input {
+    width: 80px;
+    text-align: right;
+}
+
+.status-indicator {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+}
+
+.status-indicator.disconnected { background: var(--text-muted); }
+.status-indicator.ready { background: var(--green); }
+.status-indicator.loading { background: var(--yellow); animation: pulse 1s infinite; }
+.status-indicator.generating { background: var(--accent); animation: pulse 0.5s infinite; }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* Chat area */
+.chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.message {
+    max-width: 85%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.6;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.message.user {
+    align-self: flex-end;
+    background: var(--user-bubble);
+    border-bottom-right-radius: 4px;
+}
+
+.message.assistant {
+    align-self: flex-start;
+    background: var(--assistant-bubble);
+    border-bottom-left-radius: 4px;
+}
+
+.message .role-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.message.user .role-label { color: var(--accent); }
+.message.assistant .role-label { color: var(--green); }
+
+.message .content { white-space: pre-wrap; }
+
+.message .content code {
+    background: rgba(0,0,0,0.3);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 13px;
+}
+
+.message .content pre {
+    background: rgba(0,0,0,0.4);
+    padding: 10px 14px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.message .content pre code {
+    background: none;
+    padding: 0;
+}
+
+.message .stats {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+}
+
+.welcome-msg {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    color: var(--text-muted);
+    text-align: center;
+    gap: 8px;
+    padding: 40px;
+}
+
+.welcome-msg h2 {
+    color: var(--text-secondary);
+    font-size: 22px;
+}
+
+.welcome-msg p { font-size: 14px; }
+
+/* Input area */
+.input-area {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+}
+
+.input-area textarea {
+    flex: 1;
+    min-height: 44px;
+    max-height: 120px;
+    padding: 10px 14px;
+    font-size: 14px;
+    border-radius: 12px;
+}
+
+.input-area button {
+    height: 44px;
+    min-width: 70px;
+    border-radius: 12px;
+}
+
+.input-area button.stop-btn {
+    background: var(--red);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Loading spinner */
+.spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+    <h1>LLMPlayer <span class="version">v1.0</span></h1>
+
+    <div>
+        <div class="section-title">Model</div>
+        <select id="modelSelect" title="Select a GGUF model">
+            <option value="">-- Select model --</option>
+        </select>
+    </div>
+
+    <div class="btn-row">
+        <button id="loadBtn" onclick="loadModel()">Load</button>
+        <button id="unloadBtn" class="btn-secondary" onclick="unloadModel()" disabled>Unload</button>
+    </div>
+
+    <div id="statusBar" style="font-size:12px;">
+        <span class="status-indicator disconnected" id="statusDot"></span>
+        <span id="statusText">No model loaded</span>
+    </div>
+
+    <div id="modelInfoSection" style="display:none;">
+        <div class="section-title">Model Info</div>
+        <div class="model-info" id="modelInfoContent"></div>
+    </div>
+
+    <div>
+        <div class="section-title">Settings</div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+            <div class="param-row">
+                <label>Temperature</label>
+                <input type="number" id="temperature" value="0.7" step="0.1" min="0" max="2">
+            </div>
+            <div class="param-row">
+                <label>Max Tokens</label>
+                <input type="number" id="maxTokens" value="256" step="32" min="1" max="4096">
+            </div>
+            <div class="param-row">
+                <label>Top-K</label>
+                <input type="number" id="topK" value="40" step="1" min="1" max="200">
+            </div>
+            <div class="param-row">
+                <label>Top-P</label>
+                <input type="number" id="topP" value="0.9" step="0.05" min="0" max="1">
+            </div>
+            <div class="param-row">
+                <label>Rep. Penalty</label>
+                <input type="number" id="repPenalty" value="1.1" step="0.05" min="1" max="2">
+            </div>
+            <div class="param-row">
+                <label>Context Length</label>
+                <input type="number" id="contextLength" value="2048" step="256" min="512" max="8192">
+            </div>
+        </div>
+    </div>
+
+    <div>
+        <div class="section-title">GPU</div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+            <label style="font-size:12px; color:var(--text-secondary); display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="gpuEnabled"> Enable GPU
+            </label>
+            <div class="param-row">
+                <label>Device</label>
+                <select id="gpuDevice" style="width:140px;" disabled>
+                    <option value="">Loading...</option>
+                </select>
+            </div>
+            <div class="param-row">
+                <label>GPU Layers</label>
+                <input type="number" id="gpuLayers" value="-1" min="-1" max="999" step="1" disabled
+                    title="-1 = Auto, 0 = All layers, N = first N layers on GPU">
+            </div>
+        </div>
+    </div>
+
+    <div>
+        <div class="section-title">System Message</div>
+        <textarea id="systemMessage" placeholder="You are a helpful assistant..."></textarea>
+    </div>
+
+    <div style="margin-top:auto; font-size:11px; color:var(--text-muted);">
+        Pure Java LLM Inference Engine<br>
+        No external dependencies
+    </div>
+</div>
+
+<div class="chat-area">
+    <div class="messages" id="messages">
+        <div class="welcome-msg" id="welcomeMsg">
+            <h2>LLMPlayer</h2>
+            <p>Load a model from the sidebar to start chatting.</p>
+        </div>
+    </div>
+    <div class="input-area">
+        <textarea id="chatInput" placeholder="Type a message..." rows="1" disabled
+            onkeydown="handleInputKeydown(event)"></textarea>
+        <button id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+    </div>
+</div>
+
+<script>
+// State
+let modelLoaded = false;
+let isGenerating = false;
+let abortController = null;
+
+// Elements
+const modelSelect = document.getElementById('modelSelect');
+const loadBtn = document.getElementById('loadBtn');
+const unloadBtn = document.getElementById('unloadBtn');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const modelInfoSection = document.getElementById('modelInfoSection');
+const modelInfoContent = document.getElementById('modelInfoContent');
+const messagesDiv = document.getElementById('messages');
+const welcomeMsg = document.getElementById('welcomeMsg');
+const chatInput = document.getElementById('chatInput');
+const sendBtn = document.getElementById('sendBtn');
+
+const gpuEnabledCheckbox = document.getElementById('gpuEnabled');
+const gpuDeviceSelect = document.getElementById('gpuDevice');
+const gpuLayersInput = document.getElementById('gpuLayers');
+
+gpuEnabledCheckbox.addEventListener('change', function() {
+    gpuDeviceSelect.disabled = !this.checked;
+    gpuLayersInput.disabled = !this.checked;
+});
+
+// Init
+loadModelList();
+loadGpuDevices();
+
+async function loadModelList() {
+    try {
+        const res = await fetch('/api/models');
+        const models = await res.json();
+        modelSelect.innerHTML = '<option value="">-- Select model --</option>';
+        models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.path;
+            const sizeMB = (m.size / 1024 / 1024).toFixed(0);
+            opt.textContent = m.name + ' (' + sizeMB + ' MB)';
+            modelSelect.appendChild(opt);
+        });
+    } catch (e) {
+        console.error('Failed to load model list:', e);
+    }
+}
+
+async function loadGpuDevices() {
+    try {
+        const res = await fetch('/api/gpu/devices');
+        const devices = await res.json();
+        gpuDeviceSelect.innerHTML = '';
+        if (devices.length === 0) {
+            gpuDeviceSelect.innerHTML = '<option value="">No GPU devices</option>';
+            gpuEnabledCheckbox.disabled = true;
+        } else {
+            let bestIdx = 0, bestVram = 0;
+            devices.forEach(function(d, i) {
+                const opt = document.createElement('option');
+                opt.value = d.index;
+                let label = d.name || 'Device ' + d.index;
+                if (d.globalMemory) {
+                    label += ' (' + Math.round(d.globalMemory / 1024 / 1024) + ' MB)';
+                    if (d.globalMemory > bestVram) { bestVram = d.globalMemory; bestIdx = i; }
+                }
+                opt.textContent = label;
+                gpuDeviceSelect.appendChild(opt);
+            });
+            // Auto-enable GPU with best device
+            gpuEnabledCheckbox.checked = true;
+            gpuDeviceSelect.disabled = false;
+            gpuLayersInput.disabled = false;
+            gpuDeviceSelect.selectedIndex = bestIdx;
+        }
+    } catch (e) {
+        gpuDeviceSelect.innerHTML = '<option value="">GPU unavailable</option>';
+        gpuEnabledCheckbox.disabled = true;
+    }
+}
+
+async function loadModel() {
+    const path = modelSelect.value;
+    if (!path) return;
+
+    setStatus('loading', 'Analyzing hardware...');
+    loadBtn.disabled = true;
+
+    try {
+        const ctx = parseInt(document.getElementById('contextLength').value) || 2048;
+
+        // Build hardware plan and ask for confirmation
+        let planData = null;
+        try {
+            const planRes = await fetch('/api/hardware/plan', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: path, contextLength: ctx})
+            });
+            planData = await planRes.json();
+
+            const confirmMsg = planData.summary +
+                (planData.recommended ? '\n\nProceed?' : '\n\nThis is NOT recommended. Proceed anyway?');
+            if (!confirm(confirmMsg)) {
+                loadBtn.disabled = false;
+                setStatus('disconnected', 'Load cancelled');
+                return;
+            }
+        } catch (e) { /* plan failed, continue anyway */ }
+
+        setStatus('loading', 'Loading model...');
+
+        // Build load request: use plan's GPU config or user overrides
+        const loadBody = {path: path, contextLength: ctx};
+        if (gpuEnabledCheckbox.checked) {
+            loadBody.gpu = true;
+            loadBody.gpuDevice = parseInt(gpuDeviceSelect.value) || 0;
+            loadBody.gpuLayers = parseInt(gpuLayersInput.value);
+            if (isNaN(loadBody.gpuLayers)) loadBody.gpuLayers = -1;
+        } else if (planData && planData.gpuAvailable && planData.gpuLayers > 0) {
+            // Auto-configured from plan
+            loadBody.gpu = true;
+            loadBody.gpuDevice = planData.gpuDeviceId || 0;
+            loadBody.gpuLayers = planData.gpuLayers;
+        }
+
+        const res = await fetch('/api/models/load', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(loadBody)
+        });
+
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.error || 'Failed to load model');
+        }
+
+        const data = await res.json();
+        showModelInfo(data.model, data.loadTimeMs, data.gpuDevice, data.gpuLayers, data.totalLayers);
+        modelLoaded = true;
+        setStatus('ready', 'Ready');
+        unloadBtn.disabled = false;
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+        chatInput.focus();
+    } catch (e) {
+        setStatus('disconnected', 'Error: ' + e.message);
+    } finally {
+        loadBtn.disabled = false;
+    }
+}
+
+async function unloadModel() {
+    try {
+        await fetch('/api/models/unload', {method: 'POST'});
+    } catch (e) { /* ignore */ }
+
+    modelLoaded = false;
+    setStatus('disconnected', 'No model loaded');
+    unloadBtn.disabled = true;
+    chatInput.disabled = true;
+    sendBtn.disabled = true;
+    modelInfoSection.style.display = 'none';
+}
+
+function showModelInfo(info, loadTimeMs, gpuDevice, gpuLayers, totalLayers) {
+    modelInfoSection.style.display = 'block';
+    let html =
+        '<div><span class="label">Name: </span><span class="value">' + esc(info.name) + '</span></div>' +
+        '<div><span class="label">Arch: </span><span class="value">' + esc(info.architecture) + '</span></div>' +
+        '<div><span class="label">Layers: </span><span class="value">' + info.blockCount + '</span></div>' +
+        '<div><span class="label">Heads: </span><span class="value">' + info.headCount + '/' + info.headCountKV + '</span></div>' +
+        '<div><span class="label">Embedding: </span><span class="value">' + info.embeddingLength + '</span></div>' +
+        '<div><span class="label">Context: </span><span class="value">' + info.contextLength + '</span></div>' +
+        '<div><span class="label">Vocab: </span><span class="value">' + info.vocabSize.toLocaleString() + '</span></div>' +
+        (loadTimeMs ? '<div><span class="label">Load time: </span><span class="value">' + (loadTimeMs/1000).toFixed(1) + 's</span></div>' : '');
+    if (gpuDevice) {
+        html += '<div><span class="label">GPU: </span><span class="value">' + esc(gpuDevice) + '</span></div>';
+        html += '<div><span class="label">GPU Layers: </span><span class="value">' + gpuLayers + ' / ' + totalLayers + '</span></div>';
+    } else {
+        html += '<div><span class="label">GPU: </span><span class="value" style="color:var(--text-muted)">CPU only</span></div>';
+    }
+    modelInfoContent.innerHTML = html;
+}
+
+function setStatus(state, text) {
+    statusDot.className = 'status-indicator ' + state;
+    statusText.textContent = text;
+}
+
+function handleInputKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (isGenerating) return;
+        sendMessage();
+    }
+}
+
+async function sendMessage() {
+    const text = chatInput.value.trim();
+    if (!text || !modelLoaded || isGenerating) return;
+
+    // Hide welcome
+    welcomeMsg.style.display = 'none';
+
+    // Add user message
+    addMessage('user', text);
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+
+    // Prepare assistant message
+    const assistantMsg = addMessage('assistant', '');
+    const contentEl = assistantMsg.querySelector('.content');
+
+    isGenerating = true;
+    setStatus('generating', 'Generating...');
+    sendBtn.textContent = 'Stop';
+    sendBtn.classList.add('stop-btn');
+    sendBtn.onclick = stopGeneration;
+
+    const params = {
+        prompt: text,
+        temperature: parseFloat(document.getElementById('temperature').value) || 0.7,
+        maxTokens: parseInt(document.getElementById('maxTokens').value) || 256,
+        topK: parseInt(document.getElementById('topK').value) || 40,
+        topP: parseFloat(document.getElementById('topP').value) || 0.9,
+        repPenalty: parseFloat(document.getElementById('repPenalty').value) || 1.1
+    };
+
+    const sysMsg = document.getElementById('systemMessage').value.trim();
+    if (sysMsg) params.systemMessage = sysMsg;
+
+    let fullText = '';
+
+    try {
+        abortController = new AbortController();
+        const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(params),
+            signal: abortController.signal
+        });
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const {done, value} = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, {stream: true});
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const jsonStr = line.substring(6);
+                let event;
+                try { event = JSON.parse(jsonStr); } catch { continue; }
+
+                if (event.error) {
+                    contentEl.innerHTML = renderMarkdown(fullText + '\n\n[Error: ' + event.error + ']');
+                    break;
+                }
+
+                if (event.done) {
+                    if (event.stats) {
+                        const statsEl = document.createElement('div');
+                        statsEl.className = 'stats';
+                        statsEl.textContent = event.stats.tokenCount + ' tokens | ' +
+                            event.stats.tokensPerSecond + ' tok/s | ' +
+                            (event.stats.timeMs / 1000).toFixed(1) + 's' +
+                            (event.stopped ? ' (stopped)' : '');
+                        assistantMsg.appendChild(statsEl);
+                    }
+                } else if (event.token !== undefined) {
+                    fullText += event.token;
+                    contentEl.innerHTML = renderMarkdown(fullText);
+                    scrollToBottom();
+                }
+            }
+        }
+    } catch (e) {
+        if (e.name !== 'AbortError') {
+            contentEl.innerHTML = renderMarkdown(fullText + '\n\n[Error: ' + e.message + ']');
+        }
+    } finally {
+        isGenerating = false;
+        abortController = null;
+        setStatus('ready', 'Ready');
+        sendBtn.textContent = 'Send';
+        sendBtn.classList.remove('stop-btn');
+        sendBtn.onclick = sendMessage;
+
+        if (!fullText.trim()) {
+            contentEl.innerHTML = '<span style="color:var(--text-muted)">[No output]</span>';
+        }
+    }
+}
+
+async function stopGeneration() {
+    try {
+        await fetch('/api/chat/stop', {method: 'POST'});
+    } catch (e) { /* ignore */ }
+    if (abortController) {
+        abortController.abort();
+    }
+}
+
+function addMessage(role, text) {
+    const div = document.createElement('div');
+    div.className = 'message ' + role;
+    div.innerHTML =
+        '<div class="role-label">' + role + '</div>' +
+        '<div class="content">' + (text ? renderMarkdown(text) : '') + '</div>';
+    messagesDiv.appendChild(div);
+    scrollToBottom();
+    return div;
+}
+
+function scrollToBottom() {
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+// Basic markdown rendering
+function renderMarkdown(text) {
+    // Escape HTML first
+    let html = esc(text);
+
+    // Code blocks: ```lang\n...\n```
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
+        return '<pre><code>' + code + '</code></pre>';
+    });
+
+    // Inline code: `...`
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bold: **...**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic: *...*
+    html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+
+    // Bullet lists: lines starting with - or *
+    html = html.replace(/^([*\-]) (.+)$/gm, '<li>$2</li>');
+    html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+
+    // Numbered lists: lines starting with 1. 2. etc.
+    html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+
+    return html;
+}
+
+function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+// Auto-resize input
+chatInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+</script>
+</body>
+</html>
