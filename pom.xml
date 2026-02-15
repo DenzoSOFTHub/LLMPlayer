@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>it.denzosoft</groupId>
     <artifactId>LLMPlayer</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -41,6 +41,7 @@
                 <activeByDefault>true</activeByDefault>
             </activation>
             <build>
+                <finalName>${project.artifactId}-${project.version}-jvm25</finalName>
                 <plugins>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
@@ -96,6 +97,7 @@
         <profile>
             <id>java21</id>
             <build>
+                <finalName>${project.artifactId}-${project.version}-jvm21</finalName>
                 <plugins>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
@@ -138,6 +140,7 @@
         <profile>
             <id>java8</id>
             <build>
+                <finalName>${project.artifactId}-${project.version}-jvm8</finalName>
                 <plugins>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
