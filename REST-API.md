@@ -1,9 +1,10 @@
 # LLMPlayer REST API
 
-LLMPlayer exposes two groups of REST APIs when started with `--web` (default port 8080):
+LLMPlayer exposes three groups of REST APIs when started with `--web` (default port 8080):
 
 - **`/v1/*`** — OpenAI Chat Completions compatible API. Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.).
 - **`/api/*`** — LLMPlayer-specific management API for model loading, GPU configuration, and hardware diagnostics.
+- **`/api/chats/*`** — Chat persistence API with conversation branching. Used by the chat UI at `/chat`.
 
 All endpoints support CORS (`Access-Control-Allow-Origin: *`).
 
@@ -19,7 +20,7 @@ All endpoints support CORS (`Access-Control-Allow-Origin: *`).
 ./run.sh --web --port 9090
 ```
 
-The server serves the web UI at `http://localhost:8080/` and the APIs at `/v1/*` and `/api/*`. GGUF model files should be placed in the `gguf/` directory relative to the working directory.
+The server serves the model config UI at `http://localhost:8080/`, the chat UI at `http://localhost:8080/chat`, and the APIs at `/v1/*`, `/api/*`, and `/api/chats/*`. GGUF model files should be placed in the `gguf/` directory relative to the working directory.
 
 ---
 
@@ -631,11 +632,268 @@ print(response.content)
 
 ---
 
+## Chat Persistence API (`/api/chats/*`)
+
+Server-side conversation persistence with tree-based branching. Conversations are stored as JSON files in the `chats/` directory (created automatically). Used by the chat UI at `/chat`.
+
+### Data Model
+
+Each conversation is a JSON file (`chats/conv_{timestamp}.json`) with a flat message map forming a tree:
+
+```json
+{
+  "id": "conv_1708012345678",
+  "title": "Write a Java factorial class",
+  "created": 1708012345678,
+  "updated": 1708012400000,
+  "settings": {
+    "temperature": 0.7,
+    "maxTokens": 256,
+    "topK": 40,
+    "topP": 0.9,
+    "repetitionPenalty": 1.1,
+    "systemMessage": ""
+  },
+  "messages": {
+    "msg_1": {
+      "id": "msg_1",
+      "role": "user",
+      "content": "Hello",
+      "parentId": null,
+      "children": ["msg_2"],
+      "timestamp": 1708012345680
+    },
+    "msg_2": {
+      "id": "msg_2",
+      "role": "assistant",
+      "content": "Hi there!",
+      "parentId": "msg_1",
+      "children": [],
+      "timestamp": 1708012345700,
+      "stats": {"tokenCount": 45, "promptTokenCount": 12, "tokensPerSecond": 5.2, "timeMs": 8650}
+    }
+  },
+  "rootChildren": ["msg_1"],
+  "activeLeafId": "msg_2"
+}
+```
+
+**Branching:** Editing a user message or regenerating an assistant response creates a new message with the same `parentId` as the original — a sibling in the tree. The chat UI navigates between branches with arrow controls.
+
+---
+
+### GET `/api/chats`
+
+Lists all conversations, sorted by most recently updated.
+
+#### Response
+
+```json
+[
+  {
+    "id": "conv_1708012345678",
+    "title": "Write a Java factorial class",
+    "created": 1708012345678,
+    "updated": 1708012400000,
+    "messageCount": 4
+  }
+]
+```
+
+---
+
+### POST `/api/chats`
+
+Creates a new conversation.
+
+#### Request
+
+Empty body or:
+
+```json
+{
+  "title": "My Chat",
+  "settings": {
+    "temperature": 0.8,
+    "maxTokens": 512
+  }
+}
+```
+
+#### Response (201)
+
+The full conversation object (see Data Model above).
+
+---
+
+### GET `/api/chats/{id}`
+
+Returns the full conversation including the message tree.
+
+#### Response
+
+The full conversation object (see Data Model above). Returns 404 if not found.
+
+---
+
+### DELETE `/api/chats/{id}`
+
+Deletes a conversation.
+
+#### Response
+
+```json
+{
+  "status": "deleted"
+}
+```
+
+---
+
+### PUT `/api/chats/{id}/title`
+
+Renames a conversation.
+
+#### Request
+
+```json
+{
+  "title": "New title"
+}
+```
+
+#### Response
+
+The updated conversation object.
+
+---
+
+### POST `/api/chats/{id}/messages`
+
+Adds a message to a conversation.
+
+#### Request
+
+```json
+{
+  "role": "user",
+  "content": "Hello, how are you?",
+  "parentId": "msg_1",
+  "stats": {
+    "tokenCount": 45,
+    "promptTokenCount": 12,
+    "tokensPerSecond": 5.2,
+    "timeMs": 8650
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | `"user"` or `"assistant"` (required) |
+| `content` | string | Message text |
+| `parentId` | string or null | Parent message ID. `null` for root messages |
+| `stats` | object | Generation statistics (optional, for assistant messages) |
+
+The first user message auto-generates the conversation title (truncated to 50 chars).
+
+#### Response (201)
+
+```json
+{
+  "message": { "id": "msg_3", "role": "user", "content": "...", ... },
+  "conversationId": "conv_1708012345678"
+}
+```
+
+---
+
+### PUT `/api/chats/{id}/messages/{msgId}`
+
+Edits a message by creating a sibling branch. The original message is preserved.
+
+#### Request
+
+```json
+{
+  "content": "Edited message text"
+}
+```
+
+#### Response
+
+```json
+{
+  "message": { "id": "msg_4", "role": "user", "content": "Edited message text", "parentId": "msg_1", ... },
+  "conversationId": "conv_1708012345678"
+}
+```
+
+The new message has the same `parentId` as the original, making it a sibling in the tree.
+
+---
+
+### PUT `/api/chats/{id}/active-leaf`
+
+Updates the active branch leaf pointer.
+
+#### Request
+
+```json
+{
+  "activeLeafId": "msg_4"
+}
+```
+
+#### Response
+
+```json
+{
+  "activeLeafId": "msg_4"
+}
+```
+
+---
+
+### PUT `/api/chats/{id}/settings`
+
+Updates per-conversation settings.
+
+#### Request
+
+```json
+{
+  "temperature": 0.8,
+  "maxTokens": 512,
+  "systemMessage": "You are a coding assistant."
+}
+```
+
+#### Response
+
+```json
+{
+  "settings": { "temperature": 0.8, "maxTokens": 512, ... }
+}
+```
+
+---
+
+### GET `/api/chats/export/{id}`
+
+Exports a conversation as a downloadable JSON file.
+
+#### Response
+
+Returns the full conversation JSON with `Content-Disposition: attachment` header.
+
+---
+
 ## Notes
 
 - **Single model:** LLMPlayer loads one model at a time. The `model` field in requests is ignored; the server always uses the currently loaded model.
 - **Single generation:** Only one generation at a time is supported. Concurrent requests receive HTTP 429.
-- **Multi-turn conversation:** The server is stateless — the client must send the entire message history with each request.
+- **Multi-turn conversation:** The `/v1/chat/completions` API is stateless — the client must send the entire message history with each request. The chat UI at `/chat` handles this automatically using the `/api/chats/*` persistence API.
 - **BOS token:** Automatically prepended by the server for all chat template formats. Do not include it in messages.
 - **Stop sequences:** Stop sequence post-processing occurs server-side. Text is truncated when it contains a stop sequence.
 - **Supported architectures:** Llama 3, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Phi-3/4, Mistral3/Devstral. Each architecture uses its own chat template for formatting messages.

@@ -83,7 +83,7 @@ There is also a 7th reflection site in `CLIRunner.listGpuDevices()` which loads 
 | `tensor` | Tensor operations and quantization/dequantization; GPU variants in java21 |
 | `tokenizer` | BPE and SentencePiece tokenizers, chat template formatting |
 | `ui` | Swing desktop GUI |
-| `web` | Embedded HTTP server with HTML web UI, OpenAI-compatible API (`OpenAIHandler`), management API (`ApiHandler`) |
+| `web` | Embedded HTTP server with HTML web UI, OpenAI-compatible API (`OpenAIHandler`), management API (`ApiHandler`), chat persistence with branching (`ChatHandler`) |
 
 ### Key data flow
 
@@ -110,13 +110,13 @@ There is also a 7th reflection site in `CLIRunner.listGpuDevices()` which loads 
 ### Launch modes
 
 - **No args** → Swing desktop GUI (`LLMPlayerUI`)
-- **`--web`** → Embedded `com.sun.net.httpserver.HttpServer` with HTML web UI (default port 8080), OpenAI-compatible API at `/v1/*`, management API at `/api/*`
+- **`--web`** → Embedded `com.sun.net.httpserver.HttpServer` with model config UI at `/`, chat UI at `/chat`, OpenAI-compatible API at `/v1/*`, management API at `/api/*`, chat persistence API at `/api/chats/*`
 - **`--model <path>`** → CLI mode (single prompt with `--prompt` or `--interactive` chat)
 - **`--gpu-list`** → enumerate OpenCL devices and exit
 
 ### REST API (web mode)
 
-When running with `--web`, the server exposes two API groups. Full documentation in `REST-API.md`.
+When running with `--web`, the server exposes three API groups. Full documentation in `REST-API.md`.
 
 #### OpenAI-compatible API (`/v1/*`)
 
@@ -129,7 +129,7 @@ Follows the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-r
 
 Implemented in `OpenAIHandler.java`. Uses `ChatTemplate.formatConversation()` for multi-turn message formatting. Supports `messages` array with `system`/`user`/`assistant` roles, `stream`, `temperature`, `max_tokens`, `top_p`, `top_k`, `stop`, `frequency_penalty`, `repetition_penalty`. The `model` field is accepted but ignored (uses the currently loaded model). Streaming sends SSE chunks in OpenAI format (`chat.completion.chunk`) ending with `data: [DONE]`. Non-streaming returns a full `chat.completion` JSON with `choices` and `usage`.
 
-The web UI (`web-ui.html`) uses `/v1/chat/completions` for chat and `/api/*` for model management.
+The model config UI (`web-ui.html`, served at `/`) uses `/v1/chat/completions` for chat and `/api/*` for model management. The chat UI (`chat-ui.html`, served at `/chat`) uses `/v1/chat/completions` for streaming generation and `/api/chats/*` for conversation persistence.
 
 #### Management API (`/api/*`)
 
@@ -147,6 +147,25 @@ LLMPlayer-specific endpoints for model loading, GPU configuration, and diagnosti
 | `/api/memory/check` | POST | Check RAM availability for a model |
 | `/api/hardware/plan` | POST | Build optimal hardware config plan |
 
+#### Chat Persistence API (`/api/chats/*`)
+
+Server-side conversation persistence with tree-based branching. Conversations are stored as JSON files in the `chats/` directory. Implemented in `ChatHandler.java`.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/chats` | GET | List conversations (id, title, created, updated, messageCount) |
+| `/api/chats` | POST | Create new conversation |
+| `/api/chats/{id}` | GET | Get full conversation with message tree |
+| `/api/chats/{id}` | DELETE | Delete conversation |
+| `/api/chats/{id}/title` | PUT | Rename conversation |
+| `/api/chats/{id}/messages` | POST | Add message (user or assistant) |
+| `/api/chats/{id}/messages/{msgId}` | PUT | Edit message (creates sibling branch) |
+| `/api/chats/{id}/active-leaf` | PUT | Update active branch leaf |
+| `/api/chats/{id}/settings` | PUT | Update per-conversation settings |
+| `/api/chats/export/{id}` | GET | Export conversation as JSON |
+
+Messages use a flat map (`id → message`) with `parentId`/`children` references forming a tree. Editing a message creates a new sibling with the same parent, enabling conversation branching. The chat UI (`/chat`) navigates branches with arrow controls.
+
 ### Adding a new model architecture
 
 1. Add enum value to `ModelArchitecture` with its GGUF `general.architecture` string
@@ -158,7 +177,8 @@ LLMPlayer-specific endpoints for model loading, GPU configuration, and diagnosti
 ### Resources
 
 - `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/web-ui.html` — Single-page web UI served by `WebServer` in `--web` mode.
+- `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
+- `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
 ### GPU placement strategies
 

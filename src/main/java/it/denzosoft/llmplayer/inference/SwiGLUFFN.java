@@ -1,5 +1,6 @@
 package it.denzosoft.llmplayer.inference;
 
+import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.TransformerLayerWeights;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
@@ -7,16 +8,23 @@ import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 import java.util.Arrays;
 
 /**
- * Feed-Forward Network with SwiGLU activation.
- * Standard: FFN(x) = wDown * (silu(wGate * x) * (wUp * x))
+ * Feed-Forward Network with SwiGLU or GeGLU activation.
+ * SwiGLU (Llama, Qwen, etc.): FFN(x) = wDown * (silu(wGate * x) * (wUp * x))
+ * GeGLU (Gemma2/3):            FFN(x) = wDown * (gelu(wGate * x) * (wUp * x))
  * Packed (GLM4): wUp produces [2*ffnDim], first half is gate, second half is up.
  */
 public class SwiGLUFFN {
 
+    private static final float SQRT_2_OVER_PI = (float) Math.sqrt(2.0 / Math.PI);
+
     private final ModelConfig config;
+    private final boolean useGelu;
 
     public SwiGLUFFN(ModelConfig config) {
         this.config = config;
+        // Gemma2/3 uses GELU activation instead of SiLU
+        this.useGelu = config.architecture() == ModelArchitecture.GEMMA2
+                     || config.architecture() == ModelArchitecture.GEMMA3;
     }
 
     /**
@@ -46,12 +54,26 @@ public class SwiGLUFFN {
             System.arraycopy(state.hbPacked, ffnDim, state.hb2, 0, ffnDim);
         }
 
-        // hb = silu(gate) * up
-        VectorOpsFactory.get().silu(state.hb, ffnDim);
+        // hb = activation(gate) * up
+        if (useGelu) {
+            gelu(state.hb, ffnDim);
+        } else {
+            VectorOpsFactory.get().silu(state.hb, ffnDim);
+        }
         VectorOpsFactory.get().elementwiseMul(state.hb, state.hb2, state.hb, ffnDim);
 
         // xb = wDown * hb
         Arrays.fill(state.xb, 0);
         weights.wDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
+    }
+
+    /**
+     * GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+     */
+    private static void gelu(float[] x, int size) {
+        for (int i = 0; i < size; i++) {
+            float v = x[i];
+            x[i] = 0.5f * v * (1.0f + (float) Math.tanh(SQRT_2_OVER_PI * (v + 0.044715f * v * v * v)));
+        }
     }
 }

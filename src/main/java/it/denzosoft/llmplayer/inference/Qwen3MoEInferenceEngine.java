@@ -1,5 +1,6 @@
 package it.denzosoft.llmplayer.inference;
 
+import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.Qwen3MoELayerWeights;
 import it.denzosoft.llmplayer.model.Qwen3MoEWeights;
@@ -30,12 +31,19 @@ public class Qwen3MoEInferenceEngine {
     private final float[][] cachedKNorm;
     private final float[] outputNormCache;
     private final int maxSeqLen;
+    private final boolean isGptOss;
+    private final int slidingWindow; // ISWA: 0 = disabled, >0 = window size for SWA layers
+
+    // Cached attention sinks per layer (GPT-OSS): float[blockCount][headCount]
+    private final float[][] cachedAttnSinks;
 
     public Qwen3MoEInferenceEngine(ModelConfig config, Qwen3MoEWeights weights, int maxSeqLen,
                                     float[] ropeFreqFactors) {
         this.config = config;
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
+        this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
+        this.slidingWindow = config.slidingWindow();
 
         int ropeDimCount = config.ropeDimensionCount();
         RoPE.YarnParams yarnParams = null;
@@ -62,6 +70,18 @@ public class Qwen3MoEInferenceEngine {
             if (weights.layers()[i].qNorm() != null) {
                 cachedQNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].qNorm(), headSize);
                 cachedKNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].kNorm(), headSize);
+            }
+        }
+
+        // Cache attention sinks (GPT-OSS)
+        this.cachedAttnSinks = new float[blockCount][];
+        for (int i = 0; i < blockCount; i++) {
+            if (weights.layers()[i].attnSinks() != null) {
+                int headCount = config.headCount();
+                cachedAttnSinks[i] = new float[headCount];
+                for (int h = 0; h < headCount; h++) {
+                    cachedAttnSinks[i][h] = weights.layers()[i].attnSinks().getFloat(h);
+                }
             }
         }
 
@@ -98,7 +118,7 @@ public class Qwen3MoEInferenceEngine {
             // Residual
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
 
-            // FFN norm
+            // FFN norm (post_attention_norm for GPT-OSS, ffn_norm for others)
             RMSNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
 
             if (layer < leadingDenseCount) {
@@ -147,6 +167,11 @@ public class Qwen3MoEInferenceEngine {
         weights.wk().matmulParallel(state.xb, state.k, kvDim, dim);
         weights.wv().matmulParallel(state.xb, state.v, kvDim, dim);
 
+        // Apply attention biases (GPT-OSS)
+        if (weights.wqBias() != null) addBias(state.q, weights.wqBias(), qDim);
+        if (weights.wkBias() != null) addBias(state.k, weights.wkBias(), kvDim);
+        if (weights.wvBias() != null) addBias(state.v, weights.wvBias(), kvDim);
+
         // Apply per-head QK-norm (Qwen3)
         if (cachedQNorm[layer] != null) {
             applyPerHeadNorm(state.q, cachedQNorm[layer], headCount, headSize, config.normEps());
@@ -164,30 +189,51 @@ public class Qwen3MoEInferenceEngine {
         System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
 
         // Attention computation - parallel over heads
-        float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
+        // Include YaRN mscale^2 for attention magnitude correction
+        float mscale = rope.getMscale();
+        float scaleFactor = mscale * mscale / (float) Math.sqrt(headSize);
+
+        // ISWA: even layers use sliding window, odd layers use full attention
+        // startPos is the first position to attend to
+        final int startPos;
+        if (slidingWindow > 0 && (layer % 2 == 0)) {
+            startPos = Math.max(0, position - slidingWindow + 1);
+        } else {
+            startPos = 0;
+        }
+        final int attLen = position - startPos + 1; // number of positions to attend to
 
         Arrays.fill(state.xb2, 0, qDim, 0f);
+
+        // Capture for use in lambda
+        final float[] sinks = cachedAttnSinks[layer];
 
         IntStream.range(0, headCount).parallel().forEach(new java.util.function.IntConsumer() {
             @Override
             public void accept(int h) {
                 int kvHead = h / kvMul;
-                int attOffset = h * (position + 1);
-                for (int t = 0; t <= position; t++) {
+                int attOffset = h * attLen;
+                for (int t = startPos; t <= position; t++) {
                     float score = 0f;
                     int qOffset = h * headSize;
                     int kOffset = state.kvCache.offset(t) + kvHead * headSize;
                     for (int i = 0; i < headSize; i++) {
                         score += state.q[qOffset + i] * keyCache[kOffset + i];
                     }
-                    state.att[attOffset + t] = score * scaleFactor;
+                    state.att[attOffset + (t - startPos)] = score * scaleFactor;
                 }
 
-                VectorOpsFactory.get().softmax(state.att, attOffset, position + 1);
+                if (sinks != null) {
+                    // Attention sinks (GPT-OSS): include sink in softmax denominator
+                    // but don't multiply with any V vector
+                    softmaxWithSink(state.att, attOffset, attLen, sinks[h]);
+                } else {
+                    VectorOpsFactory.get().softmax(state.att, attOffset, attLen);
+                }
 
                 int outOffset = h * headSize;
-                for (int t = 0; t <= position; t++) {
-                    float a = state.att[attOffset + t];
+                for (int t = startPos; t <= position; t++) {
+                    float a = state.att[attOffset + (t - startPos)];
                     int vOffset = state.kvCache.offset(t) + kvHead * headSize;
                     for (int i = 0; i < headSize; i++) {
                         state.xb2[outOffset + i] += a * valueCache[vOffset + i];
@@ -199,6 +245,7 @@ public class Qwen3MoEInferenceEngine {
         // Output projection: qDim -> dim
         Arrays.fill(state.xb, 0);
         weights.wo().matmulParallel(state.xb2, state.xb, dim, qDim);
+        if (weights.woBias() != null) addBias(state.xb, weights.woBias(), dim);
     }
 
     /**
@@ -234,27 +281,49 @@ public class Qwen3MoEInferenceEngine {
         // 1. Router: compute expert logits and select top-K
         Arrays.fill(state.routerLogits, 0, expertCount, 0f);
         weights.ffnGateInp().matmul(state.xbSaved, state.routerLogits, expertCount, dim);
+        if (weights.ffnGateInpBias() != null) addBias(state.routerLogits, weights.ffnGateInpBias(), expertCount);
 
-        // Softmax + sigmoid gating: Qwen3 MoE uses softmax then sigmoid
-        VectorOpsFactory.get().softmax(state.routerLogits, 0, expertCount);
+        if (isGptOss) {
+            // SOFTMAX_WEIGHT routing: select top-K by raw logits, then softmax over selected
+            selectTopK(state.routerLogits, expertCount, expertUsedCount,
+                state.selectedExperts, state.selectedWeights);
 
-        // Select top-K experts
-        selectTopK(state.routerLogits, expertCount, expertUsedCount,
-            state.selectedExperts, state.selectedWeights);
-
-        // Renormalize weights (Qwen3 MoE uses normalized top-K weights)
-        float weightSum = 0f;
-        for (int k = 0; k < expertUsedCount; k++) {
-            weightSum += state.selectedWeights[k];
-        }
-        if (weightSum > 0f) {
+            // Softmax only over the selected experts' raw logits
+            float maxW = Float.NEGATIVE_INFINITY;
+            for (int k = 0; k < expertUsedCount; k++) maxW = Math.max(maxW, state.selectedWeights[k]);
+            float sum = 0f;
             for (int k = 0; k < expertUsedCount; k++) {
-                state.selectedWeights[k] /= weightSum;
+                state.selectedWeights[k] = (float) Math.exp(state.selectedWeights[k] - maxW);
+                sum += state.selectedWeights[k];
+            }
+            if (sum > 0f) {
+                for (int k = 0; k < expertUsedCount; k++) {
+                    state.selectedWeights[k] /= sum;
+                }
+            }
+        } else {
+            // Standard Qwen3 MoE: softmax over all experts first, then top-K + renormalize
+            VectorOpsFactory.get().softmax(state.routerLogits, 0, expertCount);
+
+            selectTopK(state.routerLogits, expertCount, expertUsedCount,
+                state.selectedExperts, state.selectedWeights);
+
+            float weightSum = 0f;
+            for (int k = 0; k < expertUsedCount; k++) {
+                weightSum += state.selectedWeights[k];
+            }
+            if (weightSum > 0f) {
+                for (int k = 0; k < expertUsedCount; k++) {
+                    state.selectedWeights[k] /= weightSum;
+                }
             }
         }
 
         // 2. Compute routed expert outputs - parallel across experts
         Arrays.fill(state.xb, 0);
+
+        // Capture for lambda
+        final boolean useSwigluOai = isGptOss;
 
         IntStream.range(0, expertUsedCount).parallel().forEach(new java.util.function.IntConsumer() {
             @Override
@@ -271,11 +340,21 @@ public class Qwen3MoEInferenceEngine {
                 expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim);
                 expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim);
 
-                VectorOpsFactory.get().silu(gate, expertFfnDim);
-                VectorOpsFactory.get().elementwiseMul(gate, up, gate, expertFfnDim);
+                // Expert biases (GPT-OSS): shape [ffnDim, expertCount]
+                if (weights.ffnGateExpsBias() != null) addExpertBias(gate, weights.ffnGateExpsBias(), e, expertFfnDim);
+                if (weights.ffnUpExpsBias() != null) addExpertBias(up, weights.ffnUpExpsBias(), e, expertFfnDim);
+
+                if (useSwigluOai) {
+                    // GPT-OSS custom SwiGLU: alpha=1.702, limit=7, (up + 1)
+                    swigluOai(gate, up, expertFfnDim);
+                } else {
+                    VectorOpsFactory.get().silu(gate, expertFfnDim);
+                    VectorOpsFactory.get().elementwiseMul(gate, up, gate, expertFfnDim);
+                }
 
                 Arrays.fill(out, 0, dim, 0f);
                 expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim);
+                if (weights.ffnDownExpsBias() != null) addExpertBias(out, weights.ffnDownExpsBias(), e, dim);
             }
         });
 
@@ -342,6 +421,55 @@ public class Qwen3MoEInferenceEngine {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * GPT-OSS custom SwiGLU activation: alpha=1.702, limit=7.0, (up + 1).
+     * output[i] = clamp(gate[i], max=7) * sigmoid(1.702 * clamp(gate[i], max=7)) * (clamp(up[i], -7, 7) + 1)
+     * Result is stored back in gate[].
+     */
+    private static void swigluOai(float[] gate, float[] up, int size) {
+        for (int i = 0; i < size; i++) {
+            float x = Math.min(gate[i], 7.0f);
+            float y = Math.max(-7.0f, Math.min(up[i], 7.0f));
+            float glu = x / (1.0f + (float) Math.exp(-1.702f * x));
+            gate[i] = glu * (y + 1.0f);
+        }
+    }
+
+    /**
+     * Softmax with attention sink: includes exp(sinkValue) in the denominator
+     * but doesn't produce an attention weight for it (probability is discarded).
+     */
+    private static void softmaxWithSink(float[] x, int offset, int size, float sinkValue) {
+        float max = sinkValue;
+        for (int i = 0; i < size; i++) {
+            max = Math.max(max, x[offset + i]);
+        }
+        float sum = (float) Math.exp(sinkValue - max); // sink's contribution to denominator
+        for (int i = 0; i < size; i++) {
+            x[offset + i] = (float) Math.exp(x[offset + i] - max);
+            sum += x[offset + i];
+        }
+        float invSum = 1.0f / sum;
+        for (int i = 0; i < size; i++) {
+            x[offset + i] *= invSum;
+        }
+    }
+
+    /** Add 1D bias vector to output array. */
+    private static void addBias(float[] output, FloatTensor bias, int size) {
+        for (int i = 0; i < size; i++) {
+            output[i] += bias.getFloat(i);
+        }
+    }
+
+    /** Add per-expert bias from a 2D bias tensor [size, expertCount]. */
+    private static void addExpertBias(float[] output, FloatTensor bias2D, int expert, int size) {
+        long offset = (long) expert * size;
+        for (int i = 0; i < size; i++) {
+            output[i] += bias2D.getFloat(offset + i);
         }
     }
 

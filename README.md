@@ -131,7 +131,12 @@ Type your messages and press Enter. Special commands: `quit` or `exit` to leave,
 ./run.sh --web --port 8080 --gguf-dir ./models
 ```
 
-Starts an HTTP server at `http://localhost:8080` with a web interface and REST API. The port is configurable (default: 8080).
+Starts an HTTP server at `http://localhost:8080` with two web interfaces and REST APIs. The port is configurable (default: 8080).
+
+- **`/`** — Model config page: load/unload GGUF models, configure GPU, monitor hardware
+- **`/chat`** — Chat UI: persistent conversations with edit, regeneration, and branching support
+
+The chat UI stores conversations as JSON files in the `chats/` directory (created automatically). Editing a user message or regenerating an assistant response creates a branch — alternative paths in the conversation tree, navigable with arrow controls.
 
 ### Model info
 
@@ -231,9 +236,16 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 
 ## REST API (web mode)
 
-When started with `--web`, the server exposes the following APIs:
+When started with `--web`, the server exposes the following APIs. Full documentation in `REST-API.md`.
 
-### Models
+### OpenAI-compatible API (`/v1/*`)
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/v1/models` | GET | List available/loaded models |
+
+### Management API (`/api/*`)
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -241,33 +253,21 @@ When started with `--web`, the server exposes the following APIs:
 | `/api/models/load` | POST | Load a model: `{"path": "...", "contextLength": 2048}` |
 | `/api/models/unload` | POST | Unload the current model |
 | `/api/models/info` | GET | Loaded model metadata (includes `gpuLayers`, `gpuDeviceName`, `moeOptimizedGpu`) |
-
-### Chat
-
-| Endpoint | Method | Description |
-|---|---|---|
 | `/api/chat` | POST | Generation with streaming (Server-Sent Events) |
 | `/api/chat/stop` | POST | Stop the current generation |
 
-`/api/chat` request:
-```json
-{
-  "prompt": "Your message",
-  "systemMessage": "Optional system message",
-  "temperature": 0.7,
-  "maxTokens": 256,
-  "topK": 40,
-  "topP": 0.9,
-  "repPenalty": 1.1
-}
-```
+### Chat Persistence API (`/api/chats/*`)
 
-Response is an SSE stream:
-```
-data: {"token": "hello", "done": false}
-data: {"token": " world", "done": false}
-data: {"done": true, "stats": {"tokenCount": 10, "promptTokenCount": 5, "tokensPerSecond": 25.5, "timeMs": 392}}
-```
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/chats` | GET | List conversations |
+| `/api/chats` | POST | Create new conversation |
+| `/api/chats/{id}` | GET | Get conversation with message tree |
+| `/api/chats/{id}` | DELETE | Delete conversation |
+| `/api/chats/{id}/title` | PUT | Rename conversation |
+| `/api/chats/{id}/messages` | POST | Add message |
+| `/api/chats/{id}/messages/{msgId}` | PUT | Edit message (creates branch) |
+| `/api/chats/{id}/settings` | PUT | Update per-conversation settings |
 
 ## Java API
 

@@ -49,6 +49,7 @@ public class LLMEngine implements AutoCloseable {
     private final int gpuLayersUsed;       // how many layers are on GPU (-1 = none)
     private final String gpuDeviceName;    // GPU device name, or null
     private final boolean moeOptimizedGpu; // MoE: attention on GPU, experts on CPU
+    private final ConversationCache conversationCache = new ConversationCache();
 
     private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         this(loadedModel, maxContextLength, null, -1, null, false);
@@ -70,19 +71,43 @@ public class LLMEngine implements AutoCloseable {
         this.gpuDeviceName = gpuDeviceName;
         this.moeOptimizedGpu = moeOptimizedGpu;
 
-        if (loadedModel.config().architecture() == ModelArchitecture.DEEPSEEK2) {
+        ModelArchitecture arch = loadedModel.config().architecture();
+        if (arch == ModelArchitecture.DEEPSEEK2) {
             this.engine = null;
             this.ds2Engine = new DeepSeek2InferenceEngine(
                 loadedModel.config(), loadedModel.deepSeek2Weights(), maxContextLength,
                 loadedModel.deepSeek2Weights().ropeFreqFactors());
             this.q3moeEngine = null;
-        } else if (loadedModel.config().architecture() == ModelArchitecture.QWEN3MOE) {
+        } else if (arch == ModelArchitecture.QWEN3MOE) {
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = new Qwen3MoEInferenceEngine(
+                loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
+                loadedModel.qwen3MoEWeights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.LLAMA4 && loadedModel.config().expertCount() > 0) {
+            // Llama4 MoE: reuse Qwen3MoE engine (standard GQA + MoE FFN)
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = new Qwen3MoEInferenceEngine(
+                loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
+                loadedModel.qwen3MoEWeights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.GPT_OSS && loadedModel.config().expertCount() > 0) {
+            // GPT-OSS MoE: reuse Qwen3MoE engine (GQA + MoE FFN)
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = new Qwen3MoEInferenceEngine(
+                loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
+                loadedModel.qwen3MoEWeights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.GLM4 && loadedModel.config().expertCount() > 0) {
+            // GLM4 MoE: reuse Qwen3MoE engine (GQA + MoE FFN)
             this.engine = null;
             this.ds2Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
         } else {
+            // Standard dense engine: Llama, Qwen2, Qwen3, GLM4, Phi3, Mistral3,
+            // Command-R, OLMo2, Gemma2/3, dense Llama4/GPT-OSS
             this.ds2Engine = null;
             this.q3moeEngine = null;
             this.engine = new InferenceEngine(loadedModel.config(), loadedModel.weights(), maxContextLength,
@@ -232,24 +257,68 @@ public class LLMEngine implements AutoCloseable {
                 (maxContextLength - 1) + ")", 0, promptLen, 0, 0, Collections.<EvaluationResult>emptyList());
         }
 
-        // Dispatch to appropriate engine
-        if (ds2Engine != null) {
-            return generateDeepSeek2(ds2Engine, sampler, promptTokens, request, callback);
-        } else if (q3moeEngine != null) {
-            return generateQwen3MoE(q3moeEngine, sampler, promptTokens, request, callback);
-        } else {
-            return generateStandard(engine, sampler, promptTokens, request, callback);
+        // KV cache reuse: check for cached conversation state
+        String cacheKey = request.cacheKey();
+        ConversationCache.CachedConversation cached = null;
+        int prefillStart = 0;
+
+        if (cacheKey != null) {
+            cached = conversationCache.take(cacheKey); // exclusive access
+            if (cached != null) {
+                prefillStart = findPrefixMatch(cached.promptTokens, promptTokens);
+                if (prefillStart == 0) {
+                    cached = null; // no match, create fresh state
+                } else {
+                    // Ensure at least the last token is re-processed to get logits
+                    if (prefillStart >= promptLen) {
+                        prefillStart = promptLen - 1;
+                    }
+                }
+            }
         }
+
+        // Dispatch to appropriate engine
+        GenerationResponse response;
+        Object stateForCache;
+        if (ds2Engine != null) {
+            DeepSeek2State state = (cached != null)
+                ? (DeepSeek2State) cached.state
+                : ds2Engine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateDeepSeek2(ds2Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (q3moeEngine != null) {
+            Qwen3MoEState state = (cached != null)
+                ? (Qwen3MoEState) cached.state
+                : q3moeEngine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateQwen3MoE(q3moeEngine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else {
+            InferenceState state = (cached != null)
+                ? (InferenceState) cached.state
+                : engine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateStandard(engine, sampler, promptTokens, request, callback, state, prefillStart);
+        }
+
+        // Update cache with the state (KV cache now includes prompt + generated tokens)
+        if (cacheKey != null) {
+            conversationCache.put(cacheKey, new ConversationCache.CachedConversation(stateForCache, promptTokens));
+        }
+
+        return response;
     }
 
     private GenerationResponse generateStandard(InferenceEngine eng, CompositeSampler sampler,
                                                   int[] promptTokens, GenerationRequest request,
-                                                  StreamingCallback callback) {
+                                                  StreamingCallback callback,
+                                                  InferenceState state, int prefillStart) {
         int promptLen = promptTokens.length;
-        InferenceState state = eng.createState(maxContextLength);
 
         long startTime = System.nanoTime();
-        float[] logits = eng.prefill(state, promptTokens);
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(state, promptTokens[i], i);
+        }
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -263,12 +332,15 @@ public class LLMEngine implements AutoCloseable {
 
     private GenerationResponse generateDeepSeek2(DeepSeek2InferenceEngine eng, CompositeSampler sampler,
                                                    int[] promptTokens, GenerationRequest request,
-                                                   StreamingCallback callback) {
+                                                   StreamingCallback callback,
+                                                   DeepSeek2State state, int prefillStart) {
         int promptLen = promptTokens.length;
-        DeepSeek2State state = eng.createState(maxContextLength);
 
         long startTime = System.nanoTime();
-        float[] logits = eng.prefill(state, promptTokens);
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(state, promptTokens[i], i);
+        }
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -282,12 +354,15 @@ public class LLMEngine implements AutoCloseable {
 
     private GenerationResponse generateQwen3MoE(Qwen3MoEInferenceEngine eng, CompositeSampler sampler,
                                                   int[] promptTokens, GenerationRequest request,
-                                                  StreamingCallback callback) {
+                                                  StreamingCallback callback,
+                                                  Qwen3MoEState state, int prefillStart) {
         int promptLen = promptTokens.length;
-        Qwen3MoEState state = eng.createState(maxContextLength);
 
         long startTime = System.nanoTime();
-        float[] logits = eng.prefill(state, promptTokens);
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(state, promptTokens[i], i);
+        }
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -354,6 +429,62 @@ public class LLMEngine implements AutoCloseable {
 
         return new GenerationResponse(
             responseText.toString(), genTokenCount, promptLen, tokPerSec, totalTimeMs, evalResults);
+    }
+
+    /**
+     * Generate an embedding vector for the given text.
+     * Runs prefill through the model, extracts the last hidden state after final RMSNorm,
+     * and returns an L2-normalized vector.
+     */
+    public float[] embed(String text) {
+        int[] encodedTokens = tokenizer.encode(text);
+        int[] tokens = new int[encodedTokens.length + 1];
+        tokens[0] = specialTokens.getBosId();
+        System.arraycopy(encodedTokens, 0, tokens, 1, encodedTokens.length);
+
+        int dim = loadedModel.config().embeddingLength();
+
+        if (engine != null) {
+            InferenceState state = engine.createState(maxContextLength);
+            engine.prefill(state, tokens);
+            return l2Normalize(state.xb, dim);
+        } else if (ds2Engine != null) {
+            DeepSeek2State state = ds2Engine.createState(maxContextLength);
+            ds2Engine.prefill(state, tokens);
+            return l2Normalize(state.xb, dim);
+        } else if (q3moeEngine != null) {
+            Qwen3MoEState state = q3moeEngine.createState(maxContextLength);
+            q3moeEngine.prefill(state, tokens);
+            return l2Normalize(state.xb, dim);
+        }
+        throw new IllegalStateException("No inference engine available");
+    }
+
+    /**
+     * Find the length of the matching prefix between cached tokens and new tokens.
+     */
+    private static int findPrefixMatch(int[] cached, int[] newTokens) {
+        int limit = Math.min(cached.length, newTokens.length);
+        int match = 0;
+        while (match < limit && cached[match] == newTokens[match]) {
+            match++;
+        }
+        return match;
+    }
+
+    private static float[] l2Normalize(float[] src, int dim) {
+        float[] result = new float[dim];
+        float sumSq = 0;
+        for (int i = 0; i < dim; i++) {
+            sumSq += src[i] * src[i];
+        }
+        float norm = (float) Math.sqrt(sumSq);
+        if (norm > 0) {
+            for (int i = 0; i < dim; i++) {
+                result[i] = src[i] / norm;
+            }
+        }
+        return result;
     }
 
     public void generateStreaming(GenerationRequest request, StreamingCallback callback) {
