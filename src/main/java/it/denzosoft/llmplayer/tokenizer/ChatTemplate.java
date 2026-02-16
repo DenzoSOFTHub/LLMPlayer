@@ -2,6 +2,8 @@ package it.denzosoft.llmplayer.tokenizer;
 
 import it.denzosoft.llmplayer.model.ModelArchitecture;
 
+import java.util.List;
+
 public class ChatTemplate {
 
     private final ModelArchitecture architecture;
@@ -106,5 +108,104 @@ public class ChatTemplate {
 
     private String formatMistral3Chat(String systemMessage, String userMessage) {
         return "[INST] " + systemMessage + "\n\n" + userMessage + " [/INST]";
+    }
+
+    /**
+     * Format a multi-turn conversation for the OpenAI-compatible API.
+     * Each message is a String[] of {role, content}. Roles: "system", "user", "assistant".
+     * Returns the formatted prompt ready for tokenization (BOS is handled by the engine).
+     */
+    public String formatConversation(List<String[]> messages) {
+        if (architecture == ModelArchitecture.LLAMA) {
+            return formatLlama3Conversation(messages);
+        } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
+                || architecture == ModelArchitecture.QWEN3MOE) {
+            return formatQwenConversation(messages);
+        } else if (architecture == ModelArchitecture.GLM4) {
+            return formatGLM4Conversation(messages);
+        } else if (architecture == ModelArchitecture.DEEPSEEK2) {
+            return formatDeepSeekConversation(messages);
+        } else if (architecture == ModelArchitecture.PHI3) {
+            return formatPhi3Conversation(messages);
+        } else if (architecture == ModelArchitecture.MISTRAL3) {
+            return formatMistral3Conversation(messages);
+        }
+        return formatLlama3Conversation(messages);
+    }
+
+    private String formatLlama3Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            sb.append("<|start_header_id|>").append(msg[0]).append("<|end_header_id|>\n\n");
+            sb.append(msg[1]).append("<|eot_id|>");
+        }
+        sb.append("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        return sb.toString();
+    }
+
+    private String formatQwenConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            sb.append("<|im_start|>").append(msg[0]).append("\n");
+            sb.append(msg[1]).append("<|im_end|>\n");
+        }
+        sb.append("<|im_start|>assistant\n");
+        return sb.toString();
+    }
+
+    private String formatGLM4Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder("[gMASK]<sop>");
+        for (String[] msg : messages) {
+            sb.append("<|").append(msg[0]).append("|>\n");
+            sb.append(msg[1]);
+        }
+        sb.append("<|assistant|>\n");
+        return sb.toString();
+    }
+
+    private String formatDeepSeekConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            if ("system".equals(msg[0])) {
+                sb.append(msg[1]).append("\n\n");
+            } else if ("user".equals(msg[0])) {
+                sb.append("User: ").append(msg[1]).append("\n\n");
+            } else if ("assistant".equals(msg[0])) {
+                sb.append("Assistant: ").append(msg[1]).append("\n\n");
+            }
+        }
+        sb.append("Assistant:");
+        return sb.toString();
+    }
+
+    private String formatPhi3Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            sb.append("<|").append(msg[0]).append("|>\n");
+            sb.append(msg[1]).append("<|end|>\n");
+        }
+        sb.append("<|assistant|>\n");
+        return sb.toString();
+    }
+
+    private String formatMistral3Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        String systemMsg = null;
+        boolean firstUser = true;
+        for (String[] msg : messages) {
+            if ("system".equals(msg[0])) {
+                systemMsg = msg[1];
+            } else if ("user".equals(msg[0])) {
+                sb.append("[INST] ");
+                if (firstUser && systemMsg != null) {
+                    sb.append(systemMsg).append("\n\n");
+                }
+                sb.append(msg[1]).append(" [/INST]");
+                firstUser = false;
+            } else if ("assistant".equals(msg[0])) {
+                sb.append(msg[1]).append("</s>");
+            }
+        }
+        return sb.toString();
     }
 }

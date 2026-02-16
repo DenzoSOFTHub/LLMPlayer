@@ -10,7 +10,8 @@ public record DeviceInfo(
     String vendor,
     long globalMemory,
     int computeUnits,
-    String deviceType
+    String deviceType,
+    long maxWorkGroupSize
 ) {
     @Override
     public String toString() {

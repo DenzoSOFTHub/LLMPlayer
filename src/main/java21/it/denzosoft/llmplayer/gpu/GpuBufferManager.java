@@ -1,5 +1,6 @@
 package it.denzosoft.llmplayer.gpu;
 
+import it.denzosoft.llmplayer.tensor.MemorySegmentTensorData;
 import it.denzosoft.llmplayer.tensor.TensorData;
 
 import java.lang.foreign.*;
@@ -41,24 +42,29 @@ public class GpuBufferManager implements AutoCloseable {
                 if (cached != null) return cached;
             }
 
-            // Copy tensor data to a contiguous host buffer using a confined arena
-            // that is freed immediately after GPU upload completes.
+            // Upload tensor data to GPU.
+            // Fast path: MemorySegmentTensorData can pass mmap'd segment directly (zero-copy staging).
+            // Slow path: copy through 64KB byte[] chunks for ByteBufferTensorData.
             MemorySegment gpuBuf;
-            try (Arena stagingArena = Arena.ofConfined()) {
-                MemorySegment hostBuf = stagingArena.allocate(sizeBytes);
-                byte[] chunk = new byte[(int) Math.min(sizeBytes, 65536)];
-                long remaining = sizeBytes;
-                long offset = 0;
-                while (remaining > 0) {
-                    int toRead = (int) Math.min(remaining, chunk.length);
-                    data.copyBytes(byteOffset + offset, chunk, 0, toRead);
-                    MemorySegment.copy(chunk, 0, hostBuf, ValueLayout.JAVA_BYTE, offset, toRead);
-                    offset += toRead;
-                    remaining -= toRead;
+            if (data instanceof MemorySegmentTensorData) {
+                MemorySegment seg = ((MemorySegmentTensorData) data).segment();
+                MemorySegment slice = seg.asSlice(byteOffset, sizeBytes);
+                gpuBuf = clContext.createGpuBuffer(sizeBytes, CL_MEM_READ_ONLY, slice);
+            } else {
+                try (Arena stagingArena = Arena.ofConfined()) {
+                    MemorySegment hostBuf = stagingArena.allocate(sizeBytes);
+                    byte[] chunk = new byte[(int) Math.min(sizeBytes, 65536)];
+                    long remaining = sizeBytes;
+                    long offset = 0;
+                    while (remaining > 0) {
+                        int toRead = (int) Math.min(remaining, chunk.length);
+                        data.copyBytes(byteOffset + offset, chunk, 0, toRead);
+                        MemorySegment.copy(chunk, 0, hostBuf, ValueLayout.JAVA_BYTE, offset, toRead);
+                        offset += toRead;
+                        remaining -= toRead;
+                    }
+                    gpuBuf = clContext.createGpuBuffer(sizeBytes, CL_MEM_READ_ONLY, hostBuf);
                 }
-
-                // Upload to GPU (CL_MEM_COPY_HOST_PTR copies data, so hostBuf can be freed)
-                gpuBuf = clContext.createGpuBuffer(sizeBytes, CL_MEM_READ_ONLY, hostBuf);
             }
 
             if (offsetMap == null) {

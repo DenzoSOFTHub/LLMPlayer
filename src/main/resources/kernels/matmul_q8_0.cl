@@ -24,6 +24,7 @@ __kernel void matmul_q8_0(
         float scale = vload_half(0, (__global const half*)(weights + bo));
 
         int inputBase = b * 32;
+        #pragma unroll 8
         for (int i = 0; i < 32; i++) {
             // int8 quant (signed)
             char q = (char)weights[bo + 2 + i];

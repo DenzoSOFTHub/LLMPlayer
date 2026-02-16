@@ -298,6 +298,36 @@ public class OpenCLContext implements AutoCloseable {
         checkError(OpenCLBindings.finish(queue), "clFinish");
     }
 
+    /**
+     * Pre-compile all known matmul and utility kernels to avoid compilation stalls during inference.
+     */
+    public void precompileKernels() {
+        String[][] kernels = {
+            {"kernels/matmul_f32.cl", "matmul_f32"},
+            {"kernels/matmul_q4_0.cl", "matmul_q4_0"},
+            {"kernels/matmul_q4_k.cl", "matmul_q4_k"},
+            {"kernels/matmul_q5_k.cl", "matmul_q5_k"},
+            {"kernels/matmul_q6_k.cl", "matmul_q6_k"},
+            {"kernels/matmul_q8_0.cl", "matmul_q8_0"},
+            {"kernels/matmul_q3_k.cl", "matmul_q3_k"},
+            {"kernels/rmsnorm.cl", "rmsnorm_sumsq"},
+            {"kernels/rmsnorm.cl", "rmsnorm_normalize"},
+            {"kernels/softmax.cl", "softmax_max"},
+            {"kernels/softmax.cl", "softmax_exp_sum"},
+            {"kernels/softmax.cl", "softmax_normalize"},
+            {"kernels/silu.cl", "silu"},
+            {"kernels/saxpy.cl", "saxpy"},
+            {"kernels/accumulate.cl", "accumulate"},
+        };
+        for (String[] kv : kernels) {
+            try {
+                compileKernel(kv[0], kv[1]);
+            } catch (Exception ignored) {
+                // Some kernels may not exist — that's fine
+            }
+        }
+    }
+
     public DeviceInfo getDeviceInfo() { return deviceInfo; }
     public MemorySegment getClContext() { return context; }
     public MemorySegment getQueue() { return queue; }
@@ -345,7 +375,13 @@ public class OpenCLContext implements AutoCloseable {
             String typeStr = (devType & OpenCLBindings.CL_DEVICE_TYPE_GPU) != 0 ? "GPU" :
                              (devType & OpenCLBindings.CL_DEVICE_TYPE_ACCELERATOR) != 0 ? "NPU/Accelerator" : "CPU";
 
-            return new DeviceInfo(index, device.address(), name, vendor, globalMem, computeUnits, typeStr);
+            MemorySegment wgBuf = arena.allocate(ValueLayout.JAVA_LONG);
+            OpenCLBindings.getDeviceInfo(device, OpenCLBindings.CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                ValueLayout.JAVA_LONG.byteSize(), wgBuf, MemorySegment.NULL);
+            long maxWorkGroupSize = wgBuf.get(ValueLayout.JAVA_LONG, 0);
+            if (maxWorkGroupSize <= 0) maxWorkGroupSize = 64;
+
+            return new DeviceInfo(index, device.address(), name, vendor, globalMem, computeUnits, typeStr, maxWorkGroupSize);
         } catch (Exception e) {
             return null;
         }

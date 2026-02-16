@@ -29,6 +29,7 @@ __kernel void matmul_q4_k(
         float dmin = vload_half(0, (__global const half*)(weights + bo + 2));
 
         int scales[8], mins[8];
+        #pragma unroll
         for (int sb = 0; sb < 8; sb++) {
             if (sb < 4) {
                 scales[sb] = weights[bo + 4 + sb] & 0x3F;
@@ -42,12 +43,14 @@ __kernel void matmul_q4_k(
         }
 
         int inputBase = b * 256;
+        #pragma unroll
         for (int group = 0; group < 4; group++) {
             float ds0 = d * (float)scales[group * 2];
             float dm0 = dmin * (float)mins[group * 2];
             float ds1 = d * (float)scales[group * 2 + 1];
             float dm1 = dmin * (float)mins[group * 2 + 1];
 
+            #pragma unroll 8
             for (int l = 0; l < 32; l++) {
                 uchar qsByte = weights[bo + 16 + group * 32 + l];
                 int q0 = qsByte & 0x0F;

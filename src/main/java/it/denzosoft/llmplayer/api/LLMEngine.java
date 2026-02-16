@@ -201,7 +201,9 @@ public class LLMEngine implements AutoCloseable {
 
         // Tokenize prompt
         String formattedPrompt;
-        if (request.useChat()) {
+        if (request.rawMode()) {
+            formattedPrompt = request.prompt();
+        } else if (request.useChat()) {
             if (request.systemMessage() != null) {
                 formattedPrompt = chatTemplate.formatChat(request.systemMessage(), request.prompt());
             } else {
@@ -213,9 +215,9 @@ public class LLMEngine implements AutoCloseable {
 
         int[] encodedTokens = tokenizer.encode(formattedPrompt);
 
-        // Prepend BOS token if chat mode (BOS is not included in template text)
+        // Prepend BOS token if chat mode or rawMode (BOS is not included in template text)
         int[] promptTokens;
-        if (request.useChat()) {
+        if (request.useChat() || request.rawMode()) {
             int bosId = specialTokens.getBosId();
             promptTokens = new int[encodedTokens.length + 1];
             promptTokens[0] = bosId;
@@ -429,6 +431,7 @@ public class LLMEngine implements AutoCloseable {
     public SpecialTokens getSpecialTokens() { return specialTokens; }
     public ChatTemplate getChatTemplate() { return chatTemplate; }
     public ModelConfig getConfig() { return loadedModel.config(); }
+    public String getModelName() { return loadedModel.config().name(); }
     public int getGpuLayersUsed() { return gpuLayersUsed; }
     public String getGpuDeviceName() { return gpuDeviceName; }
     public boolean isMoeOptimizedGpu() { return moeOptimizedGpu; }
@@ -927,6 +930,11 @@ public class LLMEngine implements AutoCloseable {
             Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
             java.lang.reflect.Method createMethod = ctxClass.getMethod("create", int.class);
             Object clContext = createMethod.invoke(null, gpuConfig.getDeviceId());
+
+            // Pre-compile all GPU kernels eagerly (avoids first-use latency)
+            try {
+                ctxClass.getMethod("precompileKernels").invoke(clContext);
+            } catch (Exception ignored) {}
 
             // Get device info for logging
             java.lang.reflect.Method getInfoMethod = ctxClass.getMethod("getDeviceInfo");

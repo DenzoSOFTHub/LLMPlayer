@@ -94,8 +94,9 @@ public abstract class GpuFloatTensor extends FloatTensor {
             clContext.writeBuffer(outputBuf, outputHost, outputBytes);
 
             setKernelArgs(kernel, weightBuf, inputBuf, outputBuf, rows, cols, tempArena);
-            long globalWorkSize = ((rows + 63L) / 64) * 64;
-            clContext.enqueueKernel1D(kernel, globalWorkSize, 64, tempArena);
+            long localWorkSize = Math.min(256, clContext.getDeviceInfo().maxWorkGroupSize());
+            long globalWorkSize = ((rows + localWorkSize - 1) / localWorkSize) * localWorkSize;
+            clContext.enqueueKernel1D(kernel, globalWorkSize, localWorkSize, tempArena);
             clContext.finish();
 
             clContext.readBuffer(outputBuf, outputHost, outputBytes);

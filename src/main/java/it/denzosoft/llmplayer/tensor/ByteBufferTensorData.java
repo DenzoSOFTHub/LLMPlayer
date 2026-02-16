@@ -20,11 +20,20 @@ public class ByteBufferTensorData implements TensorData {
     private final MappedByteBuffer[] segments;
     private final long baseOffset;
     private final long size;
+    private final ThreadLocal<ByteBuffer[]> tlDuplicates;
 
     ByteBufferTensorData(MappedByteBuffer[] segments, long baseOffset, long size) {
         this.segments = segments;
         this.baseOffset = baseOffset;
         this.size = size;
+        this.tlDuplicates = ThreadLocal.withInitial(() -> {
+            ByteBuffer[] dups = new ByteBuffer[segments.length];
+            for (int i = 0; i < segments.length; i++) {
+                dups[i] = segments[i].duplicate();
+                dups[i].order(ByteOrder.LITTLE_ENDIAN);
+            }
+            return dups;
+        });
     }
 
     public static TensorDataFactory.MappedFile mapFile(java.nio.file.Path path) throws IOException {
@@ -112,11 +121,12 @@ public class ByteBufferTensorData implements TensorData {
         long abs = baseOffset + srcOffset;
         int remaining = length;
         int dstPos = dstOffset;
+        ByteBuffer[] dups = tlDuplicates.get();
         while (remaining > 0) {
             int segIdx = (int) (abs >>> SEGMENT_BITS);
             int segOff = (int) (abs & SEGMENT_MASK);
             int available = (int) Math.min(remaining, SEGMENT_SIZE - segOff);
-            ByteBuffer dup = segments[segIdx].duplicate();
+            ByteBuffer dup = dups[segIdx];
             dup.position(segOff);
             dup.get(dst, dstPos, available);
             abs += available;

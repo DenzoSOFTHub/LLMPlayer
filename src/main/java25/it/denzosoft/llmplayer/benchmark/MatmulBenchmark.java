@@ -153,10 +153,10 @@ public final class MatmulBenchmark {
         }
 
         System.out.println();
-        System.out.println("Interpretazione:");
-        System.out.println("  vs SEQ > 1.0x = piu' veloce del sequenziale (simula Java 1.8 senza threads)");
-        System.out.println("  vs FJP > 1.0x = Virtual Threads piu' veloce di ForkJoinPool");
-        System.out.println("  vs FJP < 1.0x = ForkJoinPool piu' veloce (tipico per compute-bound puro)");
+        System.out.println("Interpretation:");
+        System.out.println("  vs SEQ > 1.0x = faster than sequential (simulates Java 1.8 without threads)");
+        System.out.println("  vs FJP > 1.0x = Virtual Threads faster than ForkJoinPool");
+        System.out.println("  vs FJP < 1.0x = ForkJoinPool faster (typical for pure compute-bound)");
 
         // Cleanup GPU
         if (gpuTensorFactory != null) {

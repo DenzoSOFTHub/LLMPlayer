@@ -29,7 +29,7 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --ena
   -cp target/classes it.denzosoft.llmplayer.LLMPlayer [options]
 ```
 
-There are no tests in the repository currently (test directory exists but is empty).
+Unit test directory exists but is empty. Integration tests for the OpenAI-compatible API are in `test-openai-api.sh` (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures (llama, qwen2, qwen3, phi3, deepseek2, mistral3) with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
 
 `run.sh` (Linux/macOS) and `run.bat` (Windows) are pre-configured launcher scripts with all required JVM flags for Java 25.
 
@@ -83,7 +83,7 @@ There is also a 7th reflection site in `CLIRunner.listGpuDevices()` which loads 
 | `tensor` | Tensor operations and quantization/dequantization; GPU variants in java21 |
 | `tokenizer` | BPE and SentencePiece tokenizers, chat template formatting |
 | `ui` | Swing desktop GUI |
-| `web` | Embedded HTTP server with HTML web UI |
+| `web` | Embedded HTTP server with HTML web UI, OpenAI-compatible API (`OpenAIHandler`), management API (`ApiHandler`) |
 
 ### Key data flow
 
@@ -110,33 +110,49 @@ There is also a 7th reflection site in `CLIRunner.listGpuDevices()` which loads 
 ### Launch modes
 
 - **No args** → Swing desktop GUI (`LLMPlayerUI`)
-- **`--web`** → Embedded `com.sun.net.httpserver.HttpServer` with HTML web UI (default port 8080), REST API at `/api/*`
+- **`--web`** → Embedded `com.sun.net.httpserver.HttpServer` with HTML web UI (default port 8080), OpenAI-compatible API at `/v1/*`, management API at `/api/*`
 - **`--model <path>`** → CLI mode (single prompt with `--prompt` or `--interactive` chat)
 - **`--gpu-list`** → enumerate OpenCL devices and exit
 
 ### REST API (web mode)
 
-When running with `--web`, the server exposes these endpoints:
+When running with `--web`, the server exposes two API groups. Full documentation in `REST-API.md`.
+
+#### OpenAI-compatible API (`/v1/*`)
+
+Follows the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) spec. Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.). The `Authorization: Bearer <token>` header is accepted and ignored.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/v1/models` | GET | List available/loaded models |
+
+Implemented in `OpenAIHandler.java`. Uses `ChatTemplate.formatConversation()` for multi-turn message formatting. Supports `messages` array with `system`/`user`/`assistant` roles, `stream`, `temperature`, `max_tokens`, `top_p`, `top_k`, `stop`, `frequency_penalty`, `repetition_penalty`. The `model` field is accepted but ignored (uses the currently loaded model). Streaming sends SSE chunks in OpenAI format (`chat.completion.chunk`) ending with `data: [DONE]`. Non-streaming returns a full `chat.completion` JSON with `choices` and `usage`.
+
+The web UI (`web-ui.html`) uses `/v1/chat/completions` for chat and `/api/*` for model management.
+
+#### Management API (`/api/*`)
+
+LLMPlayer-specific endpoints for model loading, GPU configuration, and diagnostics.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/models` | GET | List available GGUF files in the model directory |
-| `/api/models/load` | POST | Load a model: `{"path": "...", "contextLength": 2048}` |
+| `/api/models/load` | POST | Load a model: `{"path": "gguf/model.gguf", "contextLength": 2048}` |
 | `/api/models/unload` | POST | Unload the current model |
-| `/api/models/info` | GET | Get loaded model metadata |
-| `/api/chat` | POST | Generate with SSE streaming |
+| `/api/models/info` | GET | Get loaded model metadata (includes GPU placement fields) |
+| `/api/chat` | POST | Generate with SSE streaming (legacy format) |
 | `/api/chat/stop` | POST | Stop current generation |
-
-Chat responses stream as SSE: `data: {"token": "...", "done": false}` followed by a final `data: {"done": true, "stats": {...}}`.
-
-`/api/models/info` includes GPU placement fields: `gpuLayers` (int), `gpuDeviceName` (string|null), `moeOptimizedGpu` (boolean).
+| `/api/gpu/devices` | GET | Enumerate OpenCL devices |
+| `/api/memory/check` | POST | Check RAM availability for a model |
+| `/api/hardware/plan` | POST | Build optimal hardware config plan |
 
 ### Adding a new model architecture
 
 1. Add enum value to `ModelArchitecture` with its GGUF `general.architecture` string
 2. Add any architecture-specific tensor name patterns to `ArchitectureRegistry` (standard names like `blk.{n}.attn_q.weight` are shared across most architectures)
 3. Update `ModelConfig.fromMetadata()` if the architecture uses non-standard metadata keys for hyperparameters
-4. Add a chat template branch in `ChatTemplate.formatUserMessage()`
+4. Add a chat template branch in `ChatTemplate.formatUserMessage()` and `ChatTemplate.formatConversation()`
 5. If the architecture's forward pass differs from standard transformer attention+FFN, create a dedicated inference engine class (see `DeepSeek2InferenceEngine` as reference)
 
 ### Resources

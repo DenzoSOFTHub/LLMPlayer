@@ -14,6 +14,9 @@ public class Q6_KFloatTensor extends FloatTensor {
     private static final int BLOCK_SIZE = 256;
     private static final int BLOCK_BYTES = 210;
     private static final ThreadLocal<float[]> DOT_BUFFER = ThreadLocal.withInitial(() -> new float[BLOCK_SIZE]);
+    private static final ThreadLocal<byte[]> TL_QL = ThreadLocal.withInitial(() -> new byte[128]);
+    private static final ThreadLocal<byte[]> TL_QH = ThreadLocal.withInitial(() -> new byte[64]);
+    private static final ThreadLocal<byte[]> TL_SC = ThreadLocal.withInitial(() -> new byte[16]);
 
     public Q6_KFloatTensor(TensorData data, long size) {
         super(data, size);
@@ -69,9 +72,9 @@ public class Q6_KFloatTensor extends FloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherBase = otherOffset;
         float[] tmp = DOT_BUFFER.get();
-        byte[] ql = new byte[128];
-        byte[] qh = new byte[64];
-        byte[] sc = new byte[16];
+        byte[] ql = TL_QL.get();
+        byte[] qh = TL_QH.get();
+        byte[] sc = TL_SC.get();
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;

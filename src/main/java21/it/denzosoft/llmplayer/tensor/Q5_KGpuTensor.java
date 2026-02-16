@@ -11,6 +11,11 @@ public class Q5_KGpuTensor extends GpuFloatTensor {
     private static final int BLOCK_SIZE = 256;
     private static final int BLOCK_BYTES = 176;
     private static final ThreadLocal<float[]> DOT_BUFFER = ThreadLocal.withInitial(() -> new float[BLOCK_SIZE]);
+    private static final ThreadLocal<byte[]> TL_SCALE_BYTES = ThreadLocal.withInitial(() -> new byte[12]);
+    private static final ThreadLocal<byte[]> TL_QH = ThreadLocal.withInitial(() -> new byte[32]);
+    private static final ThreadLocal<byte[]> TL_QS = ThreadLocal.withInitial(() -> new byte[128]);
+    private static final ThreadLocal<int[]> TL_SCALES = ThreadLocal.withInitial(() -> new int[8]);
+    private static final ThreadLocal<int[]> TL_MINS = ThreadLocal.withInitial(() -> new int[8]);
 
     public Q5_KGpuTensor(TensorData data, long size, GpuBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -46,7 +51,7 @@ public class Q5_KGpuTensor extends GpuFloatTensor {
         boolean isHigh = jLocal >= 32;
 
         int scaleIdx = group * 2 + (isHigh ? 1 : 0);
-        byte[] scaleBytes = new byte[12];
+        byte[] scaleBytes = TL_SCALE_BYTES.get();
         data.copyBytes(bo + 4, scaleBytes, 0, 12);
         int sc, m;
         if (scaleIdx < 4) {
@@ -78,11 +83,11 @@ public class Q5_KGpuTensor extends GpuFloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherBase = otherOffset;
         float[] tmp = DOT_BUFFER.get();
-        byte[] scaleBytes = new byte[12];
-        byte[] qh = new byte[32];
-        byte[] qs = new byte[128];
-        int[] scales = new int[8];
-        int[] mins = new int[8];
+        byte[] scaleBytes = TL_SCALE_BYTES.get();
+        byte[] qh = TL_QH.get();
+        byte[] qs = TL_QS.get();
+        int[] scales = TL_SCALES.get();
+        int[] mins = TL_MINS.get();
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;

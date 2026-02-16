@@ -48,6 +48,7 @@ __kernel void matmul_q5_k(
             float ds1 = d * (float)scales[group * 2 + 1];
             float dm1 = dmin * (float)mins[group * 2 + 1];
 
+            #pragma unroll 8
             for (int l = 0; l < 32; l++) {
                 uchar qsByte = weights[bo + 48 + group * 32 + l];
                 uchar qhByte = weights[bo + 16 + l];
