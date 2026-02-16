@@ -19,6 +19,7 @@ public class WebServer {
     private final String ggufDirectory;
     private HttpServer server;
     private ApiHandler apiHandler;
+    private OpenAIHandler openAIHandler;
 
     public WebServer(int port, String ggufDirectory) {
         this.port = port;
@@ -28,6 +29,7 @@ public class WebServer {
     /** Start the server (non-blocking). */
     public void start() throws IOException {
         apiHandler = new ApiHandler(ggufDirectory);
+        openAIHandler = new OpenAIHandler(apiHandler);
         String html = loadHtml();
 
         server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -40,6 +42,8 @@ public class WebServer {
                 exchange.sendResponseHeaders(200, response.length);
                 exchange.getResponseBody().write(response);
                 exchange.getResponseBody().close();
+            } else if (path.startsWith("/v1/")) {
+                openAIHandler.handle(exchange);
             } else if (path.startsWith("/api/")) {
                 apiHandler.handle(exchange);
             } else {

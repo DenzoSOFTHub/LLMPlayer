@@ -344,6 +344,7 @@ button.btn-danger {
     <div class="btn-row">
         <button id="loadBtn" onclick="loadModel()">Load</button>
         <button id="unloadBtn" class="btn-secondary" onclick="unloadModel()" disabled>Unload</button>
+        <button id="clearBtn" class="btn-secondary" onclick="clearChat()" disabled>Clear</button>
     </div>
 
     <div id="statusBar" style="font-size:12px;">
@@ -436,11 +437,13 @@ button.btn-danger {
 let modelLoaded = false;
 let isGenerating = false;
 let abortController = null;
+let conversationHistory = []; // OpenAI messages format: [{role, content}, ...]
 
 // Elements
 const modelSelect = document.getElementById('modelSelect');
 const loadBtn = document.getElementById('loadBtn');
 const unloadBtn = document.getElementById('unloadBtn');
+const clearBtn = document.getElementById('clearBtn');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const modelInfoSection = document.getElementById('modelInfoSection');
@@ -574,6 +577,7 @@ async function loadModel() {
         modelLoaded = true;
         setStatus('ready', 'Ready');
         unloadBtn.disabled = false;
+        clearBtn.disabled = false;
         chatInput.disabled = false;
         sendBtn.disabled = false;
         chatInput.focus();
@@ -590,11 +594,20 @@ async function unloadModel() {
     } catch (e) { /* ignore */ }
 
     modelLoaded = false;
+    conversationHistory = [];
     setStatus('disconnected', 'No model loaded');
     unloadBtn.disabled = true;
+    clearBtn.disabled = true;
     chatInput.disabled = true;
     sendBtn.disabled = true;
     modelInfoSection.style.display = 'none';
+}
+
+function clearChat() {
+    conversationHistory = [];
+    messagesDiv.innerHTML = '';
+    welcomeMsg.style.display = '';
+    messagesDiv.appendChild(welcomeMsg);
 }
 
 function showModelInfo(info, loadTimeMs, gpuDevice, gpuLayers, totalLayers) {
@@ -637,12 +650,13 @@ async function sendMessage() {
     // Hide welcome
     welcomeMsg.style.display = 'none';
 
-    // Add user message
+    // Add user message to UI and history
     addMessage('user', text);
+    conversationHistory.push({role: 'user', content: text});
     chatInput.value = '';
     chatInput.style.height = 'auto';
 
-    // Prepare assistant message
+    // Prepare assistant message bubble
     const assistantMsg = addMessage('assistant', '');
     const contentEl = assistantMsg.querySelector('.content');
 
@@ -652,28 +666,43 @@ async function sendMessage() {
     sendBtn.classList.add('stop-btn');
     sendBtn.onclick = stopGeneration;
 
+    // Build OpenAI-compatible request
+    const messages = [];
+    const sysMsg = document.getElementById('systemMessage').value.trim();
+    if (sysMsg) messages.push({role: 'system', content: sysMsg});
+    for (let i = 0; i < conversationHistory.length; i++) {
+        messages.push(conversationHistory[i]);
+    }
+
     const params = {
-        prompt: text,
+        model: 'default',
+        messages: messages,
+        stream: true,
         temperature: parseFloat(document.getElementById('temperature').value) || 0.7,
-        maxTokens: parseInt(document.getElementById('maxTokens').value) || 256,
-        topK: parseInt(document.getElementById('topK').value) || 40,
-        topP: parseFloat(document.getElementById('topP').value) || 0.9,
-        repPenalty: parseFloat(document.getElementById('repPenalty').value) || 1.1
+        max_tokens: parseInt(document.getElementById('maxTokens').value) || 256,
+        top_p: parseFloat(document.getElementById('topP').value) || 0.9,
+        top_k: parseInt(document.getElementById('topK').value) || 40,
+        repetition_penalty: parseFloat(document.getElementById('repPenalty').value) || 1.1
     };
 
-    const sysMsg = document.getElementById('systemMessage').value.trim();
-    if (sysMsg) params.systemMessage = sysMsg;
-
     let fullText = '';
+    let promptTokens = 0;
+    let completionTokens = 0;
+    const startTime = Date.now();
 
     try {
         abortController = new AbortController();
-        const res = await fetch('/api/chat', {
+        const res = await fetch('/v1/chat/completions', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(params),
             signal: abortController.signal
         });
+
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error((err.error && err.error.message) || 'Request failed');
+        }
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -689,29 +718,35 @@ async function sendMessage() {
 
             for (const line of lines) {
                 if (!line.startsWith('data: ')) continue;
-                const jsonStr = line.substring(6);
-                let event;
-                try { event = JSON.parse(jsonStr); } catch { continue; }
+                const data = line.substring(6).trim();
 
+                if (data === '[DONE]') continue;
+
+                let event;
+                try { event = JSON.parse(data); } catch { continue; }
+
+                // Handle error in stream
                 if (event.error) {
-                    contentEl.innerHTML = renderMarkdown(fullText + '\n\n[Error: ' + event.error + ']');
+                    const errMsg = event.error.message || event.error;
+                    contentEl.innerHTML = renderMarkdown(fullText + '\n\n[Error: ' + errMsg + ']');
                     break;
                 }
 
-                if (event.done) {
-                    if (event.stats) {
-                        const statsEl = document.createElement('div');
-                        statsEl.className = 'stats';
-                        statsEl.textContent = event.stats.tokenCount + ' tokens | ' +
-                            event.stats.tokensPerSecond + ' tok/s | ' +
-                            (event.stats.timeMs / 1000).toFixed(1) + 's' +
-                            (event.stopped ? ' (stopped)' : '');
-                        assistantMsg.appendChild(statsEl);
+                // Handle usage chunk (choices empty)
+                if (event.usage) {
+                    promptTokens = event.usage.prompt_tokens || 0;
+                    completionTokens = event.usage.completion_tokens || 0;
+                    continue;
+                }
+
+                // Handle content chunk
+                if (event.choices && event.choices.length > 0) {
+                    const choice = event.choices[0];
+                    if (choice.delta && choice.delta.content) {
+                        fullText += choice.delta.content;
+                        contentEl.innerHTML = renderMarkdown(fullText);
+                        scrollToBottom();
                     }
-                } else if (event.token !== undefined) {
-                    fullText += event.token;
-                    contentEl.innerHTML = renderMarkdown(fullText);
-                    scrollToBottom();
                 }
             }
         }
@@ -727,7 +762,19 @@ async function sendMessage() {
         sendBtn.classList.remove('stop-btn');
         sendBtn.onclick = sendMessage;
 
-        if (!fullText.trim()) {
+        if (fullText.trim()) {
+            // Add assistant response to conversation history
+            conversationHistory.push({role: 'assistant', content: fullText});
+
+            // Show stats
+            const elapsed = (Date.now() - startTime) / 1000;
+            const tokens = completionTokens || Math.max(1, fullText.split(/\s+/).length);
+            const tokPerSec = elapsed > 0 ? (tokens / elapsed).toFixed(1) : '?';
+            const statsEl = document.createElement('div');
+            statsEl.className = 'stats';
+            statsEl.textContent = tokens + ' tokens | ' + tokPerSec + ' tok/s | ' + elapsed.toFixed(1) + 's';
+            assistantMsg.appendChild(statsEl);
+        } else {
             contentEl.innerHTML = '<span style="color:var(--text-muted)">[No output]</span>';
         }
     }

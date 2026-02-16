@@ -11,6 +11,10 @@ public class Q3_KGpuTensor extends GpuFloatTensor {
     private static final int BLOCK_SIZE = 256;
     private static final int BLOCK_BYTES = 110;
     private static final ThreadLocal<float[]> DOT_BUFFER = ThreadLocal.withInitial(() -> new float[BLOCK_SIZE]);
+    private static final ThreadLocal<byte[]> TL_RAW = ThreadLocal.withInitial(() -> new byte[12]);
+    private static final ThreadLocal<byte[]> TL_HM = ThreadLocal.withInitial(() -> new byte[32]);
+    private static final ThreadLocal<byte[]> TL_QS = ThreadLocal.withInitial(() -> new byte[64]);
+    private static final ThreadLocal<int[]> TL_SC = ThreadLocal.withInitial(() -> new int[16]);
 
     public Q3_KGpuTensor(TensorData data, long size, GpuBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -59,7 +63,7 @@ public class Q3_KGpuTensor extends GpuFloatTensor {
         int q = (lowBits | (hbit << 2)) - 4;
 
         int subBlock = j / 16;
-        int[] sc = new int[16];
+        int[] sc = TL_SC.get();
         decodeAllScales(bo, sc);
 
         return d * (sc[subBlock] - 32) * q;
@@ -72,9 +76,9 @@ public class Q3_KGpuTensor extends GpuFloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherIdx = otherOffset;
         float[] tmp = DOT_BUFFER.get();
-        byte[] hm = new byte[32];
-        byte[] qs = new byte[64];
-        int[] sc = new int[16];
+        byte[] hm = TL_HM.get();
+        byte[] qs = TL_QS.get();
+        int[] sc = TL_SC.get();
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;
@@ -128,7 +132,7 @@ public class Q3_KGpuTensor extends GpuFloatTensor {
     }
 
     private void decodeAllScales(long bo, int[] sc) {
-        byte[] raw = new byte[12];
+        byte[] raw = TL_RAW.get();
         data.copyBytes(bo + 96, raw, 0, 12);
 
         for (int i = 0; i < 8; i++) {

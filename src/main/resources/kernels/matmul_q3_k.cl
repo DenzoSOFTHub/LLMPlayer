@@ -56,6 +56,7 @@ __kernel void matmul_q3_k(
 
                 int elemBase = hf * 128 + pair * 32;
 
+                #pragma unroll 4
                 for (int l = 0; l < 16; l++) {
                     uchar qsByte = weights[bo + 32 + qBase + l];
                     uchar hmByte = weights[bo + l];
@@ -65,6 +66,7 @@ __kernel void matmul_q3_k(
                     sum += dl0 * (float)q * input[inputBase + elemBase + l];
                 }
 
+                #pragma unroll 4
                 for (int l = 0; l < 16; l++) {
                     uchar qsByte = weights[bo + 32 + qBase + 16 + l];
                     uchar hmByte = weights[bo + 16 + l];

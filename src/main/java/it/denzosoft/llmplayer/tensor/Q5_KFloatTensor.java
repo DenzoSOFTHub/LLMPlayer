@@ -15,6 +15,11 @@ public class Q5_KFloatTensor extends FloatTensor {
     private static final int BLOCK_SIZE = 256;
     private static final int BLOCK_BYTES = 176;
     private static final ThreadLocal<float[]> DOT_BUFFER = ThreadLocal.withInitial(() -> new float[BLOCK_SIZE]);
+    private static final ThreadLocal<byte[]> TL_SCALE_BYTES = ThreadLocal.withInitial(() -> new byte[12]);
+    private static final ThreadLocal<byte[]> TL_QH = ThreadLocal.withInitial(() -> new byte[32]);
+    private static final ThreadLocal<byte[]> TL_QS = ThreadLocal.withInitial(() -> new byte[128]);
+    private static final ThreadLocal<int[]> TL_SCALES = ThreadLocal.withInitial(() -> new int[8]);
+    private static final ThreadLocal<int[]> TL_MINS = ThreadLocal.withInitial(() -> new int[8]);
 
     public Q5_KFloatTensor(TensorData data, long size) {
         super(data, size);
@@ -38,9 +43,18 @@ public class Q5_KFloatTensor extends FloatTensor {
         boolean isHigh = jLocal >= 32;
 
         int scaleIdx = group * 2 + (isHigh ? 1 : 0);
-        int[] scm = decodeScaleMin(bo, scaleIdx);
-        int sc = scm[0];
-        int m = scm[1];
+        byte[] scaleBytes = TL_SCALE_BYTES.get();
+        data.copyBytes(bo + 4, scaleBytes, 0, 12);
+        int sc, m;
+        if (scaleIdx < 4) {
+            sc = Byte.toUnsignedInt(scaleBytes[scaleIdx]) & 0x3F;
+            m = Byte.toUnsignedInt(scaleBytes[scaleIdx + 4]) & 0x3F;
+        } else {
+            sc = (Byte.toUnsignedInt(scaleBytes[scaleIdx + 4]) & 0x0F)
+               | ((Byte.toUnsignedInt(scaleBytes[scaleIdx - 4]) >> 6) << 4);
+            m = ((Byte.toUnsignedInt(scaleBytes[scaleIdx + 4]) >> 4) & 0x0F)
+              | ((Byte.toUnsignedInt(scaleBytes[scaleIdx]) >> 6) << 4);
+        }
 
         int qsOffset = group * 32 + l;
         int qsByte = Byte.toUnsignedInt(data.getByte(bo + 48 + qsOffset));
@@ -54,24 +68,6 @@ public class Q5_KFloatTensor extends FloatTensor {
         return d * sc * q - dmin * m;
     }
 
-    private int[] decodeScaleMin(long bo, int scaleIdx) {
-        byte[] scaleBytes = new byte[12];
-        data.copyBytes(bo + 4, scaleBytes, 0, 12);
-
-        int subBlock = scaleIdx;
-        int sc, m;
-        if (subBlock < 4) {
-            sc = Byte.toUnsignedInt(scaleBytes[subBlock]) & 0x3F;
-            m = Byte.toUnsignedInt(scaleBytes[subBlock + 4]) & 0x3F;
-        } else {
-            sc = (Byte.toUnsignedInt(scaleBytes[subBlock + 4]) & 0x0F)
-               | ((Byte.toUnsignedInt(scaleBytes[subBlock - 4]) >> 6) << 4);
-            m = ((Byte.toUnsignedInt(scaleBytes[subBlock + 4]) >> 4) & 0x0F)
-              | ((Byte.toUnsignedInt(scaleBytes[subBlock]) >> 6) << 4);
-        }
-        return new int[]{sc, m};
-    }
-
     @Override
     public float dot(long thisOffset, float[] other, int otherOffset, int length) {
         float result = 0f;
@@ -79,11 +75,11 @@ public class Q5_KFloatTensor extends FloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherBase = otherOffset;
         float[] tmp = DOT_BUFFER.get();
-        byte[] scaleBytes = new byte[12];
-        byte[] qh = new byte[32];
-        byte[] qs = new byte[128];
-        int[] scales = new int[8];
-        int[] mins = new int[8];
+        byte[] scaleBytes = TL_SCALE_BYTES.get();
+        byte[] qh = TL_QH.get();
+        byte[] qs = TL_QS.get();
+        int[] scales = TL_SCALES.get();
+        int[] mins = TL_MINS.get();
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;

@@ -32,6 +32,7 @@ __kernel void matmul_q6_k(
             int scBase = hf * 8;
             int elemBase = hf * 128;
 
+            #pragma unroll 8
             for (int l = 0; l < 32; l++) {
                 uchar qlByte0 = weights[bo + qlOff + l];
                 uchar qlByte1 = weights[bo + qlOff + 32 + l];

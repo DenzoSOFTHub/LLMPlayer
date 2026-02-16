@@ -8,14 +8,21 @@ public final class GenerationRequest {
     private final int maxTokens;
     private final SamplerConfig samplerConfig;
     private final boolean useChat;
+    private final boolean rawMode;
 
     public GenerationRequest(String prompt, String systemMessage, int maxTokens,
                              SamplerConfig samplerConfig, boolean useChat) {
+        this(prompt, systemMessage, maxTokens, samplerConfig, useChat, false);
+    }
+
+    public GenerationRequest(String prompt, String systemMessage, int maxTokens,
+                             SamplerConfig samplerConfig, boolean useChat, boolean rawMode) {
         this.prompt = prompt;
         this.systemMessage = systemMessage;
         this.maxTokens = maxTokens;
         this.samplerConfig = samplerConfig;
         this.useChat = useChat;
+        this.rawMode = rawMode;
     }
 
     public String prompt() { return prompt; }
@@ -23,6 +30,8 @@ public final class GenerationRequest {
     public int maxTokens() { return maxTokens; }
     public SamplerConfig samplerConfig() { return samplerConfig; }
     public boolean useChat() { return useChat; }
+    /** True if prompt is pre-formatted (multi-turn) but still needs BOS prepended. */
+    public boolean rawMode() { return rawMode; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -32,14 +41,16 @@ public final class GenerationRequest {
         private int maxTokens = 256;
         private SamplerConfig samplerConfig = SamplerConfig.DEFAULT;
         private boolean useChat = true;
+        private boolean rawMode = false;
 
         public Builder prompt(String p) { this.prompt = p; return this; }
         public Builder systemMessage(String s) { this.systemMessage = s; return this; }
         public Builder maxTokens(int m) { this.maxTokens = m; return this; }
         public Builder samplerConfig(SamplerConfig sc) { this.samplerConfig = sc; return this; }
         public Builder useChat(boolean uc) { this.useChat = uc; return this; }
+        public Builder rawMode(boolean rm) { this.rawMode = rm; return this; }
         public GenerationRequest build() {
-            return new GenerationRequest(prompt, systemMessage, maxTokens, samplerConfig, useChat);
+            return new GenerationRequest(prompt, systemMessage, maxTokens, samplerConfig, useChat, rawMode);
         }
     }
 }

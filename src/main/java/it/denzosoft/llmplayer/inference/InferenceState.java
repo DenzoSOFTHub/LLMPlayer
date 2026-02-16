@@ -10,11 +10,11 @@ public class InferenceState {
 
     public final float[] x;      // current activation [embeddingLength]
     public final float[] xb;     // activation after rmsnorm [embeddingLength]
-    public final float[] xb2;    // second buffer [embeddingLength]
+    public final float[] xb2;    // second buffer [max(embeddingLength, headCount*headSize)]
     public final float[] hb;     // FFN hidden buffer [intermediateSize]
     public final float[] hb2;    // FFN hidden buffer 2 [intermediateSize]
     public final float[] hbPacked; // FFN packed buffer [2 * intermediateSize] - for GLM4 packed FFN
-    public final float[] q;      // query [embeddingLength]
+    public final float[] q;      // query [max(embeddingLength, headCount*headSize)]
     public final float[] k;      // key [kvDim]
     public final float[] v;      // value [kvDim]
     public final float[] att;    // attention scores [headCount * maxSeqLen]
@@ -28,11 +28,12 @@ public class InferenceState {
 
         this.x = new float[dim];
         this.xb = new float[dim];
-        this.xb2 = new float[dim];
+        int qDim = Math.max(dim, config.headCount() * config.headSize());
+        this.xb2 = new float[qDim];
         this.hb = new float[ffnDim];
         this.hb2 = new float[ffnDim];
         this.hbPacked = new float[2 * ffnDim];
-        this.q = new float[dim];
+        this.q = new float[qDim];
         this.k = new float[kvDim];
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];

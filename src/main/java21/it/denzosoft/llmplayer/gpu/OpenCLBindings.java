@@ -23,6 +23,7 @@ public final class OpenCLBindings {
     public static final int CL_DEVICE_GLOBAL_MEM_SIZE = 0x101F;
     public static final int CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002;
     public static final int CL_DEVICE_TYPE = 0x1000;
+    public static final int CL_DEVICE_MAX_WORK_GROUP_SIZE = 0x1004;
 
     // cl_mem_flags
     public static final long CL_MEM_READ_ONLY = (1L << 2);

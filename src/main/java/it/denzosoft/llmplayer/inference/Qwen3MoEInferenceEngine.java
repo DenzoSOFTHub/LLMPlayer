@@ -324,16 +324,23 @@ public class Qwen3MoEInferenceEngine {
         Arrays.fill(outIndices, 0, k, -1);
         Arrays.fill(outValues, 0, k, Float.NEGATIVE_INFINITY);
 
+        // Track min position persistently — only rescan when replaced
+        int minPos = 0;
+        float minVal = Float.NEGATIVE_INFINITY;
+
         for (int i = 0; i < n; i++) {
-            int minIdx = 0;
-            for (int j = 1; j < k; j++) {
-                if (outValues[j] < outValues[minIdx]) {
-                    minIdx = j;
+            if (logits[i] > minVal) {
+                outValues[minPos] = logits[i];
+                outIndices[minPos] = i;
+                // Rescan for new minimum
+                minPos = 0;
+                minVal = outValues[0];
+                for (int j = 1; j < k; j++) {
+                    if (outValues[j] < minVal) {
+                        minPos = j;
+                        minVal = outValues[j];
+                    }
                 }
-            }
-            if (logits[i] > outValues[minIdx]) {
-                outValues[minIdx] = logits[i];
-                outIndices[minIdx] = i;
             }
         }
     }

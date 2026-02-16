@@ -25,6 +25,7 @@ __kernel void matmul_q4_0(
         float scale = vload_half(0, (__global const half*)(weights + bo));
 
         int inputBase = b * 32;
+        #pragma unroll 4
         for (int i = 0; i < 16; i++) {
             uchar packed = weights[bo + 2 + i];
             int lo = (packed & 0x0F) - 8;

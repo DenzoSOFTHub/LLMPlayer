@@ -350,6 +350,15 @@ public class ApiHandler {
         sendJson(exchange, 200, result);
     }
 
+    // --- Accessors for OpenAIHandler ---
+
+    LLMEngine getEngine() { return engine; }
+    String getGgufDirectory() { return ggufDirectory; }
+    boolean isGenerating() { return generating; }
+    void setGenerating(boolean g) { generating = g; }
+    boolean isStopRequested() { return stopRequested; }
+    void setStopRequested(boolean s) { stopRequested = s; }
+
     public void shutdown() {
         stopRequested = true;
         if (engine != null) {
