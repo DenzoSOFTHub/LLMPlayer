@@ -27,6 +27,10 @@ public final class ModelConfig {
     private final float ropeScalingFactor;
     private final int ropeOrigContextLength;
     private final float yarnLogMultiplier;
+    private final float finalLogitSoftCap;
+    private final float attnLogitSoftCap;
+    private final float logitScale;
+    private final int slidingWindow;
 
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
@@ -34,7 +38,9 @@ public final class ModelConfig {
                        int ropeDimensionCount, int keyLength, int valueLength, int kvLoraRank,
                        int leadingDenseBlockCount, int expertCount, int expertUsedCount,
                        int expertSharedCount, int expertFfnLength, float ropeScalingFactor,
-                       int ropeOrigContextLength, float yarnLogMultiplier) {
+                       int ropeOrigContextLength, float yarnLogMultiplier,
+                       float finalLogitSoftCap, float attnLogitSoftCap, float logitScale,
+                       int slidingWindow) {
         this.architecture = architecture;
         this.name = name;
         this.embeddingLength = embeddingLength;
@@ -61,6 +67,10 @@ public final class ModelConfig {
         this.ropeScalingFactor = ropeScalingFactor;
         this.ropeOrigContextLength = ropeOrigContextLength;
         this.yarnLogMultiplier = yarnLogMultiplier;
+        this.finalLogitSoftCap = finalLogitSoftCap;
+        this.attnLogitSoftCap = attnLogitSoftCap;
+        this.logitScale = logitScale;
+        this.slidingWindow = slidingWindow;
     }
 
     public ModelArchitecture architecture() { return architecture; }
@@ -89,6 +99,10 @@ public final class ModelConfig {
     public float ropeScalingFactor() { return ropeScalingFactor; }
     public int ropeOrigContextLength() { return ropeOrigContextLength; }
     public float yarnLogMultiplier() { return yarnLogMultiplier; }
+    public float finalLogitSoftCap() { return finalLogitSoftCap; }
+    public float attnLogitSoftCap() { return attnLogitSoftCap; }
+    public float logitScale() { return logitScale; }
+    public int slidingWindow() { return slidingWindow; }
 
     public static ModelConfig fromMetadata(it.denzosoft.llmplayer.gguf.GGUFMetadata metadata) {
         String archName = metadata.getString("general.architecture", "llama");
@@ -114,15 +128,18 @@ public final class ModelConfig {
         int headSize = defaultHeadSize;
         int kvDim = headSize * headCountKV;
 
-        // Llama/DeepSeek2/Mistral3 use ROPE_TYPE_NORMAL (consecutive pairs),
-        // Qwen/Falcon/GLM4/Phi3/Qwen3MoE use ROPE_TYPE_NEOX (split-half)
+        // Llama/DeepSeek2/Mistral3/Command-R/Gemma/Llama4 use ROPE_TYPE_NORMAL (consecutive pairs),
+        // Qwen/Falcon/GLM4/Phi3/Qwen3MoE/OLMo2/GPT-OSS use ROPE_TYPE_NEOX (split-half)
         int ropeType;
         if (arch == ModelArchitecture.LLAMA || arch == ModelArchitecture.DEEPSEEK2
-                || arch == ModelArchitecture.MISTRAL3) {
+                || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
+                || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
+                || arch == ModelArchitecture.LLAMA4) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
                 || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
-                || arch == ModelArchitecture.QWEN3MOE) {
+                || arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.OLMO2
+                || arch == ModelArchitecture.GPT_OSS) {
             ropeType = 2;  // ROPE_TYPE_NEOX
         } else {
             ropeType = 0;
@@ -169,12 +186,23 @@ public final class ModelConfig {
             yarnLogMultiplier = metadata.getFloat(prefix + "rope.scaling.yarn_log_multiplier", 0.0f);
         }
 
+        // Gemma2/3 logit soft-capping
+        float finalLogitSoftCap = metadata.getFloat(prefix + "final_logit_softcapping", 0f);
+        float attnLogitSoftCap = metadata.getFloat(prefix + "attn_logit_softcapping", 0f);
+
+        // Command-R logit scale (multiplied to output logits)
+        float logitScale = metadata.getFloat(prefix + "logit_scale", 0f);
+
+        // ISWA sliding window (GPT-OSS: 128 tokens for alternating layers)
+        int slidingWindow = metadata.getInt(prefix + "attention.sliding_window", 0);
+
         return new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
             contextLength, vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim,
             ropeType, ropeDimensionCount,
             keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
             expertCount, expertUsedCount, expertSharedCount, expertFfnLength,
-            ropeScalingFactor, ropeOrigContextLength, yarnLogMultiplier);
+            ropeScalingFactor, ropeOrigContextLength, yarnLogMultiplier,
+            finalLogitSoftCap, attnLogitSoftCap, logitScale, slidingWindow);
     }
 
     @Override
@@ -190,6 +218,9 @@ public final class ModelConfig {
         if (expertCount > 0) {
             sb.append(String.format(", experts=%d(top%d+%dshared), expertFfn=%d, denseBlocks=%d",
                 expertCount, expertUsedCount, expertSharedCount, expertFfnLength, leadingDenseBlockCount));
+        }
+        if (slidingWindow > 0) {
+            sb.append(String.format(", slidingWindow=%d", slidingWindow));
         }
         sb.append('}');
         return sb.toString();

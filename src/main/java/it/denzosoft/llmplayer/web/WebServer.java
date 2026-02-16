@@ -20,6 +20,8 @@ public class WebServer {
     private HttpServer server;
     private ApiHandler apiHandler;
     private OpenAIHandler openAIHandler;
+    private AnthropicHandler anthropicHandler;
+    private ChatHandler chatHandler;
 
     public WebServer(int port, String ggufDirectory) {
         this.port = port;
@@ -30,7 +32,10 @@ public class WebServer {
     public void start() throws IOException {
         apiHandler = new ApiHandler(ggufDirectory);
         openAIHandler = new OpenAIHandler(apiHandler);
+        anthropicHandler = new AnthropicHandler(apiHandler);
+        chatHandler = new ChatHandler(ggufDirectory);
         String html = loadHtml();
+        String chatHtml = loadResource("/chat-ui.html");
 
         server = HttpServer.create(new InetSocketAddress(port), 0);
 
@@ -42,8 +47,18 @@ public class WebServer {
                 exchange.sendResponseHeaders(200, response.length);
                 exchange.getResponseBody().write(response);
                 exchange.getResponseBody().close();
+            } else if ("/chat".equals(path) || "/chat/".equals(path)) {
+                byte[] response = chatHtml.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+                exchange.sendResponseHeaders(200, response.length);
+                exchange.getResponseBody().write(response);
+                exchange.getResponseBody().close();
+            } else if ("/v1/messages".equals(path) || "/v1/messages/count_tokens".equals(path)) {
+                anthropicHandler.handle(exchange);
             } else if (path.startsWith("/v1/")) {
                 openAIHandler.handle(exchange);
+            } else if (path.startsWith("/api/chats")) {
+                chatHandler.handle(exchange);
             } else if (path.startsWith("/api/")) {
                 apiHandler.handle(exchange);
             } else {
@@ -103,9 +118,13 @@ public class WebServer {
     }
 
     private String loadHtml() throws IOException {
-        try (InputStream is = getClass().getResourceAsStream("/web-ui.html")) {
+        return loadResource("/web-ui.html");
+    }
+
+    private String loadResource(String resourcePath) throws IOException {
+        try (InputStream is = getClass().getResourceAsStream(resourcePath)) {
             if (is == null) {
-                throw new IOException("web-ui.html not found in resources");
+                throw new IOException(resourcePath + " not found in resources");
             }
             return new String(readAllBytes(is), StandardCharsets.UTF_8);
         }

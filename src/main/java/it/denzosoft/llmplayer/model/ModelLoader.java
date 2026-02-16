@@ -84,9 +84,15 @@ public class ModelLoader {
         DeepSeek2Weights ds2Weights = null;
         Qwen3MoEWeights q3moeWeights = null;
 
-        if (config.architecture() == ModelArchitecture.DEEPSEEK2) {
+        ModelArchitecture arch = config.architecture();
+        boolean isMoEArch = config.expertCount() > 0;
+        if (arch == ModelArchitecture.DEEPSEEK2) {
             ds2Weights = loadDeepSeek2Weights(gguf, config, gpuLayers, moeOptimizedGpu);
-        } else if (config.architecture() == ModelArchitecture.QWEN3MOE) {
+        } else if (arch == ModelArchitecture.QWEN3MOE
+                || (arch == ModelArchitecture.LLAMA4 && isMoEArch)
+                || (arch == ModelArchitecture.GPT_OSS && isMoEArch)
+                || (arch == ModelArchitecture.GLM4 && isMoEArch)) {
+            // Qwen3MoE weight format works for any GQA + MoE architecture
             q3moeWeights = loadQwen3MoEWeights(gguf, config, gpuLayers, moeOptimizedGpu);
         } else {
             weights = loadWeights(gguf, config, gpuLayers);
@@ -139,8 +145,8 @@ public class ModelLoader {
             }
 
             layers[i] = new TransformerLayerWeights(
-                loadTensor(gguf, ArchitectureRegistry.attnNorm(i)),
-                loadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),
+                tryLoadTensor(gguf, ArchitectureRegistry.attnNorm(i)),   // null for OLMo2 (post-norm only)
+                tryLoadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),    // null for OLMo2/Command-R
                 wq, wk, wv,
                 loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
                 wqkv,
@@ -151,10 +157,10 @@ public class ModelLoader {
                 tryLoadTensor(gguf, ArchitectureRegistry.attnQBias(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnKBias(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnVBias(i)),
-                // Qwen3 QK norm (null if absent)
+                // Qwen3/OLMo2 QK norm (null if absent)
                 tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i)),
-                // GLM4 post-norm (null if absent)
+                // GLM4/Gemma2/OLMo2 post-norm (null if absent)
                 tryLoadTensor(gguf, ArchitectureRegistry.postAttnNorm(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.postFfnNorm(i))
             );
@@ -300,7 +306,7 @@ public class ModelLoader {
                 // GPU ON for attention tensors
                 TensorFactory.setGpuBufferManager(savedGpuManager);
                 FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
-                FloatTensor ffnNorm = loadTensor(gguf, ArchitectureRegistry.ffnNorm(i));
+                FloatTensor ffnNorm = loadFfnNorm(gguf, i);
                 FloatTensor wq = loadTensor(gguf, ArchitectureRegistry.attnQ(i));
                 FloatTensor wk = loadTensor(gguf, ArchitectureRegistry.attnK(i));
                 FloatTensor wv = loadTensor(gguf, ArchitectureRegistry.attnV(i));
@@ -308,24 +314,42 @@ public class ModelLoader {
                 FloatTensor qNorm = tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i));
                 FloatTensor kNorm = tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i));
 
+                // Attention biases (GPT-OSS)
+                FloatTensor wqBias = tryLoadTensor(gguf, ArchitectureRegistry.attnQBias(i));
+                FloatTensor wkBias = tryLoadTensor(gguf, ArchitectureRegistry.attnKBias(i));
+                FloatTensor wvBias = tryLoadTensor(gguf, ArchitectureRegistry.attnVBias(i));
+                FloatTensor woBias = tryLoadTensor(gguf, ArchitectureRegistry.attnOutputBias(i));
+
                 // GPU OFF for expert tensors (large, only top-K used per token)
                 TensorFactory.setGpuBufferManager(null);
                 FloatTensor ffnGateExps = loadTensor(gguf, ArchitectureRegistry.ffnGateExps(i));
                 FloatTensor ffnUpExps = loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i));
                 FloatTensor ffnDownExps = loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i));
 
+                // Expert biases (GPT-OSS)
+                FloatTensor ffnGateExpsBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateExpsBias(i));
+                FloatTensor ffnUpExpsBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpExpsBias(i));
+                FloatTensor ffnDownExpsBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownExpsBias(i));
+
                 // GPU ON for router + shared experts (small)
                 TensorFactory.setGpuBufferManager(savedGpuManager);
                 FloatTensor ffnGateInp = loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
+                FloatTensor ffnGateInpBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateInpBias(i));
                 FloatTensor ffnGateShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i));
                 FloatTensor ffnUpShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
                 FloatTensor ffnDownShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
+
+                // Attention sinks (GPT-OSS)
+                FloatTensor attnSinks = tryLoadTensor(gguf, ArchitectureRegistry.attnSinks(i));
 
                 layers[i] = new Qwen3MoELayerWeights(
                     attnNorm, ffnNorm, wq, wk, wv, wo, qNorm, kNorm,
                     null, null, null, // no dense FFN
                     ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps,
-                    ffnGateShexp, ffnUpShexp, ffnDownShexp
+                    ffnGateShexp, ffnUpShexp, ffnDownShexp,
+                    wqBias, wkBias, wvBias, woBias,
+                    ffnGateInpBias, ffnGateExpsBias, ffnUpExpsBias, ffnDownExpsBias,
+                    attnSinks
                 );
             } else {
                 // Standard first-N-layers offload or dense leading layers
@@ -336,13 +360,30 @@ public class ModelLoader {
                     TensorFactory.setGpuBufferManager(null);
                 }
 
+                FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
+                FloatTensor ffnNorm = loadFfnNorm(gguf, i);
+                FloatTensor wq = loadTensor(gguf, ArchitectureRegistry.attnQ(i));
+                FloatTensor wk = loadTensor(gguf, ArchitectureRegistry.attnK(i));
+                FloatTensor wv = loadTensor(gguf, ArchitectureRegistry.attnV(i));
+                FloatTensor wo = loadTensor(gguf, ArchitectureRegistry.attnOutput(i));
+
+                // Attention biases (GPT-OSS)
+                FloatTensor wqBias = tryLoadTensor(gguf, ArchitectureRegistry.attnQBias(i));
+                FloatTensor wkBias = tryLoadTensor(gguf, ArchitectureRegistry.attnKBias(i));
+                FloatTensor wvBias = tryLoadTensor(gguf, ArchitectureRegistry.attnVBias(i));
+                FloatTensor woBias = tryLoadTensor(gguf, ArchitectureRegistry.attnOutputBias(i));
+
+                // Router/expert biases (GPT-OSS)
+                FloatTensor ffnGateInpBias = isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnGateInpBias(i));
+                FloatTensor ffnGateExpsBias = isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnGateExpsBias(i));
+                FloatTensor ffnUpExpsBias = isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnUpExpsBias(i));
+                FloatTensor ffnDownExpsBias = isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnDownExpsBias(i));
+
+                // Attention sinks (GPT-OSS)
+                FloatTensor attnSinks = tryLoadTensor(gguf, ArchitectureRegistry.attnSinks(i));
+
                 layers[i] = new Qwen3MoELayerWeights(
-                    loadTensor(gguf, ArchitectureRegistry.attnNorm(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnK(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnV(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                    attnNorm, ffnNorm, wq, wk, wv, wo,
                     tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
                     tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i)),
                     isDense ? loadTensor(gguf, ArchitectureRegistry.ffnGate(i)) : null,
@@ -354,7 +395,10 @@ public class ModelLoader {
                     isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i)),
                     isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i)),
                     isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i)),
-                    isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i))
+                    isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i)),
+                    wqBias, wkBias, wvBias, woBias,
+                    ffnGateInpBias, ffnGateExpsBias, ffnUpExpsBias, ffnDownExpsBias,
+                    attnSinks
                 );
             }
         }
@@ -367,6 +411,16 @@ public class ModelLoader {
         float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
 
         return new Qwen3MoEWeights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
+    }
+
+    /** Load ffn_norm with fallback to post_attention_norm (GPT-OSS naming). */
+    private static FloatTensor loadFfnNorm(GGUFFile gguf, int layer) {
+        FloatTensor t = tryLoadTensor(gguf, ArchitectureRegistry.ffnNorm(layer));
+        if (t != null) return t;
+        t = tryLoadTensor(gguf, ArchitectureRegistry.postAttnNorm(layer));
+        if (t != null) return t;
+        throw new IllegalStateException("Required tensor not found: " + ArchitectureRegistry.ffnNorm(layer)
+            + " (also tried " + ArchitectureRegistry.postAttnNorm(layer) + ")");
     }
 
     private static float[] loadRopeFreqFactors(GGUFFile gguf, ModelConfig config) {

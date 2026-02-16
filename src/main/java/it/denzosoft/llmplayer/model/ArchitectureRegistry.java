@@ -46,12 +46,24 @@ public final class ArchitectureRegistry {
     public static String attnKvANorm(int layer) { return "blk." + layer + ".attn_kv_a_norm.weight"; }
     public static String attnKvB(int layer) { return "blk." + layer + ".attn_kv_b.weight"; }
 
+    // Attention output bias (GPT-OSS)
+    public static String attnOutputBias(int layer) { return "blk." + layer + ".attn_output.bias"; }
+
     // DeepSeek2 MoE
     public static String ffnGateInp(int layer) { return "blk." + layer + ".ffn_gate_inp.weight"; }
+    public static String ffnGateInpBias(int layer) { return "blk." + layer + ".ffn_gate_inp.bias"; }
     public static String ffnGateExps(int layer) { return "blk." + layer + ".ffn_gate_exps.weight"; }
     public static String ffnUpExps(int layer) { return "blk." + layer + ".ffn_up_exps.weight"; }
     public static String ffnDownExps(int layer) { return "blk." + layer + ".ffn_down_exps.weight"; }
     public static String ffnGateShexp(int layer) { return "blk." + layer + ".ffn_gate_shexp.weight"; }
     public static String ffnUpShexp(int layer) { return "blk." + layer + ".ffn_up_shexp.weight"; }
     public static String ffnDownShexp(int layer) { return "blk." + layer + ".ffn_down_shexp.weight"; }
+
+    // MoE expert biases (GPT-OSS)
+    public static String ffnGateExpsBias(int layer) { return "blk." + layer + ".ffn_gate_exps.bias"; }
+    public static String ffnUpExpsBias(int layer) { return "blk." + layer + ".ffn_up_exps.bias"; }
+    public static String ffnDownExpsBias(int layer) { return "blk." + layer + ".ffn_down_exps.bias"; }
+
+    // GPT-OSS attention sinks: per-head learned biases for softmax
+    public static String attnSinks(int layer) { return "blk." + layer + ".attn_sinks.weight"; }
 }

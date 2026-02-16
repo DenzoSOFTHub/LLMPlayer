@@ -1,5 +1,6 @@
 package it.denzosoft.llmplayer.inference;
 
+import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.ModelWeights;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
@@ -22,6 +23,9 @@ public class InferenceEngine {
     private final TransformerBlock block;
     private final float[] normWeightCache;
     private final int maxSeqLen;
+    private final float finalLogitSoftCap;
+    private final float logitScale;
+    private final float embeddingScale;
 
     public InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen) {
         this(config, weights, maxSeqLen, null);
@@ -39,6 +43,17 @@ public class InferenceEngine {
         attention.initNormCachesIfNeeded(weights.layers());
         SwiGLUFFN ffn = new SwiGLUFFN(config);
         this.block = new TransformerBlock(config, attention, ffn, weights.layers());
+
+        this.finalLogitSoftCap = config.finalLogitSoftCap();
+        this.logitScale = config.logitScale();
+
+        // Gemma models scale embeddings by sqrt(dim)
+        ModelArchitecture arch = config.architecture();
+        if (arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3) {
+            this.embeddingScale = (float) Math.sqrt(config.embeddingLength());
+        } else {
+            this.embeddingScale = 0f;
+        }
 
         // Pre-cache output norm weights
         int dim = config.embeddingLength();
@@ -68,6 +83,13 @@ public class InferenceEngine {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
 
+        // Gemma: scale embedding by sqrt(dim)
+        if (embeddingScale > 0f) {
+            for (int i = 0; i < dim; i++) {
+                state.x[i] *= embeddingScale;
+            }
+        }
+
         // 2. Forward through all transformer layers
         for (int layer = 0; layer < config.blockCount(); layer++) {
             block.forward(state, weights.layers()[layer], layer, position);
@@ -79,6 +101,20 @@ public class InferenceEngine {
         // 4. Output projection: logits = output_weight * xb
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+
+        // 5. Logit scaling (Command-R): logits *= logitScale
+        if (logitScale > 0f) {
+            for (int i = 0; i < vocabSize; i++) {
+                state.logits[i] *= logitScale;
+            }
+        }
+
+        // 6. Logit soft-capping (Gemma2/3): logits = softCap * tanh(logits / softCap)
+        if (finalLogitSoftCap > 0f) {
+            for (int i = 0; i < vocabSize; i++) {
+                state.logits[i] = finalLogitSoftCap * (float) Math.tanh(state.logits[i] / finalLogitSoftCap);
+            }
+        }
 
         return state.logits;
     }

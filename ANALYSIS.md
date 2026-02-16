@@ -35,8 +35,7 @@ F32, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
 |---|---|---|---|---|
 | **IQ4_XS** | 4.46 | **High** | Medium | 256-value lookup table. Bartowski includes in almost all releases |
 | **IQ4_NL** | 4.50 | Medium | Low | Base for IQ4_XS, non-linear 4-bit with lookup |
-| **IQ3_M** | 3.76 | Medium | Medium | Importance quant, 3-bit grid |
-| **IQ3_S** | 3.66 | Medium | Medium | Smaller variant |
+| **IQ3_S** | 3.66 | Medium | Medium | Importance quant, 3-bit grid |
 | **IQ3_XXS** | 3.06 | Low-Medium | Medium | Ultra-compressed |
 | **IQ2_XXS** | 2.38 | Low-Medium | High | Bartowski includes as an extreme option |
 | **IQ2_XS** | 2.60 | Low | High | |
@@ -112,26 +111,57 @@ F32, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
 
 ---
 
-## 5. Prioritized Roadmap
+## 5. API Capabilities — Implemented vs Missing
+
+### Implemented (v1.2.0)
+- `/v1/chat/completions` (streaming + non-streaming)
+- `/v1/models`
+- Multi-turn conversation support
+- Stop sequences
+- Bearer token acceptance
+- CORS headers
+
+### Not implemented
+
+| Feature | Effort | Impact | Notes |
+|---|---|---|---|
+| **Tool calling / Function calling** | ~400 LOC | **High** | `tools` parameter in `/v1/chat/completions` — required by LangChain agents, CrewAI, Cursor |
+| **Grammar / JSON mode** | ~400 LOC | **High** | `response_format: {type: "json_object"}` — structured output for extraction pipelines |
+| **Embeddings endpoint** (`/v1/embeddings`) | ~200 LOC | Medium | Enables local RAG pipelines |
+| **KV cache reuse across requests** | ~500 LOC | **High** | Avoid re-computing prefill for multi-turn chat — major latency improvement |
+| **Batch prefill** | ~1000 LOC | **High** | Process N tokens in one forward pass instead of sequential loop (2-10x prefill speedup) |
+| **Speculative decoding** | ~800 LOC | Medium | Small draft model accelerates large model decode (1.5-2x) |
+| **LoRA adapter loading** | ~600 LOC | Medium | Hot-swap fine-tuned adapters on base models |
+| **Multimodal / vision** | ~1500 LOC | Medium | Process images with LLaVA/Qwen-VL style models |
+
+---
+
+## 6. Prioritized Roadmap
 
 ### Tier 1 — High ROI (high popularity, low-medium complexity)
-1. **IQ4_XS + IQ4_NL** — unlocks bartowski models (~200 LOC)
+1. **IQ4_XS + IQ4_NL** — unlocks Bartowski models (~200 LOC)
 2. **Gemma2/Gemma3** — unlocks Google models (~300 LOC)
-3. **Qwen3Next/Qwen3.5** — unlocks latest Qwen (~50 LOC if minimal differences)
-4. **GLM4-MoE** — combines existing pieces (~200 LOC)
+3. **Tool calling** — required by most agent frameworks (~400 LOC)
+4. **JSON mode / response_format** — structured output (~400 LOC)
+5. **Qwen3Next/Qwen3.5** — latest Qwen, minimal changes (~50 LOC)
+6. **GLM4-MoE** — combines existing GLM4 + MoE code (~200 LOC)
 
 ### Tier 2 — Medium ROI
-5. **IQ3_M/IQ3_S/IQ3_XXS** — importance quant 3-bit (~300 LOC)
-6. **OpenAI gpt-oss** — requires MXFP4 + MoE architecture (~500 LOC)
-7. **Command-R/Cohere2, OLMo2** — standard transformer (~100 LOC each)
+7. **KV cache reuse across requests** — major chat latency improvement (~500 LOC)
+8. **IQ3_S/IQ3_XXS** — importance quant 3-bit (~300 LOC). Note: IQ3_M not in GGMLType enum
+9. **OpenAI gpt-oss** — requires MXFP4 + MoE architecture (~500 LOC)
+10. **Command-R/Cohere2, OLMo2** — standard transformer (~100 LOC each)
+11. **Embeddings endpoint** (`/v1/embeddings`) — enables RAG (~200 LOC)
+12. **Llama4 MoE** — growing popularity (~300 LOC)
 
-### Tier 3 — Low ROI (high complexity, niche)
-8. Batch prefill (~1000 LOC, only optimization with real impact)
-9. Mamba/RWKV (completely different engines, ~1500+ LOC each)
-10. Kernel fusion (useful only with batch prefill)
+### Tier 3 — High effort, significant impact
+13. **Batch prefill** — only optimization with real impact on prefill speed (~1000 LOC)
+14. **Speculative decoding** — 1.5-2x decode speedup with draft model (~800 LOC)
+15. **LoRA adapter loading** — fine-tune support (~600 LOC)
 
-### Tier 4 — Future
-11. Llama4 MoE
-12. Falcon-H1 (hybrid Mamba+Attention)
-13. MXFP4 quantization type
-14. Multimodal support (vision models)
+### Tier 4 — High effort, niche
+16. Falcon-H1 (hybrid Mamba+Attention, ~1000 LOC)
+17. Mamba/RWKV (completely different engines, ~1500+ LOC each)
+18. MXFP4 quantization type
+19. Multimodal / vision support (~1500 LOC)
+20. Kernel fusion (useful only with batch prefill)

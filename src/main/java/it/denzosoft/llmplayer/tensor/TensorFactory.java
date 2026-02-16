@@ -41,6 +41,12 @@ public final class TensorFactory {
         if (type == GGMLType.Q6_K) return new Q6_KFloatTensor(data, elementCount);
         if (type == GGMLType.Q5_K) return new Q5_KFloatTensor(data, elementCount);
         if (type == GGMLType.Q2_K) return new Q2_KFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ4_NL) return new IQ4_NLFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ4_XS) return new IQ4_XSFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ3_XXS) return new IQ3_XXSFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ3_S) return new IQ3_SFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ2_S) return new IQ2_SFloatTensor(data, elementCount);
+        if (type == GGMLType.MXFP4) return new MXFP4FloatTensor(data, elementCount);
         throw new UnsupportedOperationException("Unsupported tensor type: " + type);
     }
 

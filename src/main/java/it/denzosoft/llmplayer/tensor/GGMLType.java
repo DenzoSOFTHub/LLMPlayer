@@ -30,7 +30,9 @@ public enum GGMLType {
     I64(27, 1, 8),
     F64(28, 1, 8),
     IQ1_M(29, 256, 56),
-    BF16(30, 1, 2);
+    BF16(30, 1, 2),
+    // Microscaling FP4: 32 weights per block, 16 bytes FP4 data + 1 byte E8M0 scale = 17 bytes
+    MXFP4(39, 32, 17);
 
     private final int id;
     private final int blockSize;
@@ -50,7 +52,7 @@ public enum GGMLType {
         return (nElements / blockSize) * typeSize;
     }
 
-    private static final GGMLType[] BY_ID = new GGMLType[31];
+    private static final GGMLType[] BY_ID = new GGMLType[40];
     static {
         for (GGMLType t : values()) {
             BY_ID[t.id] = t;

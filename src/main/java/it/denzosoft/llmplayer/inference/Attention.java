@@ -15,6 +15,7 @@ public class Attention {
 
     private final ModelConfig config;
     private final RoPE rope;
+    private final float attnLogitSoftCap;
     // Cached per-head QK norm weights (null if not used)
     private float[][] cachedQNorm;
     private float[][] cachedKNorm;
@@ -22,6 +23,7 @@ public class Attention {
     public Attention(ModelConfig config, RoPE rope) {
         this.config = config;
         this.rope = rope;
+        this.attnLogitSoftCap = config.attnLogitSoftCap();
     }
 
     /**
@@ -125,7 +127,12 @@ public class Attention {
                 for (int i = 0; i < headSize; i++) {
                     score += state.q[qOffset + i] * keyCache[kOffset + i];
                 }
-                state.att[attOffset + t] = score * scaleFactor;
+                float s = score * scaleFactor;
+                // Attention logit soft-capping (Gemma2/3)
+                if (attnLogitSoftCap > 0f) {
+                    s = attnLogitSoftCap * (float) Math.tanh(s / attnLogitSoftCap);
+                }
+                state.att[attOffset + t] = s;
             }
 
             // Softmax over attention scores
