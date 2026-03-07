@@ -412,7 +412,7 @@ public class ApiHandler {
     // --- Minimal JSON serializer/parser ---
 
     @SuppressWarnings("unchecked")
-    static String toJson(Object obj) {
+    public static String toJson(Object obj) {
         if (obj == null) return "null";
         if (obj instanceof Boolean) return obj.toString();
         if (obj instanceof Number) {
@@ -480,7 +480,7 @@ public class ApiHandler {
         return sb.toString();
     }
 
-    static Map<String, Object> parseJson(String json) {
+    public static Map<String, Object> parseJson(String json) {
         json = json.trim();
         if (json.isEmpty()) return Collections.emptyMap();
         JsonParser parser = new JsonParser(json);

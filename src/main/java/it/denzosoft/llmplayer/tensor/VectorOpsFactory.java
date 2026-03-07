@@ -14,7 +14,7 @@ public final class VectorOpsFactory {
         try {
             Class<?> cls = Class.forName("it.denzosoft.llmplayer.tensor.SimdVectorOps");
             ops = (VectorOps) cls.getDeclaredConstructor().newInstance();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             // Vector API not available
         }
         if (ops == null) {

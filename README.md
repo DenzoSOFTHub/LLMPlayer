@@ -1,15 +1,15 @@
 # LLMPlayer
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, BF16, F16, F32).
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 56 tok/s on RTX 4050, and a built-in LoRA fine-tuning pipeline.
 
 ## Requirements
 
 - **Java 8** — base functionality (no SIMD, no GPU)
-- **Java 21+** — adds SIMD (Vector API), optimized memory mapping (Panama FFI), GPU acceleration (OpenCL)
+- **Java 21+** — adds SIMD (Vector API), optimized memory mapping (Panama FFI), GPU acceleration (CUDA + OpenCL)
 - **Java 25** — adds advanced parallelism (StructuredTaskScope, virtual thread matmul)
+- **NVIDIA GPU** — optional, for CUDA acceleration (requires NVIDIA driver + NVRTC)
+- **OpenCL drivers** — alternative GPU backend (e.g. `libOpenCL.so` on Linux)
 - **Maven 3.x** — for building
-- **OpenCL drivers** — only needed for GPU usage (e.g. `libOpenCL.so` on Linux)
-
 ## Building
 
 The project has three Maven profiles that include different source sets:
@@ -146,9 +146,14 @@ The chat UI stores conversations as JSON files in the `chats/` directory (create
 
 Prints model metadata (architecture, layers, dimensions, vocabulary) and exits.
 
-## GPU Acceleration (OpenCL)
+## GPU Acceleration
 
-Requires Java 21+ and installed OpenCL drivers.
+Requires Java 21+ and a supported GPU. Two backends are available:
+
+- **CUDA** (preferred) — calls `libcuda.so` + `libnvrtc.so` via Panama FFM. Kernels are `.cu` files compiled at runtime by NVRTC. Requires NVIDIA driver and NVRTC.
+- **OpenCL** — calls `libOpenCL.so` via Panama FFM. Kernels are `.cl` files compiled at runtime. Works with any OpenCL driver.
+
+Backend selection: `--gpu-backend auto` (default, prefers CUDA), `--gpu-backend cuda`, or `--gpu-backend opencl`.
 
 ### List available devices
 
@@ -156,31 +161,39 @@ Requires Java 21+ and installed OpenCL drivers.
 ./run.sh --gpu-list
 ```
 
-Shows all detected OpenCL devices (GPUs, OpenCL CPUs, accelerators) with name and memory. If no devices are found, verify that OpenCL drivers are installed (`libOpenCL.so` on Linux, vendor GPU drivers on Windows/macOS).
+Shows all detected CUDA and OpenCL devices with name and memory.
 
 ### Enable GPU
 
 ```bash
-# Use the first GPU device (device 0)
+# Auto-detect best GPU (prefers CUDA)
 ./run.sh --model model.gguf --gpu --prompt "Hello" --max-tokens 256
 
 # Use a specific device
 ./run.sh --model model.gguf --gpu-device 1 --prompt "Hello" --max-tokens 256
+
+# Force a specific backend
+./run.sh --model model.gguf --gpu --gpu-backend opencl --prompt "Hello"
 ```
 
-The `--gpu-device N` flag selects a device by index (as shown by `--gpu-list`) and automatically enables the GPU. The `--gpu` flag alone uses device 0.
+### CUDA graph mode
+
+For dense models that fit entirely in VRAM, CUDA graph mode captures all kernel launches (~210 for a 16-layer model) into a CUDA graph on the first token, then replays with a single `cuGraphLaunch` API call. This eliminates per-kernel Panama FFM launch overhead and delivers significant speedups.
+
+Enabled by default when using CUDA with full GPU offload. Disable with `-Dcuda.nograph=true`.
 
 ### How it works
 
 When GPU is enabled, the system:
-1. Initializes an OpenCL context on the selected device
-2. Registers a global `GpuBufferManager` in `TensorFactory`
-3. For each tensor created during model loading, attempts the GPU variant first (e.g. `Q4_KGpuTensor`), then falls back to the CPU variant if unavailable
-4. Compute-heavy operations (matmul, RMSNorm, softmax, SiLU, etc.) are executed via OpenCL kernels compiled on-demand
+1. Initializes CUDA or OpenCL context on the selected device
+2. Registers a buffer manager in `TensorFactory`
+3. For each tensor created during model loading, attempts the GPU variant first (e.g. `Q4_KCudaTensor`), then falls back to CPU
+4. For dense models with all layers on GPU, enables the GPU-resident forward pass — activations stay on GPU between layers
+5. Compute-heavy operations (matmul, RMSNorm, softmax, SiLU, etc.) are executed via GPU kernels compiled on-demand
 
-GPU-supported quantized formats: F32, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0. Other formats automatically fall back to CPU.
+GPU-supported quantized formats: F32, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0. Other formats automatically fall back to CPU.
 
-If Java is < 21 or OpenCL drivers are not present, the system prints a warning and continues in CPU-only mode.
+If Java is < 21 or GPU drivers are not present, the system prints a warning and continues in CPU-only mode.
 
 ### MoE-optimized GPU placement
 
@@ -204,7 +217,8 @@ Explicit `--gpu-layers N` always uses first-N-layers to preserve backward compat
 | All quantization formats (CPU) | Yes | Yes | Yes |
 | SIMD tensor operations (Vector API) | No | Yes | Yes |
 | Optimized memory mapping (Panama FFI) | No | Yes | Yes |
-| GPU acceleration (OpenCL) | No | Yes | Yes |
+| GPU acceleration (CUDA + OpenCL) | No | Yes | Yes |
+| CUDA graph mode | No | Yes | Yes |
 | Virtual thread matmul | No | No | Yes |
 | Parallel batch generation (StructuredTaskScope) | No | No | Yes |
 
@@ -231,7 +245,11 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 | `--gguf-dir` | — | String | `gguf` | GGUF file directory |
 | `--gpu` | — | Flag | false | Enable GPU acceleration |
 | `--gpu-device` | — | Integer | 0 | GPU device index |
+| `--gpu-backend` | — | String | `auto` | GPU backend: `auto`, `cuda`, `opencl` |
+| `--gpu-layers` | — | Integer | -1 | GPU layers (-1 = auto-detect, 0 = CPU only) |
 | `--gpu-list` | — | Flag | false | List GPU devices and exit |
+| `--fine-tune` | — | Flag | false | Start LoRA fine-tuning pipeline |
+| `--target-model` | — | String | — | Target model for fine-tuning |
 | `--help` | `-h` | Flag | false | Show help |
 
 ## REST API (web mode)
@@ -242,8 +260,20 @@ When started with `--web`, the server exposes the following APIs. Full documenta
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming), tool calling, JSON mode |
+| `/v1/embeddings` | POST | Text embeddings (L2-normalized vectors) |
 | `/v1/models` | GET | List available/loaded models |
+
+Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.). The `Authorization: Bearer <token>` header is accepted and ignored.
+
+### Anthropic Messages API (`/v1/messages`)
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/messages` | POST | Chat completion (streaming + non-streaming), Anthropic message format |
+| `/v1/messages/count_tokens` | POST | Token counting for a message payload |
+
+Compatible with Claude Code and other Anthropic API clients. The `x-api-key` header is accepted and ignored.
 
 ### Management API (`/api/*`)
 
@@ -319,6 +349,7 @@ engine.close();
 | Qwen2 | `qwen2` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3 MoE | `qwen3moe` | BPE (gpt2) | `<\|im_start\|>user` |
+| Qwen3.5 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
 | DeepSeek2 | `deepseek2` | BPE (gpt2) | `User: ... Assistant:` |
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
 | Phi-3/4 | `phi3` | BPE (gpt2) | `<\|user\|>` |
@@ -328,16 +359,46 @@ The architecture is automatically detected from the `general.architecture` field
 
 ## Benchmarks
 
-### MoE-optimized GPU placement
+Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s), Java 25, SimdVectorOps.
 
-Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM), Java 25, SimdVectorOps.
+### Top results (ranked by tok/s)
 
-| Model | Type | GPU Strategy | Layers on GPU | VRAM Used | tok/s | Quality |
-|-------|------|--------------|---------------|-----------|-------|---------|
-| Qwen3-Coder-30B-A3B Q4_K_M | MoE (128 experts, top-8) | MoE-optimized | 48/48 attn | 540 MB | 1.7 | Perplexity 0.98, Coherence 0.99 |
-| DeepSeek-Coder-V2-Lite Q4_K_M | MoE (64 experts, top-6+2shared) | MoE-optimized | 27/27 attn | 517 MB | 2.1 | Perplexity 0.85, Coherence 1.00 |
-| Llama-3.2-3B Q3_K_L | Dense | Full offload | 28/28 all | 1731 MB | 5.9 | Perplexity 0.96, Coherence 0.95 |
+| # | Model | Params | Quant | GPU Config | tok/s |
+|--:|-------|--------|-------|------------|------:|
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | GPU full + CUDA graph | 53-56 |
+| 2 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | GPU full + CUDA graph | 19.6 |
+| 3 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | GPU full (no graph) | 13.1 |
+| 4 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | GPU full offload | 11.4 |
+| 5 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | GPU full offload | 6.9 |
+| 6 | Qwen3.5-4B | 4B | Q4_K_M | GPU full offload | 6.6 |
+| 7 | Qwen3-4B | 4B | Q4_K_M | GPU full offload | 6.4 |
+| 8 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | GPU full offload | 5.0 |
 
-Test: `--prompt "Write a Java class that calculates factorial" --max-tokens 40 --context-length 256 --gpu --gpu-device 1`.
+Full benchmark results (28 models) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 
-Key takeaway: MoE-optimized placement puts 100% of attention on GPU using only ~540 MB VRAM for a 17.3 GB model. With standard first-N-layers, only ~2/48 layers would fit in 6 GB VRAM for Qwen3-Coder-30B.
+### GPU strategy summary
+
+| Strategy | When Used | VRAM Needed | Typical Speed |
+|----------|-----------|-------------|---------------|
+| Full offload + CUDA graph | Dense model fits in VRAM | 770–4822 MB | 6–56 tok/s |
+| Full offload (no graph) | Dense model, graph disabled | 770–4822 MB | 3–13 tok/s |
+| MoE-optimized | MoE model, attention fits in VRAM | 517–913 MB | 0.8–1.6 tok/s |
+| Partial offload | Dense/hybrid model, most layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |
+| CPU only (SIMD) | No GPU or unsupported quant (IQ*) | 0 | 0.3–4.1 tok/s |
+
+## Fine-Tuning
+
+Built-in LoRA fine-tuning pipeline. Full documentation in [FINE-TUNING.md](FINE-TUNING.md).
+
+```bash
+# Fine-tune from source code
+./run.sh --fine-tune --target-model base.gguf --source ./my-codebase --model generator.gguf
+
+# Fine-tune from documents
+./run.sh --fine-tune --target-model base.gguf --documents ./docs --model generator.gguf
+
+# Fine-tune from pre-built dataset
+./run.sh --fine-tune --target-model base.gguf --train-dataset dataset.jsonl
+```
+
+The pipeline: analyze target model → chunk input data → generate Q&A pairs (using a generator LLM) → LoRA training → merge adapters → export as new GGUF file.

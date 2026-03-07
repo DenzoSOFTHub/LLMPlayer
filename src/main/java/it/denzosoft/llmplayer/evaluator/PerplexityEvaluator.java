@@ -17,6 +17,7 @@ public class PerplexityEvaluator implements ResponseEvaluator {
 
         for (int i = 0; i < context.logitsHistory().size() && i < context.tokens().length; i++) {
             float[] logits = context.logitsHistory().get(i);
+            if (logits == null) continue; // sparse logits history (performance optimization)
             int actualToken = context.tokens()[i];
             if (actualToken < 0 || actualToken >= logits.length) continue;
 

@@ -66,4 +66,15 @@ public final class ArchitectureRegistry {
 
     // GPT-OSS attention sinks: per-head learned biases for softmax
     public static String attnSinks(int layer) { return "blk." + layer + ".attn_sinks.weight"; }
+
+    // Qwen3.5 Gated DeltaNet (SSM) tensors
+    public static String attnGate(int layer) { return "blk." + layer + ".attn_gate.weight"; }
+    public static String ssmA(int layer) { return "blk." + layer + ".ssm_a"; }
+    public static String ssmAlpha(int layer) { return "blk." + layer + ".ssm_alpha.weight"; }
+    public static String ssmBeta(int layer) { return "blk." + layer + ".ssm_beta.weight"; }
+    public static String ssmConv1d(int layer) { return "blk." + layer + ".ssm_conv1d.weight"; }
+    public static String ssmDtBias(int layer) { return "blk." + layer + ".ssm_dt.bias"; }
+    public static String ssmNorm(int layer) { return "blk." + layer + ".ssm_norm.weight"; }
+    public static String ssmOut(int layer) { return "blk." + layer + ".ssm_out.weight"; }
+    public static String postAttnNormWeight(int layer) { return "blk." + layer + ".post_attention_norm.weight"; }
 }

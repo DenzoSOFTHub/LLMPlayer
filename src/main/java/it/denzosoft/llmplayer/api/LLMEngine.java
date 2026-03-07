@@ -7,6 +7,8 @@ import it.denzosoft.llmplayer.inference.InferenceEngine;
 import it.denzosoft.llmplayer.inference.InferenceState;
 import it.denzosoft.llmplayer.inference.Qwen3MoEInferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen3MoEState;
+import it.denzosoft.llmplayer.inference.Qwen35InferenceEngine;
+import it.denzosoft.llmplayer.inference.Qwen35State;
 import it.denzosoft.llmplayer.gguf.GGUFTensorInfo;
 import it.denzosoft.llmplayer.model.ArchitectureRegistry;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
@@ -39,6 +41,7 @@ public class LLMEngine implements AutoCloseable {
     private final InferenceEngine engine;                 // standard architectures
     private final DeepSeek2InferenceEngine ds2Engine;     // DeepSeek2 only
     private final Qwen3MoEInferenceEngine q3moeEngine;   // Qwen3 MoE only
+    private final Qwen35InferenceEngine q35Engine;        // Qwen3.5 only
     private final Tokenizer tokenizer;
     private final ChatTemplate chatTemplate;
     private final SpecialTokens specialTokens;
@@ -52,12 +55,18 @@ public class LLMEngine implements AutoCloseable {
     private final ConversationCache conversationCache = new ConversationCache();
 
     private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
-        this(loadedModel, maxContextLength, null, -1, null, false);
+        this(loadedModel, maxContextLength, null, -1, null, false, true);
     }
 
     private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength,
                        AutoCloseable gpuResources, int gpuLayersUsed, String gpuDeviceName,
                        boolean moeOptimizedGpu) {
+        this(loadedModel, maxContextLength, gpuResources, gpuLayersUsed, gpuDeviceName, moeOptimizedGpu, true);
+    }
+
+    private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength,
+                       AutoCloseable gpuResources, int gpuLayersUsed, String gpuDeviceName,
+                       boolean moeOptimizedGpu, boolean gpuChainEnabled) {
         this.loadedModel = loadedModel;
         this.tokenizer = loadedModel.tokenizer();
         this.specialTokens = SpecialTokens.fromMetadata(loadedModel.ggufFile().getMetadata());
@@ -72,46 +81,63 @@ public class LLMEngine implements AutoCloseable {
         this.moeOptimizedGpu = moeOptimizedGpu;
 
         ModelArchitecture arch = loadedModel.config().architecture();
-        if (arch == ModelArchitecture.DEEPSEEK2) {
+        if (arch == ModelArchitecture.QWEN35) {
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = null;
+            this.q35Engine = new Qwen35InferenceEngine(
+                loadedModel.config(), loadedModel.qwen35Weights(), maxContextLength,
+                loadedModel.qwen35Weights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.DEEPSEEK2) {
             this.engine = null;
             this.ds2Engine = new DeepSeek2InferenceEngine(
                 loadedModel.config(), loadedModel.deepSeek2Weights(), maxContextLength,
                 loadedModel.deepSeek2Weights().ropeFreqFactors());
             this.q3moeEngine = null;
+            this.q35Engine = null;
         } else if (arch == ModelArchitecture.QWEN3MOE) {
             this.engine = null;
             this.ds2Engine = null;
+            this.q35Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
         } else if (arch == ModelArchitecture.LLAMA4 && loadedModel.config().expertCount() > 0) {
-            // Llama4 MoE: reuse Qwen3MoE engine (standard GQA + MoE FFN)
             this.engine = null;
             this.ds2Engine = null;
+            this.q35Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
         } else if (arch == ModelArchitecture.GPT_OSS && loadedModel.config().expertCount() > 0) {
-            // GPT-OSS MoE: reuse Qwen3MoE engine (GQA + MoE FFN)
             this.engine = null;
             this.ds2Engine = null;
+            this.q35Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
         } else if (arch == ModelArchitecture.GLM4 && loadedModel.config().expertCount() > 0) {
-            // GLM4 MoE: reuse Qwen3MoE engine (GQA + MoE FFN)
             this.engine = null;
             this.ds2Engine = null;
+            this.q35Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
         } else {
-            // Standard dense engine: Llama, Qwen2, Qwen3, GLM4, Phi3, Mistral3,
-            // Command-R, OLMo2, Gemma2/3, dense Llama4/GPT-OSS
             this.ds2Engine = null;
             this.q3moeEngine = null;
+            this.q35Engine = null;
             this.engine = new InferenceEngine(loadedModel.config(), loadedModel.weights(), maxContextLength,
                 loadedModel.weights().ropeFreqFactors());
+        }
+
+        // Try to initialize GPU-resident forward pass for kernel chaining
+        if (this.engine != null && gpuChainEnabled && gpuResources != null) {
+            this.engine.setGpuChainEnabled(true);
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.engine.tryInitGpuForwardPass(bufMgr);
+            }
         }
     }
 
@@ -131,6 +157,11 @@ public class LLMEngine implements AutoCloseable {
     }
 
     public static LLMEngine load(Path ggufPath, int maxContextLength, GpuConfig gpuConfig) throws IOException {
+        return load(ggufPath, maxContextLength, gpuConfig, true);
+    }
+
+    public static LLMEngine load(Path ggufPath, int maxContextLength, GpuConfig gpuConfig,
+                                  boolean gpuChainEnabled) throws IOException {
         // Initialize GPU BEFORE model loading so TensorFactory can create GPU tensor variants.
         // Disable virtual thread matmul when GPU is active: OpenCL driver threads conflict
         // with JVM virtual thread carrier threads, causing segfaults in hybrid CPU/GPU mode.
@@ -154,7 +185,15 @@ public class LLMEngine implements AutoCloseable {
                 ModelConfig quickConfig = ModelConfig.fromMetadata(quickParse.getMetadata());
                 int blockCount = quickConfig.blockCount();
 
-                if (requestedLayers == -1) {
+                // With managed or host-mapped memory, force all layers on GPU
+                // (driver handles paging between VRAM and system RAM)
+                String memMode = gpuConfig.getMemoryMode();
+                boolean sharedMemMode = "managed".equals(memMode) || "host-mapped".equals(memMode);
+                if (sharedMemMode) {
+                    gpuLayersUsed = blockCount;
+                    System.out.println("GPU: offloading all " + blockCount + " layers (" + memMode +
+                        " memory — VRAM + system RAM shared)");
+                } else if (requestedLayers == -1) {
                     // Auto-detect: estimate bytes per layer, fit into VRAM
                     long vram = getDeviceGlobalMemory(gpuConfig.getDeviceId());
                     if (vram > 0 && quickConfig.expertCount() > 0) {
@@ -213,7 +252,7 @@ public class LLMEngine implements AutoCloseable {
         }
         ModelLoader.LoadedModel model = ModelLoader.load(ggufPath, true, gpuLayersUsed, moeOptimized);
         int maxCtx = Math.min(maxContextLength, model.config().contextLength());
-        return new LLMEngine(model, maxCtx, gpuRes, gpuLayersUsed, deviceName, moeOptimized);
+        return new LLMEngine(model, maxCtx, gpuRes, gpuLayersUsed, deviceName, moeOptimized, gpuChainEnabled);
     }
 
     public GenerationResponse generate(GenerationRequest request) {
@@ -240,9 +279,9 @@ public class LLMEngine implements AutoCloseable {
 
         int[] encodedTokens = tokenizer.encode(formattedPrompt);
 
-        // Prepend BOS token if chat mode or rawMode (BOS is not included in template text)
+        // Prepend BOS token if chat mode or rawMode, and the model expects BOS
         int[] promptTokens;
-        if (request.useChat() || request.rawMode()) {
+        if ((request.useChat() || request.rawMode()) && specialTokens.shouldAddBos() && specialTokens.getBosId() >= 0) {
             int bosId = specialTokens.getBosId();
             promptTokens = new int[encodedTokens.length + 1];
             promptTokens[0] = bosId;
@@ -251,6 +290,14 @@ public class LLMEngine implements AutoCloseable {
             promptTokens = encodedTokens;
         }
         int promptLen = promptTokens.length;
+
+        // Debug: dump prompt tokens
+        System.err.printf("  Prompt tokens (%d): ", promptLen);
+        for (int i = 0; i < Math.min(promptLen, 30); i++) {
+            System.err.printf("%d ", promptTokens[i]);
+        }
+        System.err.println();
+        System.err.printf("  Formatted prompt: [%s]%n", formattedPrompt.replace("\n", "\\n"));
 
         if (promptLen >= maxContextLength - 1) {
             return new GenerationResponse("Error: prompt too long (" + promptLen + " tokens, max " +
@@ -280,7 +327,13 @@ public class LLMEngine implements AutoCloseable {
         // Dispatch to appropriate engine
         GenerationResponse response;
         Object stateForCache;
-        if (ds2Engine != null) {
+        if (q35Engine != null) {
+            Qwen35State state = (cached != null)
+                ? (Qwen35State) cached.state
+                : q35Engine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateQwen35(q35Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (ds2Engine != null) {
             DeepSeek2State state = (cached != null)
                 ? (DeepSeek2State) cached.state
                 : ds2Engine.createState(maxContextLength);
@@ -321,6 +374,26 @@ public class LLMEngine implements AutoCloseable {
         }
         long genStartTime = System.nanoTime();
 
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override
+                public float[] forward(int token, int position) {
+                    return eng.forward(state, token, position);
+                }
+            });
+    }
+
+    private GenerationResponse generateQwen35(Qwen35InferenceEngine eng, CompositeSampler sampler,
+                                                  int[] promptTokens, GenerationRequest request,
+                                                  StreamingCallback callback,
+                                                  Qwen35State state, int prefillStart) {
+        int promptLen = promptTokens.length;
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(state, promptTokens[i], i);
+        }
+        long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
             new ForwardFunction() {
                 @Override
@@ -397,7 +470,12 @@ public class LLMEngine implements AutoCloseable {
             }
 
             generatedTokens.add(nextToken);
-            logitsHistory.add(Arrays.copyOf(logits, logits.length));
+            // Only copy logits every 10th token (for evaluation), saves ~1ms/tok on 128K vocab
+            if (i % 10 == 0 || i < 3) {
+                logitsHistory.add(Arrays.copyOf(logits, logits.length));
+            } else {
+                logitsHistory.add(null); // placeholder, evaluator handles nulls
+            }
 
             String tokenText = tokenizer.decode(nextToken);
             responseText.append(tokenText);
@@ -455,6 +533,10 @@ public class LLMEngine implements AutoCloseable {
         } else if (q3moeEngine != null) {
             Qwen3MoEState state = q3moeEngine.createState(maxContextLength);
             q3moeEngine.prefill(state, tokens);
+            return l2Normalize(state.xb, dim);
+        } else if (q35Engine != null) {
+            Qwen35State state = q35Engine.createState(maxContextLength);
+            q35Engine.prefill(state, tokens);
             return l2Normalize(state.xb, dim);
         }
         throw new IllegalStateException("No inference engine available");
@@ -558,6 +640,58 @@ public class LLMEngine implements AutoCloseable {
         }
     }
 
+    // --- Training support ---
+
+    private volatile Object trainingState; // InferenceState or DeepSeek2State or Qwen3MoEState
+
+    /**
+     * Forward a single token at a given position, returning logits.
+     * Used by the LoRA training loop for teacher forcing.
+     * Lazily creates an inference state that persists across calls.
+     * The KV cache is naturally managed: sequential calls from position 0
+     * overwrite earlier cache entries, so no explicit reset is needed between examples.
+     */
+    public float[] forwardSingleToken(int token, int position) {
+        if (engine != null) {
+            InferenceState state;
+            if (trainingState instanceof InferenceState) {
+                state = (InferenceState) trainingState;
+            } else {
+                state = engine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return engine.forward(state, token, position);
+        } else if (ds2Engine != null) {
+            DeepSeek2State state;
+            if (trainingState instanceof DeepSeek2State) {
+                state = (DeepSeek2State) trainingState;
+            } else {
+                state = ds2Engine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return ds2Engine.forward(state, token, position);
+        } else if (q3moeEngine != null) {
+            Qwen3MoEState state;
+            if (trainingState instanceof Qwen3MoEState) {
+                state = (Qwen3MoEState) trainingState;
+            } else {
+                state = q3moeEngine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return q3moeEngine.forward(state, token, position);
+        } else if (q35Engine != null) {
+            Qwen35State state;
+            if (trainingState instanceof Qwen35State) {
+                state = (Qwen35State) trainingState;
+            } else {
+                state = q35Engine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return q35Engine.forward(state, token, position);
+        }
+        throw new IllegalStateException("No inference engine available for training");
+    }
+
     public Tokenizer getTokenizer() { return tokenizer; }
     public SpecialTokens getSpecialTokens() { return specialTokens; }
     public ChatTemplate getChatTemplate() { return chatTemplate; }
@@ -573,51 +707,55 @@ public class LLMEngine implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public static List<Map<String, Object>> listGpuDevices() {
+        List<Map<String, Object>> result = new ArrayList<>();
+
+        // Try CUDA devices first
         try {
-            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
-            java.lang.reflect.Method enumMethod = ctxClass.getMethod("enumerateDevices");
-            List<?> devices = (List<?>) enumMethod.invoke(null);
-            List<Map<String, Object>> result = new ArrayList<>();
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
+            List<?> devices = (List<?>) ctxClass.getMethod("enumerateDevices").invoke(null);
             for (int i = 0; i < devices.size(); i++) {
-                Object dev = devices.get(i);
-                Map<String, Object> info = new LinkedHashMap<>();
-                info.put("index", i);
-                // Try to extract fields via reflection on the device info object
-                try {
-                    Class<?> devClass = dev.getClass();
-                    try {
-                        info.put("name", devClass.getMethod("name").invoke(dev));
-                    } catch (Exception e1) {
-                        try {
-                            info.put("name", devClass.getMethod("getName").invoke(dev));
-                        } catch (Exception e2) {
-                            info.put("name", dev.toString());
-                        }
-                    }
-                    try {
-                        info.put("vendor", devClass.getMethod("vendor").invoke(dev));
-                    } catch (Exception ignored) {}
-                    try {
-                        info.put("globalMemory", devClass.getMethod("globalMemory").invoke(dev));
-                    } catch (Exception ignored) {}
-                    try {
-                        info.put("computeUnits", devClass.getMethod("computeUnits").invoke(dev));
-                    } catch (Exception ignored) {}
-                    try {
-                        info.put("deviceType", devClass.getMethod("deviceType").invoke(dev));
-                    } catch (Exception ignored) {}
-                } catch (Exception e) {
-                    info.put("name", dev.toString());
-                }
+                Map<String, Object> info = extractDeviceInfo(devices.get(i), i);
+                info.put("backend", "cuda");
                 result.add(info);
             }
-            return result;
-        } catch (ClassNotFoundException e) {
-            return Collections.emptyList();
+        } catch (Throwable ignored) {}
+
+        // Then OpenCL devices
+        try {
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
+            List<?> devices = (List<?>) ctxClass.getMethod("enumerateDevices").invoke(null);
+            for (int i = 0; i < devices.size(); i++) {
+                Map<String, Object> info = extractDeviceInfo(devices.get(i), result.size());
+                info.put("backend", "opencl");
+                result.add(info);
+            }
+        } catch (Throwable ignored) {}
+
+        return result;
+    }
+
+    private static Map<String, Object> extractDeviceInfo(Object dev, int index) {
+        Map<String, Object> info = new LinkedHashMap<>();
+        info.put("index", index);
+        try {
+            Class<?> devClass = dev.getClass();
+            try {
+                info.put("name", devClass.getMethod("name").invoke(dev));
+            } catch (Exception e1) {
+                try {
+                    info.put("name", devClass.getMethod("getName").invoke(dev));
+                } catch (Exception e2) {
+                    info.put("name", dev.toString());
+                }
+            }
+            try { info.put("vendor", devClass.getMethod("vendor").invoke(dev)); } catch (Exception ignored) {}
+            try { info.put("globalMemory", devClass.getMethod("globalMemory").invoke(dev)); } catch (Exception ignored) {}
+            try { info.put("computeUnits", devClass.getMethod("computeUnits").invoke(dev)); } catch (Exception ignored) {}
+            try { info.put("deviceType", devClass.getMethod("deviceType").invoke(dev)); } catch (Exception ignored) {}
         } catch (Exception e) {
-            System.err.println("Error enumerating GPU devices: " + e.getMessage());
-            return Collections.emptyList();
+            info.put("name", dev.toString());
         }
+        return info;
     }
 
     /**
@@ -755,24 +893,64 @@ public class LLMEngine implements AutoCloseable {
             return null;
         }
 
-        // Select device with most VRAM
-        int bestIdx = 0;
-        long bestVram = 0;
+        // Priority: CUDA GPU > OpenCL GPU > OpenCL CPU
+        // Among same-backend GPUs, pick the one with the most VRAM.
+        int bestCudaIdx = -1;
+        long bestCudaVram = 0;
+        int bestOclGpuIdx = -1;
+        long bestOclGpuVram = 0;
+        int bestOclCpuIdx = -1;
+        long bestOclCpuVram = 0;
+
         for (int i = 0; i < devices.size(); i++) {
-            Object mem = devices.get(i).get("globalMemory");
-            if (mem instanceof Number) {
-                long vram = ((Number) mem).longValue();
-                if (vram > bestVram) {
-                    bestVram = vram;
-                    bestIdx = i;
+            Map<String, Object> dev = devices.get(i);
+            Object mem = dev.get("globalMemory");
+            long vram = (mem instanceof Number) ? ((Number) mem).longValue() : 0;
+            String backend = dev.get("backend") != null ? dev.get("backend").toString() : "opencl";
+
+            if ("cuda".equals(backend)) {
+                if (vram > bestCudaVram) { bestCudaVram = vram; bestCudaIdx = i; }
+            } else {
+                // OpenCL: distinguish GPU vs CPU
+                Object deviceType = dev.get("deviceType");
+                boolean isCpu = false;
+                if (deviceType != null) {
+                    String typeStr = deviceType.toString().toUpperCase();
+                    isCpu = typeStr.contains("CPU") || "2".equals(typeStr);
+                } else {
+                    Object name = dev.get("name");
+                    if (name != null) {
+                        String n = name.toString().toLowerCase();
+                        isCpu = n.contains("cpu") || n.contains("pocl");
+                    }
+                }
+                if (isCpu) {
+                    if (vram > bestOclCpuVram) { bestOclCpuVram = vram; bestOclCpuIdx = i; }
+                } else {
+                    if (vram > bestOclGpuVram) { bestOclGpuVram = vram; bestOclGpuIdx = i; }
                 }
             }
         }
 
         GpuConfig config = new GpuConfig();
         config.setEnabled(true);
-        config.setDeviceId(bestIdx);
-        config.setGpuLayers(-1); // auto-calculate based on VRAM
+        config.setGpuLayers(-1);
+
+        if (bestCudaIdx >= 0) {
+            // CUDA device found — use device index 0 for CUDA (the index within CUDA devices)
+            // Since CUDA devices come first in listGpuDevices, the CUDA device index is the raw index
+            config.setDeviceId(0); // CUDA device ordinal
+            config.setBackend(GpuConfig.GpuBackend.CUDA);
+        } else if (bestOclGpuIdx >= 0) {
+            config.setDeviceId(bestOclGpuIdx);
+            config.setBackend(GpuConfig.GpuBackend.OPENCL);
+        } else if (bestOclCpuIdx >= 0) {
+            config.setDeviceId(bestOclCpuIdx);
+            config.setBackend(GpuConfig.GpuBackend.OPENCL);
+        } else {
+            config.setDeviceId(0);
+        }
+
         return config;
     }
 
@@ -1052,46 +1230,128 @@ public class LLMEngine implements AutoCloseable {
 
     /**
      * Initialize GPU via reflection (Java 21 only).
-     * Returns an AutoCloseable that manages OpenCLContext + GpuBufferManager lifecycle,
+     * Tries CUDA first (unless backend=opencl), then falls back to OpenCL.
+     * Returns an AutoCloseable that manages context + buffer manager lifecycle,
      * or null if GPU initialization fails.
      */
     private static AutoCloseable initGpu(GpuConfig gpuConfig) {
+        GpuConfig.GpuBackend backend = gpuConfig.getBackend();
+
+        // Try CUDA first (unless explicitly set to opencl)
+        if (backend != GpuConfig.GpuBackend.OPENCL) {
+            AutoCloseable cudaRes = initCuda(gpuConfig);
+            if (cudaRes != null) return cudaRes;
+            if (backend == GpuConfig.GpuBackend.CUDA) {
+                System.err.println("CUDA initialization failed and --gpu-backend=cuda was specified. Falling back to CPU.");
+                return null;
+            }
+        }
+
+        // Fall back to OpenCL
+        return initOpenCL(gpuConfig);
+    }
+
+    /**
+     * Initialize CUDA GPU via reflection.
+     */
+    private static AutoCloseable initCuda(GpuConfig gpuConfig) {
         try {
-            // Initialize OpenCLContext
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
+
+            // Check if CUDA is available
+            Class<?> bindingsClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaBindings");
+            boolean available = (boolean) bindingsClass.getMethod("isAvailable").invoke(null);
+            if (!available) return null;
+
+            // Enumerate to find the right device
+            @SuppressWarnings("unchecked")
+            List<?> devices = (List<?>) ctxClass.getMethod("enumerateDevices").invoke(null);
+            if (devices.isEmpty()) return null;
+
+            // Use deviceId for CUDA device index
+            int cudaDeviceId = gpuConfig.getDeviceId();
+            if (cudaDeviceId >= devices.size()) cudaDeviceId = 0;
+
+            Object cudaContext = ctxClass.getMethod("create", int.class).invoke(null, cudaDeviceId);
+
+            // Pre-compile kernels
+            try {
+                ctxClass.getMethod("precompileKernels").invoke(cudaContext);
+            } catch (Exception ignored) {}
+
+            // Log device info
+            Object deviceInfo = ctxClass.getMethod("getDeviceInfo").invoke(cudaContext);
+            System.out.println("GPU (CUDA): " + deviceInfo);
+
+            // Create CudaBufferManager with memory mode
+            Class<?> bufMgrClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaBufferManager");
+            Object bufManager;
+            String memMode = gpuConfig.getMemoryMode();
+            if ("managed".equals(memMode) || "host-mapped".equals(memMode)) {
+                Class<?> memModeEnum = Class.forName("it.denzosoft.llmplayer.gpu.CudaBufferManager$MemoryMode");
+                Object modeValue;
+                if ("managed".equals(memMode)) {
+                    modeValue = Enum.valueOf((Class<Enum>) memModeEnum, "MANAGED");
+                    System.out.println("GPU memory mode: MANAGED (unified memory)");
+                } else {
+                    modeValue = Enum.valueOf((Class<Enum>) memModeEnum, "HOST_MAPPED");
+                    System.out.println("GPU memory mode: HOST_MAPPED (zero-copy via PCIe)");
+                }
+                bufManager = bufMgrClass.getConstructor(ctxClass, memModeEnum).newInstance(cudaContext, modeValue);
+            } else {
+                bufManager = bufMgrClass.getConstructor(ctxClass).newInstance(cudaContext);
+            }
+
+            // Register with TensorFactory
+            TensorFactory.setGpuBackend("cuda");
+            TensorFactory.setGpuBufferManager(bufManager);
+
+            return new AutoCloseable() {
+                @Override
+                public void close() throws Exception {
+                    try { TensorFactory.setGpuBufferManager(null); } catch (Exception ignored) {}
+                    try { TensorFactory.setGpuBackend("opencl"); } catch (Exception ignored) {}
+                    ((AutoCloseable) bufManager).close();
+                    ((AutoCloseable) cudaContext).close();
+                }
+            };
+        } catch (ClassNotFoundException e) {
+            return null; // Java 21+ not available
+        } catch (Exception e) {
+            String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+            System.err.println("CUDA initialization failed: " + msg);
+            return null;
+        }
+    }
+
+    /**
+     * Initialize OpenCL GPU via reflection.
+     */
+    private static AutoCloseable initOpenCL(GpuConfig gpuConfig) {
+        try {
             Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
             java.lang.reflect.Method createMethod = ctxClass.getMethod("create", int.class);
             Object clContext = createMethod.invoke(null, gpuConfig.getDeviceId());
 
-            // Pre-compile all GPU kernels eagerly (avoids first-use latency)
             try {
                 ctxClass.getMethod("precompileKernels").invoke(clContext);
             } catch (Exception ignored) {}
 
-            // Get device info for logging
             java.lang.reflect.Method getInfoMethod = ctxClass.getMethod("getDeviceInfo");
             Object deviceInfo = getInfoMethod.invoke(clContext);
-            System.out.println("GPU: " + deviceInfo);
+            System.out.println("GPU (OpenCL): " + deviceInfo);
 
-            // Create GpuBufferManager
             Class<?> bufMgrClass = Class.forName("it.denzosoft.llmplayer.gpu.GpuBufferManager");
             Object bufManager = bufMgrClass.getConstructor(ctxClass).newInstance(clContext);
 
-            // Register with TensorFactory
-            Class<?> tfClass = Class.forName("it.denzosoft.llmplayer.tensor.TensorFactory");
-            java.lang.reflect.Method setGpuMethod = tfClass.getMethod("setGpuBufferManager", Object.class);
-            setGpuMethod.invoke(null, bufManager);
+            TensorFactory.setGpuBackend("opencl");
+            TensorFactory.setGpuBufferManager(bufManager);
 
-            // Return a composite AutoCloseable
             return new AutoCloseable() {
                 @Override
                 public void close() throws Exception {
-                    // Unregister from TensorFactory
-                    try {
-                        setGpuMethod.invoke(null, (Object) null);
-                    } catch (Exception ignored) {}
-                    // Close buffer manager
+                    try { TensorFactory.setGpuBufferManager(null); } catch (Exception ignored) {}
                     ((AutoCloseable) bufManager).close();
-                    // Close OpenCL context
                     ((AutoCloseable) clContext).close();
                 }
             };
@@ -1101,7 +1361,7 @@ public class LLMEngine implements AutoCloseable {
         } catch (Exception e) {
             String msg = e.getMessage();
             if (e.getCause() != null) msg = e.getCause().getMessage();
-            System.err.println("GPU initialization failed: " + msg + ". Falling back to CPU.");
+            System.err.println("GPU (OpenCL) initialization failed: " + msg + ". Falling back to CPU.");
             return null;
         }
     }

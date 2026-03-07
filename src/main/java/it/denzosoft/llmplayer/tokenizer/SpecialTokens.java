@@ -12,10 +12,17 @@ public class SpecialTokens {
     private final int eotId;  // end-of-turn token (Llama 3: <|eot_id|>)
     private final int[] additionalEosIds; // extra stop tokens (GPT-OSS: <|end|>)
     private final Map<String, Integer> specialTokenMap;
+    private final boolean addBos;  // whether to prepend BOS token
 
     public SpecialTokens(int bosId, int eosId, int padId, int eotId, int[] additionalEosIds,
                           Map<String, Integer> specialTokenMap) {
+        this(bosId, eosId, padId, eotId, additionalEosIds, specialTokenMap, true);
+    }
+
+    public SpecialTokens(int bosId, int eosId, int padId, int eotId, int[] additionalEosIds,
+                          Map<String, Integer> specialTokenMap, boolean addBos) {
         this.bosId = bosId;
+        this.addBos = addBos;
         this.eosId = eosId;
         this.padId = padId;
         this.eotId = eotId;
@@ -24,6 +31,7 @@ public class SpecialTokens {
     }
 
     public int getBosId() { return bosId; }
+    public boolean shouldAddBos() { return addBos; }
     public int getEosId() { return eosId; }
     public int getPadId() { return padId; }
     public int getEotId() { return eotId; }
@@ -47,6 +55,9 @@ public class SpecialTokens {
         int eosId = metadata.getInt("tokenizer.ggml.eos_token_id", 2);
         int padId = metadata.getInt("tokenizer.ggml.padding_token_id", -1);
         int eotId = metadata.getInt("tokenizer.ggml.eot_token_id", -1);
+        // Respect add_bos_token flag; default true unless explicitly false or no bos_token_id defined
+        boolean addBos = metadata.getBoolean("tokenizer.ggml.add_bos_token",
+            metadata.getInt("tokenizer.ggml.bos_token_id", -1) >= 0);
 
         // Load additional EOS token IDs from metadata array
         int[] additionalEos = metadata.getIntArray("tokenizer.ggml.eos_token_ids");
@@ -76,6 +87,6 @@ public class SpecialTokens {
         if (padId >= 0) specialMap.put("pad", padId);
         if (eotId >= 0) specialMap.put("eot", eotId);
 
-        return new SpecialTokens(bosId, eosId, padId, eotId, additionalEos, specialMap);
+        return new SpecialTokens(bosId, eosId, padId, eotId, additionalEos, specialMap, addBos);
     }
 }

@@ -114,6 +114,27 @@ public class GpuBufferManager implements AutoCloseable {
         return clContext.createGpuBuffer(sizeBytes, CL_MEM_READ_WRITE);
     }
 
+    /**
+     * Create a new GPU buffer with the given size and flags.
+     * For activation buffers that persist across forward passes.
+     */
+    public MemorySegment createBuffer(long sizeBytes, long flags) {
+        return clContext.createGpuBuffer(sizeBytes, flags);
+    }
+
+    /**
+     * Upload RMS norm weights (float array) to a persistent GPU buffer.
+     * Returns the cl_mem handle. The buffer is READ_ONLY.
+     */
+    public MemorySegment uploadNormWeights(float[] weights) {
+        try (Arena staging = Arena.ofConfined()) {
+            long sizeBytes = (long) weights.length * Float.BYTES;
+            MemorySegment hostBuf = staging.allocate(ValueLayout.JAVA_FLOAT, weights.length);
+            MemorySegment.copy(weights, 0, hostBuf, ValueLayout.JAVA_FLOAT, 0, weights.length);
+            return clContext.createGpuBuffer(sizeBytes, CL_MEM_READ_ONLY, hostBuf);
+        }
+    }
+
     public OpenCLContext getClContext() { return clContext; }
 
     @Override

@@ -169,6 +169,15 @@ public final class OpenCLBindings {
             ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
             ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 
+    // cl_int clEnqueueFillBuffer(cl_command_queue queue, cl_mem buffer,
+    //     const void* pattern, size_t pattern_size, size_t offset, size_t size,
+    //     cl_uint num_events, cl_event* wait_list, cl_event* event)
+    private static final MethodHandle clEnqueueFillBuffer = findIfAvailable("clEnqueueFillBuffer",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+            ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
     // --- Kernel Execution ---
 
     // cl_int clSetKernelArg(cl_kernel kernel, cl_uint arg_index, size_t arg_size, const void* arg_value)
@@ -324,6 +333,16 @@ public final class OpenCLBindings {
             return (int) clEnqueueReadBuffer.invokeExact(
                 queue, buffer, blockingRead, offset, size, ptr, numEvents, waitList, event);
         } catch (Throwable t) { throw new RuntimeException("clEnqueueReadBuffer failed", t); }
+    }
+
+    public static int enqueueFillBuffer(MemorySegment queue, MemorySegment buffer,
+                                         MemorySegment pattern, long patternSize,
+                                         long offset, long size,
+                                         int numEvents, MemorySegment waitList, MemorySegment event) {
+        try {
+            return (int) clEnqueueFillBuffer.invokeExact(
+                queue, buffer, pattern, patternSize, offset, size, numEvents, waitList, event);
+        } catch (Throwable t) { throw new RuntimeException("clEnqueueFillBuffer failed", t); }
     }
 
     public static int setKernelArg(MemorySegment kernel, int argIndex,

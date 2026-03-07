@@ -229,6 +229,24 @@ public class OpenCLContext implements AutoCloseable {
     }
 
     /**
+     * Write host data to a GPU buffer (non-blocking / async).
+     */
+    public void writeBufferAsync(MemorySegment gpuBuffer, MemorySegment hostData, long size) {
+        checkError(OpenCLBindings.enqueueWriteBuffer(queue, gpuBuffer, 0, 0L, size,
+            hostData, 0, MemorySegment.NULL, MemorySegment.NULL), "enqueueWriteBuffer(async)");
+    }
+
+    /**
+     * Fill a GPU buffer with zero (float 0.0f pattern).
+     */
+    public void fillBufferZero(MemorySegment gpuBuffer, long sizeBytes) {
+        MemorySegment pattern = arena.allocateFrom(ValueLayout.JAVA_FLOAT, 0.0f);
+        checkError(OpenCLBindings.enqueueFillBuffer(queue, gpuBuffer, pattern,
+            ValueLayout.JAVA_FLOAT.byteSize(), 0L, sizeBytes,
+            0, MemorySegment.NULL, MemorySegment.NULL), "enqueueFillBuffer");
+    }
+
+    /**
      * Read GPU buffer to host memory (blocking).
      */
     public void readBuffer(MemorySegment gpuBuffer, MemorySegment hostData, long size) {
@@ -269,6 +287,15 @@ public class OpenCLContext implements AutoCloseable {
         MemorySegment argPtr = arena.allocateFrom(ValueLayout.JAVA_FLOAT, value);
         checkError(OpenCLBindings.setKernelArg(kernel, argIndex, ValueLayout.JAVA_FLOAT.byteSize(), argPtr),
             "setKernelArg");
+    }
+
+    /**
+     * Set a kernel argument for __local memory allocation.
+     * Passes NULL pointer with the requested size in bytes.
+     */
+    public void setKernelArgLocal(MemorySegment kernel, int argIndex, long sizeBytes) {
+        checkError(OpenCLBindings.setKernelArg(kernel, argIndex, sizeBytes, MemorySegment.NULL),
+            "setKernelArg(local)");
     }
 
     /**
@@ -318,6 +345,8 @@ public class OpenCLContext implements AutoCloseable {
             {"kernels/silu.cl", "silu"},
             {"kernels/saxpy.cl", "saxpy"},
             {"kernels/accumulate.cl", "accumulate"},
+            {"kernels/elementwise_mul.cl", "elementwise_mul"},
+            {"kernels/fill_zero.cl", "fill_zero"},
         };
         for (String[] kv : kernels) {
             try {
@@ -326,6 +355,14 @@ public class OpenCLContext implements AutoCloseable {
                 // Some kernels may not exist — that's fine
             }
         }
+    }
+
+    /**
+     * Get a pre-compiled kernel by its cache key ("resourcePath:kernelName").
+     * Returns null if not found — call compileKernel() to ensure it's compiled first.
+     */
+    public MemorySegment getPrecompiledKernel(String resourcePath, String kernelName) {
+        return kernelCache.get(resourcePath + ":" + kernelName);
     }
 
     public DeviceInfo getDeviceInfo() { return deviceInfo; }

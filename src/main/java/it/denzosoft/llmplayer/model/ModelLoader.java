@@ -20,16 +20,18 @@ public class ModelLoader {
         private final ModelWeights weights;
         private final DeepSeek2Weights deepSeek2Weights;
         private final Qwen3MoEWeights qwen3MoEWeights;
+        private final Qwen35Weights qwen35Weights;
         private final Tokenizer tokenizer;
 
         public LoadedModel(GGUFFile ggufFile, ModelConfig config, ModelWeights weights,
                            DeepSeek2Weights deepSeek2Weights, Qwen3MoEWeights qwen3MoEWeights,
-                           Tokenizer tokenizer) {
+                           Qwen35Weights qwen35Weights, Tokenizer tokenizer) {
             this.ggufFile = ggufFile;
             this.config = config;
             this.weights = weights;
             this.deepSeek2Weights = deepSeek2Weights;
             this.qwen3MoEWeights = qwen3MoEWeights;
+            this.qwen35Weights = qwen35Weights;
             this.tokenizer = tokenizer;
         }
 
@@ -38,6 +40,7 @@ public class ModelLoader {
         public ModelWeights weights() { return weights; }
         public DeepSeek2Weights deepSeek2Weights() { return deepSeek2Weights; }
         public Qwen3MoEWeights qwen3MoEWeights() { return qwen3MoEWeights; }
+        public Qwen35Weights qwen35Weights() { return qwen35Weights; }
         public Tokenizer tokenizer() { return tokenizer; }
 
         @Override
@@ -83,10 +86,13 @@ public class ModelLoader {
         ModelWeights weights = null;
         DeepSeek2Weights ds2Weights = null;
         Qwen3MoEWeights q3moeWeights = null;
+        Qwen35Weights q35Weights = null;
 
         ModelArchitecture arch = config.architecture();
         boolean isMoEArch = config.expertCount() > 0;
-        if (arch == ModelArchitecture.DEEPSEEK2) {
+        if (arch == ModelArchitecture.QWEN35) {
+            q35Weights = loadQwen35Weights(gguf, config, gpuLayers);
+        } else if (arch == ModelArchitecture.DEEPSEEK2) {
             ds2Weights = loadDeepSeek2Weights(gguf, config, gpuLayers, moeOptimizedGpu);
         } else if (arch == ModelArchitecture.QWEN3MOE
                 || (arch == ModelArchitecture.LLAMA4 && isMoEArch)
@@ -105,7 +111,68 @@ public class ModelLoader {
         long elapsed = System.currentTimeMillis() - startTime;
         System.out.println("  Model loaded in " + elapsed + "ms");
 
-        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, tokenizer);
+        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, q35Weights, tokenizer);
+    }
+
+    private static Qwen35Weights loadQwen35Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
+
+        FloatTensor output;
+        GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
+        if (outputInfo != null) {
+            output = createTensor(gguf, outputInfo);
+        } else {
+            output = tokenEmbedding;
+        }
+
+        boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
+        Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
+
+        int fullAttnInterval = config.fullAttentionInterval();
+        Qwen35LayerWeights[] layers = new Qwen35LayerWeights[config.blockCount()];
+
+        for (int i = 0; i < config.blockCount(); i++) {
+            if (partialOffload && i >= gpuLayers) {
+                TensorFactory.setGpuBufferManager(null);
+            }
+
+            boolean isDeltaNet = fullAttnInterval > 0 && ((i + 1) % fullAttnInterval != 0);
+
+            FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
+            FloatTensor postAttnNorm = loadTensor(gguf, ArchitectureRegistry.postAttnNormWeight(i));
+            FloatTensor ffnGate = loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+            FloatTensor ffnUp = loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
+            FloatTensor ffnDown = loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
+
+            if (isDeltaNet) {
+                layers[i] = new Qwen35LayerWeights(attnNorm, postAttnNorm, ffnGate, ffnUp, ffnDown,
+                    loadTensor(gguf, ArchitectureRegistry.attnGate(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnQKV(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmAlpha(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmBeta(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmOut(i)));
+            } else {
+                layers[i] = new Qwen35LayerWeights(attnNorm, postAttnNorm, ffnGate, ffnUp, ffnDown,
+                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                    tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
+                    tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i)));
+            }
+        }
+
+        if (partialOffload) {
+            TensorFactory.setGpuBufferManager(savedGpuManager);
+        }
+
+        float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
+        return new Qwen35Weights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
     }
 
     private static ModelWeights loadWeights(GGUFFile gguf, ModelConfig config, int gpuLayers) {

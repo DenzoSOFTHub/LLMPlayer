@@ -65,6 +65,7 @@ public abstract class FloatTensor {
     }
 
     private static volatile Boolean virtualThreadAvailable;
+    private static volatile java.lang.reflect.Method cachedMatmulMethod;
 
     /**
      * Force-disable virtual thread matmul.
@@ -73,22 +74,35 @@ public abstract class FloatTensor {
      */
     public static void disableVirtualThreadMatmul() {
         virtualThreadAvailable = Boolean.FALSE;
+        cachedMatmulMethod = null;
     }
 
     private boolean tryVirtualThreadMatmul(float[] input, float[] out, int rows, int cols) {
         Boolean avail = virtualThreadAvailable;
         if (avail != null && !avail) return false;
+
+        java.lang.reflect.Method m = cachedMatmulMethod;
+        if (m == null) {
+            try {
+                Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.VirtualThreadMatmul");
+                m = cls.getMethod("matmul", FloatTensor.class, float[].class, float[].class, int.class, int.class);
+                cachedMatmulMethod = m;
+                virtualThreadAvailable = Boolean.TRUE;
+            } catch (ClassNotFoundException e) {
+                virtualThreadAvailable = Boolean.FALSE;
+                return false;
+            } catch (Exception e) {
+                virtualThreadAvailable = Boolean.FALSE;
+                return false;
+            }
+        }
+
         try {
-            Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.VirtualThreadMatmul");
-            java.lang.reflect.Method m = cls.getMethod("matmul", FloatTensor.class, float[].class, float[].class, int.class, int.class);
             m.invoke(null, this, input, out, rows, cols);
-            virtualThreadAvailable = Boolean.TRUE;
             return true;
-        } catch (ClassNotFoundException e) {
-            virtualThreadAvailable = Boolean.FALSE;
-            return false;
         } catch (Exception e) {
             virtualThreadAvailable = Boolean.FALSE;
+            cachedMatmulMethod = null;
             return false;
         }
     }
