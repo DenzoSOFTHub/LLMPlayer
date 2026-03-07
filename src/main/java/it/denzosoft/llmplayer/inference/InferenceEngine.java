@@ -21,11 +21,24 @@ public class InferenceEngine {
     private final ModelConfig config;
     private final ModelWeights weights;
     private final TransformerBlock block;
+    private final Attention attention;
     private final float[] normWeightCache;
     private final int maxSeqLen;
     private final float finalLogitSoftCap;
     private final float logitScale;
     private final float embeddingScale;
+
+    // GPU-resident forward pass (null if not available or not supported)
+    private AutoCloseable gpuForwardPass;
+    private boolean gpuChainEnabled;
+
+    // Cached reflection Method handles for GPU hot path (avoids per-token getMethod lookups)
+    private java.lang.reflect.Method cachedUploadX;
+    private java.lang.reflect.Method cachedUpdateTokenParams;
+    private java.lang.reflect.Method cachedForwardGraph;
+    private java.lang.reflect.Method cachedForwardLayer;
+    private java.lang.reflect.Method cachedForwardFinalLogits;
+    private java.lang.reflect.Method cachedDownloadX;
 
     public InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen) {
         this(config, weights, maxSeqLen, null);
@@ -39,7 +52,7 @@ public class InferenceEngine {
         int ropeDimCount = config.ropeDimensionCount();
         RoPE rope = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, config.ropeFreqBase(),
             config.ropeType(), ropeFreqFactors);
-        Attention attention = new Attention(config, rope);
+        this.attention = new Attention(config, rope);
         attention.initNormCachesIfNeeded(weights.layers());
         SwiGLUFFN ffn = new SwiGLUFFN(config);
         this.block = new TransformerBlock(config, attention, ffn, weights.layers());
@@ -61,6 +74,61 @@ public class InferenceEngine {
         for (int i = 0; i < dim; i++) {
             normWeightCache[i] = weights.outputNorm().getFloat(i);
         }
+    }
+
+    /**
+     * Try to initialize GPU-resident forward pass via reflection.
+     * Called by LLMEngine after construction when GPU is available.
+     * The bufferManager must be an instance of GpuBufferManager from java21/.
+     */
+    public void tryInitGpuForwardPass(Object bufferManager) {
+        if (!gpuChainEnabled) return;
+
+        // Try CUDA forward pass first
+        if (tryInitForwardPass("it.denzosoft.llmplayer.inference.CudaForwardPass", bufferManager, "CUDA")) {
+            return;
+        }
+        // Fall back to OpenCL forward pass
+        tryInitForwardPass("it.denzosoft.llmplayer.inference.GpuForwardPass", bufferManager, "OpenCL");
+    }
+
+    private boolean tryInitForwardPass(String className, Object bufferManager, String label) {
+        try {
+            Class<?> fpClass = Class.forName(className);
+            java.lang.reflect.Method isSupported = fpClass.getMethod("isSupported",
+                ModelConfig.class, ModelWeights.class);
+            boolean supported = (boolean) isSupported.invoke(null, config, weights);
+            if (!supported) {
+                System.out.println("GPU chain (" + label + "): model not supported (requires pre-norm dense with separate Q/K/V, full GPU offload)");
+                return false;
+            }
+            // Try 5-param constructor (with Attention + maxSeqLen for GPU attention)
+            java.lang.reflect.Constructor<?>[] ctors = fpClass.getConstructors();
+            if (ctors.length > 0 && ctors[0].getParameterCount() == 5) {
+                gpuForwardPass = (AutoCloseable) ctors[0]
+                    .newInstance(config, weights, bufferManager, attention, maxSeqLen);
+            } else {
+                gpuForwardPass = (AutoCloseable) ctors[0]
+                    .newInstance(config, weights, bufferManager);
+            }
+            System.out.println("GPU chain: enabled — " + label + " GPU-resident forward pass active");
+            // Cache Method handles for hot path (avoids per-token getMethod overhead)
+            cacheGpuMethods(fpClass);
+            return true;
+        } catch (ClassNotFoundException e) {
+            // Not on classpath — expected on Java 8 or when backend not available
+            return false;
+        } catch (Exception e) {
+            System.out.println("GPU chain (" + label + "): initialization failed — " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Enable or disable GPU kernel chaining.
+     */
+    public void setGpuChainEnabled(boolean enabled) {
+        this.gpuChainEnabled = enabled;
     }
 
     /**
@@ -91,16 +159,23 @@ public class InferenceEngine {
         }
 
         // 2. Forward through all transformer layers
-        for (int layer = 0; layer < config.blockCount(); layer++) {
-            block.forward(state, weights.layers()[layer], layer, position);
+        boolean logitsDone = false;
+        if (gpuForwardPass != null) {
+            logitsDone = forwardGpu(state, position);
+        } else {
+            for (int layer = 0; layer < config.blockCount(); layer++) {
+                block.forward(state, weights.layers()[layer], layer, position);
+            }
         }
 
-        // 3. Final RMSNorm
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
+        if (!logitsDone) {
+            // 3. Final RMSNorm
+            VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
 
-        // 4. Output projection: logits = output_weight * xb
-        Arrays.fill(state.logits, 0);
-        weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+            // 4. Output projection: logits = output_weight * xb
+            Arrays.fill(state.logits, 0);
+            weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+        }
 
         // 5. Logit scaling (Command-R): logits *= logitScale
         if (logitScale > 0f) {
@@ -117,6 +192,74 @@ public class InferenceEngine {
         }
 
         return state.logits;
+    }
+
+    /**
+     * Cache reflection Method handles once at init time.
+     * Eliminates per-token getMethod() overhead in the hot path.
+     */
+    private void cacheGpuMethods(Class<?> fpClass) {
+        try {
+            cachedUploadX = fpClass.getMethod("uploadX", float[].class);
+            cachedForwardLayer = fpClass.getMethod("forwardLayer",
+                InferenceState.class,
+                it.denzosoft.llmplayer.model.TransformerLayerWeights.class,
+                int.class, int.class, Attention.class);
+            cachedDownloadX = fpClass.getMethod("downloadX", float[].class);
+            try { cachedUpdateTokenParams = fpClass.getMethod("updateTokenParams", int.class); }
+            catch (NoSuchMethodException ignored) {}
+            try { cachedForwardGraph = fpClass.getMethod("forwardGraph", float[].class); }
+            catch (NoSuchMethodException ignored) {}
+            try { cachedForwardFinalLogits = fpClass.getMethod("forwardFinalLogits", float[].class); }
+            catch (NoSuchMethodException ignored) {}
+        } catch (NoSuchMethodException e) {
+            throw new RuntimeException("GPU forward pass missing required methods", e);
+        }
+    }
+
+    /**
+     * GPU-resident forward pass through all layers.
+     * Uses cached reflection Method handles to minimize per-token overhead.
+     * Returns true if logits were computed on GPU (caller skips CPU RMSNorm + matmul).
+     */
+    private boolean forwardGpu(InferenceState state, int position) {
+        try {
+            cachedUploadX.invoke(gpuForwardPass, state.x);
+
+            if (cachedUpdateTokenParams != null) {
+                cachedUpdateTokenParams.invoke(gpuForwardPass, position);
+            }
+
+            // Try CUDA graph mode first (all layers + output in single API call)
+            if (cachedForwardGraph != null) {
+                boolean done = (boolean) cachedForwardGraph.invoke(gpuForwardPass, state.logits);
+                if (done) return true;
+            }
+
+            // Fall back to per-layer mode
+            for (int layer = 0; layer < config.blockCount(); layer++) {
+                cachedForwardLayer.invoke(gpuForwardPass, state, weights.layers()[layer], layer, position, attention);
+            }
+
+            // Try final RMSNorm + output projection on GPU
+            if (cachedForwardFinalLogits != null) {
+                boolean done = (boolean) cachedForwardFinalLogits.invoke(gpuForwardPass, state.logits);
+                if (done) return true;
+            }
+
+            // Fall back: download X and let CPU handle final steps
+            cachedDownloadX.invoke(gpuForwardPass, state.x);
+            return false;
+        } catch (Exception e) {
+            Throwable cause = e;
+            while (cause.getCause() != null) cause = cause.getCause();
+            System.err.println("GPU chain: forward failed, falling back to CPU — " + cause);
+            cause.printStackTrace(System.err);
+            for (int layer = 0; layer < config.blockCount(); layer++) {
+                block.forward(state, weights.layers()[layer], layer, position);
+            }
+            return false;
+        }
     }
 
     /**

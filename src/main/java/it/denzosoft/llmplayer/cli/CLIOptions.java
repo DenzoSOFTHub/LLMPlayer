@@ -25,6 +25,29 @@ public class CLIOptions {
     private int gpuDeviceId;
     private boolean gpuList;
     private int gpuLayers = -1;
+    private boolean gpuChainEnabled = true;  // GPU kernel chaining (default: enabled)
+    private String gpuBackend = "auto";      // auto, cuda, opencl
+    private String gpuMemoryMode = "device"; // device, managed, host-mapped
+
+    // Fine-tuning options
+    private boolean fineTune;
+    private String targetModel;
+    private String generatorModel;
+    private String sourcePath;
+    private String documentsPath;
+    private String dataPath;
+    private String schemaPath;
+    private String ftOutput;
+    private String ftDataType;
+    private int loraRank = 16;
+    private int loraAlpha = 32;
+    private int epochs = 3;
+    private float learningRate = 2e-4f;
+    private int pairsPerChunk = 5;
+    private int chunkSize = 0;
+    private String ftWorkDir = "work";
+    private boolean datasetOnly;
+    private String trainDataset;
 
     public static CLIOptions parse(String[] args) {
         CLIOptions opts = new CLIOptions();
@@ -71,6 +94,51 @@ public class CLIOptions {
                 opts.gpuLayers = Integer.parseInt(args[++i]);
             } else if ("--gpu-list".equals(arg)) {
                 opts.gpuList = true;
+            } else if ("--gpu-chain".equals(arg)) {
+                opts.gpuChainEnabled = true;
+            } else if ("--no-gpu-chain".equals(arg)) {
+                opts.gpuChainEnabled = false;
+            } else if ("--gpu-backend".equals(arg)) {
+                opts.gpuBackend = args[++i].toLowerCase();
+            } else if ("--gpu-memory".equals(arg)) {
+                opts.gpuMemoryMode = args[++i].toLowerCase();
+            } else if ("--fine-tune".equals(arg)) {
+                opts.fineTune = true;
+            } else if ("--target-model".equals(arg)) {
+                opts.targetModel = args[++i];
+                opts.fineTune = true;
+            } else if ("--generator-model".equals(arg)) {
+                opts.generatorModel = args[++i];
+            } else if ("--source".equals(arg)) {
+                opts.sourcePath = args[++i];
+            } else if ("--documents".equals(arg)) {
+                opts.documentsPath = args[++i];
+            } else if ("--data".equals(arg)) {
+                opts.dataPath = args[++i];
+            } else if ("--schema".equals(arg)) {
+                opts.schemaPath = args[++i];
+            } else if ("--ft-output".equals(arg)) {
+                opts.ftOutput = args[++i];
+            } else if ("--ft-data-type".equals(arg)) {
+                opts.ftDataType = args[++i];
+            } else if ("--lora-rank".equals(arg)) {
+                opts.loraRank = Integer.parseInt(args[++i]);
+            } else if ("--lora-alpha".equals(arg)) {
+                opts.loraAlpha = Integer.parseInt(args[++i]);
+            } else if ("--epochs".equals(arg)) {
+                opts.epochs = Integer.parseInt(args[++i]);
+            } else if ("--learning-rate".equals(arg)) {
+                opts.learningRate = Float.parseFloat(args[++i]);
+            } else if ("--pairs-per-chunk".equals(arg)) {
+                opts.pairsPerChunk = Integer.parseInt(args[++i]);
+            } else if ("--chunk-size".equals(arg)) {
+                opts.chunkSize = Integer.parseInt(args[++i]);
+            } else if ("--ft-work-dir".equals(arg)) {
+                opts.ftWorkDir = args[++i];
+            } else if ("--dataset-only".equals(arg)) {
+                opts.datasetOnly = true;
+            } else if ("--train-dataset".equals(arg)) {
+                opts.trainDataset = args[++i];
             } else if ("--help".equals(arg) || "-h".equals(arg)) {
                 opts.help = true;
             } else {
@@ -107,6 +175,29 @@ public class CLIOptions {
     public boolean isGpuList() { return gpuList; }
     public boolean isNoGpu() { return noGpu; }
     public int getGpuLayers() { return gpuLayers; }
+    public boolean isGpuChainEnabled() { return gpuChainEnabled; }
+    public String getGpuBackend() { return gpuBackend; }
+    public String getGpuMemoryMode() { return gpuMemoryMode; }
+
+    // Fine-tuning getters
+    public boolean isFineTune() { return fineTune; }
+    public String getTargetModel() { return targetModel; }
+    public String getGeneratorModel() { return generatorModel; }
+    public String getSourcePath() { return sourcePath; }
+    public String getDocumentsPath() { return documentsPath; }
+    public String getDataPath() { return dataPath; }
+    public String getSchemaPath() { return schemaPath; }
+    public String getFtOutput() { return ftOutput; }
+    public String getFtDataType() { return ftDataType; }
+    public int getLoraRank() { return loraRank; }
+    public int getLoraAlpha() { return loraAlpha; }
+    public int getEpochs() { return epochs; }
+    public float getLearningRate() { return learningRate; }
+    public int getPairsPerChunk() { return pairsPerChunk; }
+    public int getChunkSize() { return chunkSize; }
+    public String getFtWorkDir() { return ftWorkDir; }
+    public boolean isDatasetOnly() { return datasetOnly; }
+    public String getTrainDataset() { return trainDataset; }
 
     public static void printUsage() {
         System.out.println("Usage: java -jar LLMPlayer.jar [options]");
@@ -132,6 +223,30 @@ public class CLIOptions {
         System.out.println("  --gpu-device <id>        Select GPU device by index (default: best)");
         System.out.println("  --gpu-layers <n>         GPU layers: -1=auto, 0=all, N=first N (default: -1)");
         System.out.println("  --gpu-list               List available GPU devices and exit");
+        System.out.println("  --gpu-chain              Enable GPU kernel chaining (default: on)");
+        System.out.println("  --no-gpu-chain           Disable GPU kernel chaining");
+        System.out.println("  --gpu-backend <backend>  GPU backend: auto, cuda, opencl (default: auto)");
+        System.out.println("  --gpu-memory <mode>      GPU memory: device, managed, host-mapped (default: device)");
+        System.out.println();
+        System.out.println("Fine-tuning:");
+        System.out.println("  --fine-tune              Enable fine-tuning mode");
+        System.out.println("  --target-model <path>    Target GGUF model to fine-tune");
+        System.out.println("  --generator-model <path> Generator model for dataset (default: target)");
+        System.out.println("  --source <path>          Source code directory (code scenario)");
+        System.out.println("  --documents <path>       Documents directory (document scenario)");
+        System.out.println("  --data <path>            Data file CSV/JSON (structured scenario)");
+        System.out.println("  --schema <path>          SQL DDL schema file (structured scenario)");
+        System.out.println("  --ft-output <path>       Output fine-tuned GGUF path");
+        System.out.println("  --ft-data-type <type>    Force data type: code, document, structured");
+        System.out.println("  --lora-rank <n>          LoRA rank (default: 16)");
+        System.out.println("  --lora-alpha <n>         LoRA alpha (default: 32)");
+        System.out.println("  --epochs <n>             Training epochs (default: 3)");
+        System.out.println("  --learning-rate <f>      Learning rate (default: 2e-4)");
+        System.out.println("  --pairs-per-chunk <n>    Q&A pairs per chunk (default: 5)");
+        System.out.println("  --chunk-size <n>         Max tokens per chunk (default: auto from context)");
+        System.out.println("  --ft-work-dir <path>     Working directory (default: work)");
+        System.out.println("  --dataset-only           Stop after dataset generation");
+        System.out.println("  --train-dataset <path>   Skip to training with existing dataset");
         System.out.println("  --help, -h               Show this help");
     }
 }

@@ -2,6 +2,8 @@ package it.denzosoft.llmplayer;
 
 import it.denzosoft.llmplayer.cli.CLIOptions;
 import it.denzosoft.llmplayer.cli.CLIRunner;
+import it.denzosoft.llmplayer.tuning.FineTunePipeline;
+import it.denzosoft.llmplayer.tuning.PipelineConfig;
 import it.denzosoft.llmplayer.ui.LLMPlayerUI;
 import it.denzosoft.llmplayer.web.WebServer;
 
@@ -34,6 +36,9 @@ public class LLMPlayer {
             } else if (options.isGpuList()) {
                 // GPU device listing: handled by CLIRunner
                 new CLIRunner(options).run();
+            } else if (options.isFineTune()) {
+                // Fine-tuning mode
+                runFineTune(options);
             } else if (options.isWebMode()) {
                 new WebServer(options.getPort(), options.getGgufDirectory()).startBlocking();
             } else if (options.getModelPath() != null) {
@@ -52,5 +57,44 @@ public class LLMPlayer {
             e.printStackTrace();
             System.exit(1);
         }
+    }
+
+    private static void runFineTune(CLIOptions opts) throws IOException {
+        String target = opts.getTargetModel();
+        if (target == null) {
+            System.err.println("Error: --target-model is required for fine-tuning");
+            System.exit(1);
+        }
+        String output = opts.getFtOutput();
+        if (output == null) {
+            // Default output: target path with -ft suffix
+            int dot = target.lastIndexOf('.');
+            output = (dot > 0 ? target.substring(0, dot) : target) + "-ft.gguf";
+        }
+
+        PipelineConfig config = PipelineConfig.builder()
+            .targetModelPath(target)
+            .generatorModelPath(opts.getGeneratorModel())
+            .sourcePath(opts.getSourcePath())
+            .documentsPath(opts.getDocumentsPath())
+            .dataPath(opts.getDataPath())
+            .schemaPath(opts.getSchemaPath())
+            .outputPath(output)
+            .dataType(opts.getFtDataType())
+            .loraRank(opts.getLoraRank())
+            .loraAlpha(opts.getLoraAlpha())
+            .epochs(opts.getEpochs())
+            .learningRate(opts.getLearningRate())
+            .pairsPerChunk(opts.getPairsPerChunk())
+            .chunkSize(opts.getChunkSize())
+            .noGpu(opts.isNoGpu())
+            .gpuDeviceId(opts.getGpuDeviceId())
+            .gpuLayers(opts.getGpuLayers())
+            .workDir(opts.getFtWorkDir())
+            .datasetOnly(opts.isDatasetOnly())
+            .trainDataset(opts.getTrainDataset())
+            .build();
+
+        new FineTunePipeline(config).run();
     }
 }

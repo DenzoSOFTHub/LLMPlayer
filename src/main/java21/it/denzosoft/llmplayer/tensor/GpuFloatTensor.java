@@ -46,7 +46,7 @@ public abstract class GpuFloatTensor extends FloatTensor {
     /**
      * Get or lazily upload the weight data to GPU.
      */
-    protected MemorySegment getGpuWeights() {
+    public MemorySegment getGpuWeights() {
         MemorySegment cached = gpuWeights;
         if (cached != null) return cached;
         synchronized (this) {
@@ -102,6 +102,22 @@ public abstract class GpuFloatTensor extends FloatTensor {
             clContext.readBuffer(outputBuf, outputHost, outputBytes);
             MemorySegment.copy(outputHost, ValueLayout.JAVA_FLOAT, 0, out, 0, rows);
         }
+    }
+
+    /**
+     * Buffer-to-buffer GPU matmul: input and output are pre-existing GPU buffers.
+     * Does NOT call clFinish or readBuffer — the result stays GPU-resident.
+     * Used by GpuForwardPass for kernel chaining.
+     */
+    public void gpuMatmulBuffered(MemorySegment gpuInput, MemorySegment gpuOutput, int rows, int cols, Arena tempArena) {
+        MemorySegment kernel = clContext.compileKernel(kernelResourcePath(), kernelName());
+        MemorySegment weightBuf = getGpuWeights();
+
+        setKernelArgs(kernel, weightBuf, gpuInput, gpuOutput, rows, cols, tempArena);
+        long localWorkSize = Math.min(256, clContext.getDeviceInfo().maxWorkGroupSize());
+        long globalWorkSize = ((rows + localWorkSize - 1) / localWorkSize) * localWorkSize;
+        clContext.enqueueKernel1D(kernel, globalWorkSize, localWorkSize, tempArena);
+        // No clFinish — caller chains more kernels before syncing
     }
 
     /**

@@ -57,12 +57,16 @@ public class CLIRunner {
             gpuConfig.setEnabled(true);
             gpuConfig.setDeviceId(options.getGpuDeviceId());
             gpuConfig.setGpuLayers(options.getGpuLayers());
+            gpuConfig.setBackend(parseGpuBackend(options.getGpuBackend()));
+            gpuConfig.setMemoryMode(options.getGpuMemoryMode());
         } else {
             // Auto-detect: probe hardware and configure optimally
             gpuConfig = LLMEngine.autoConfigureGpu(modelPath);
             if (gpuConfig == null) {
                 gpuConfig = new GpuConfig(); // no GPU found
             }
+            gpuConfig.setBackend(parseGpuBackend(options.getGpuBackend()));
+            gpuConfig.setMemoryMode(options.getGpuMemoryMode());
         }
 
         // Show hardware plan
@@ -84,7 +88,8 @@ public class CLIRunner {
 
         System.out.println("Loading model: " + modelPath);
 
-        try (LLMEngine engine = LLMEngine.load(modelPath, options.getContextLength(), gpuConfig)) {
+        try (LLMEngine engine = LLMEngine.load(modelPath, options.getContextLength(), gpuConfig,
+                options.isGpuChainEnabled())) {
             if (options.isShowInfo()) {
                 ModelInfoPrinter.print(engine.getModelInfo());
                 return;
@@ -167,25 +172,51 @@ public class CLIRunner {
     }
 
     private void listGpuDevices() {
-        // Use reflection to call OpenCLContext.enumerateDevices() (Java 21 only)
+        boolean found = false;
+
+        // CUDA devices
         try {
-            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
-            java.lang.reflect.Method enumMethod = ctxClass.getMethod("enumerateDevices");
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
             @SuppressWarnings("unchecked")
-            List<?> devices = (List<?>) enumMethod.invoke(null);
-            if (devices.isEmpty()) {
-                System.out.println("No OpenCL devices found.");
-                System.out.println("Make sure OpenCL drivers are installed (libOpenCL.so on Linux).");
-            } else {
-                System.out.println("Available OpenCL devices:");
+            List<?> devices = (List<?>) ctxClass.getMethod("enumerateDevices").invoke(null);
+            if (!devices.isEmpty()) {
+                System.out.println("CUDA devices:");
                 for (Object dev : devices) {
                     System.out.println("  " + dev);
                 }
+                found = true;
+            }
+        } catch (Exception ignored) {}
+
+        // OpenCL devices
+        try {
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.OpenCLContext");
+            @SuppressWarnings("unchecked")
+            List<?> devices = (List<?>) ctxClass.getMethod("enumerateDevices").invoke(null);
+            if (!devices.isEmpty()) {
+                System.out.println("OpenCL devices:");
+                for (Object dev : devices) {
+                    System.out.println("  " + dev);
+                }
+                found = true;
             }
         } catch (ClassNotFoundException e) {
-            System.out.println("GPU support requires Java 21+.");
+            if (!found) System.out.println("GPU support requires Java 21+.");
+            return;
         } catch (Exception e) {
-            System.out.println("Error enumerating GPU devices: " + e.getMessage());
+            System.out.println("Error enumerating OpenCL devices: " + e.getMessage());
         }
+
+        if (!found) {
+            System.out.println("No GPU devices found.");
+            System.out.println("For CUDA: install NVIDIA driver (libcuda.so) and NVRTC (libnvrtc.so).");
+            System.out.println("For OpenCL: install OpenCL drivers (libOpenCL.so on Linux).");
+        }
+    }
+
+    private static GpuConfig.GpuBackend parseGpuBackend(String backend) {
+        if ("cuda".equals(backend)) return GpuConfig.GpuBackend.CUDA;
+        if ("opencl".equals(backend)) return GpuConfig.GpuBackend.OPENCL;
+        return GpuConfig.GpuBackend.AUTO;
     }
 }

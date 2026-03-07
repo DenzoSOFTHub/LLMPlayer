@@ -32,6 +32,14 @@ public final class ModelConfig {
     private final float logitScale;
     private final int slidingWindow;
 
+    // Qwen3.5 SSM (Gated DeltaNet) parameters
+    private final int ssmConvKernel;
+    private final int ssmStateSize;
+    private final int ssmGroupCount;
+    private final int ssmTimeStepRank;
+    private final int ssmInnerSize;
+    private final int fullAttentionInterval;
+
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
                        float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
@@ -41,6 +49,25 @@ public final class ModelConfig {
                        int ropeOrigContextLength, float yarnLogMultiplier,
                        float finalLogitSoftCap, float attnLogitSoftCap, float logitScale,
                        int slidingWindow) {
+        this(architecture, name, embeddingLength, blockCount, headCount, headCountKV, contextLength,
+             vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim, ropeType,
+             ropeDimensionCount, keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
+             expertCount, expertUsedCount, expertSharedCount, expertFfnLength, ropeScalingFactor,
+             ropeOrigContextLength, yarnLogMultiplier, finalLogitSoftCap, attnLogitSoftCap, logitScale,
+             slidingWindow, 0, 0, 0, 0, 0, 0);
+    }
+
+    public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
+                       int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
+                       float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
+                       int ropeDimensionCount, int keyLength, int valueLength, int kvLoraRank,
+                       int leadingDenseBlockCount, int expertCount, int expertUsedCount,
+                       int expertSharedCount, int expertFfnLength, float ropeScalingFactor,
+                       int ropeOrigContextLength, float yarnLogMultiplier,
+                       float finalLogitSoftCap, float attnLogitSoftCap, float logitScale,
+                       int slidingWindow,
+                       int ssmConvKernel, int ssmStateSize, int ssmGroupCount,
+                       int ssmTimeStepRank, int ssmInnerSize, int fullAttentionInterval) {
         this.architecture = architecture;
         this.name = name;
         this.embeddingLength = embeddingLength;
@@ -71,6 +98,12 @@ public final class ModelConfig {
         this.attnLogitSoftCap = attnLogitSoftCap;
         this.logitScale = logitScale;
         this.slidingWindow = slidingWindow;
+        this.ssmConvKernel = ssmConvKernel;
+        this.ssmStateSize = ssmStateSize;
+        this.ssmGroupCount = ssmGroupCount;
+        this.ssmTimeStepRank = ssmTimeStepRank;
+        this.ssmInnerSize = ssmInnerSize;
+        this.fullAttentionInterval = fullAttentionInterval;
     }
 
     public ModelArchitecture architecture() { return architecture; }
@@ -103,6 +136,12 @@ public final class ModelConfig {
     public float attnLogitSoftCap() { return attnLogitSoftCap; }
     public float logitScale() { return logitScale; }
     public int slidingWindow() { return slidingWindow; }
+    public int ssmConvKernel() { return ssmConvKernel; }
+    public int ssmStateSize() { return ssmStateSize; }
+    public int ssmGroupCount() { return ssmGroupCount; }
+    public int ssmTimeStepRank() { return ssmTimeStepRank; }
+    public int ssmInnerSize() { return ssmInnerSize; }
+    public int fullAttentionInterval() { return fullAttentionInterval; }
 
     public static ModelConfig fromMetadata(it.denzosoft.llmplayer.gguf.GGUFMetadata metadata) {
         String archName = metadata.getString("general.architecture", "llama");
@@ -141,6 +180,8 @@ public final class ModelConfig {
                 || arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.OLMO2
                 || arch == ModelArchitecture.GPT_OSS) {
             ropeType = 2;  // ROPE_TYPE_NEOX
+        } else if (arch == ModelArchitecture.QWEN35) {
+            ropeType = 2;  // ROPE_TYPE_NEOX (IMROPE uses split-half pairing like NEOX)
         } else {
             ropeType = 0;
         }
@@ -151,7 +192,8 @@ public final class ModelConfig {
         int kvLoraRank = metadata.getInt(prefix + "attention.kv_lora_rank", 0);
 
         // Override headSize when metadata specifies a different key_length
-        // (e.g., Mistral3/Devstral: embeddingLength/headCount=160 but keyLength=128)
+        // (e.g., Mistral3/Devstral: embeddingLength/headCount=160 but keyLength=128,
+        //  Qwen3.5: embeddingLength/headCount=160 but keyLength=256 for full attention layers)
         if (keyLength != headSize && arch != ModelArchitecture.DEEPSEEK2) {
             headSize = keyLength;
             kvDim = headSize * headCountKV;
@@ -196,13 +238,23 @@ public final class ModelConfig {
         // ISWA sliding window (GPT-OSS: 128 tokens for alternating layers)
         int slidingWindow = metadata.getInt(prefix + "attention.sliding_window", 0);
 
+        // Qwen3.5 SSM (Gated DeltaNet) parameters
+        int ssmConvKernel = metadata.getInt(prefix + "ssm.conv_kernel", 0);
+        int ssmStateSize = metadata.getInt(prefix + "ssm.state_size", 0);
+        int ssmGroupCount = metadata.getInt(prefix + "ssm.group_count", 0);
+        int ssmTimeStepRank = metadata.getInt(prefix + "ssm.time_step_rank", 0);
+        int ssmInnerSize = metadata.getInt(prefix + "ssm.inner_size", 0);
+        int fullAttentionInterval = metadata.getInt(prefix + "full_attention_interval", 0);
+
         return new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
             contextLength, vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim,
             ropeType, ropeDimensionCount,
             keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
             expertCount, expertUsedCount, expertSharedCount, expertFfnLength,
             ropeScalingFactor, ropeOrigContextLength, yarnLogMultiplier,
-            finalLogitSoftCap, attnLogitSoftCap, logitScale, slidingWindow);
+            finalLogitSoftCap, attnLogitSoftCap, logitScale, slidingWindow,
+            ssmConvKernel, ssmStateSize, ssmGroupCount, ssmTimeStepRank, ssmInnerSize,
+            fullAttentionInterval);
     }
 
     @Override

@@ -17,6 +17,8 @@ public class ChatTemplate {
     public String formatUserMessage(String userMessage) {
         if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3(userMessage);
+        } else if (architecture == ModelArchitecture.QWEN35) {
+            return formatQwen35(userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE) {
             return formatQwen(userMessage);
@@ -43,6 +45,8 @@ public class ChatTemplate {
     public String formatChat(String systemMessage, String userMessage) {
         if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3Chat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.QWEN35) {
+            return formatQwen35Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE) {
             return formatQwenChat(systemMessage, userMessage);
@@ -86,6 +90,16 @@ public class ChatTemplate {
     private String formatQwenChat(String systemMessage, String userMessage) {
         return "<|im_start|>system\n" + systemMessage + "<|im_end|>\n" +
                "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
+    }
+
+    // Qwen3.5 format (includes non-thinking <think> block)
+    private String formatQwen35(String userMessage) {
+        return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    }
+
+    private String formatQwen35Chat(String systemMessage, String userMessage) {
+        return "<|im_start|>system\n" + systemMessage + "<|im_end|>\n" +
+               "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     }
 
     // GLM4 format
@@ -134,6 +148,8 @@ public class ChatTemplate {
     public String formatConversation(List<String[]> messages) {
         if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3Conversation(messages);
+        } else if (architecture == ModelArchitecture.QWEN35) {
+            return formatQwen35Conversation(messages);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE) {
             return formatQwenConversation(messages);
@@ -174,6 +190,16 @@ public class ChatTemplate {
             sb.append(msg[1]).append("<|im_end|>\n");
         }
         sb.append("<|im_start|>assistant\n");
+        return sb.toString();
+    }
+
+    private String formatQwen35Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            sb.append("<|im_start|>").append(msg[0]).append("\n");
+            sb.append(msg[1]).append("<|im_end|>\n");
+        }
+        sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         return sb.toString();
     }
 

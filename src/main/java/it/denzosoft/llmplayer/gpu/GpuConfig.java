@@ -2,15 +2,20 @@ package it.denzosoft.llmplayer.gpu;
 
 /**
  * GPU configuration (Java 8 compatible).
- * Actual OpenCL operations are in java21/ sources loaded via reflection.
+ * Actual GPU operations are in java21/ sources loaded via reflection.
+ * Supports CUDA and OpenCL backends.
  */
 public class GpuConfig {
+
+    public enum GpuBackend { AUTO, CUDA, OPENCL }
 
     private boolean enabled;
     private int deviceId;
     private boolean listDevices;
     private int gpuLayers = -1; // -1 = auto-detect, 0 = all layers on GPU, N = first N layers on GPU
     private boolean moeOptimized = false; // MoE: attention on GPU, experts on CPU
+    private GpuBackend backend = GpuBackend.AUTO;
+    private String memoryMode = "device"; // device, managed, host-mapped
 
     public GpuConfig() {
         this.enabled = false;
@@ -18,6 +23,7 @@ public class GpuConfig {
         this.listDevices = false;
         this.gpuLayers = -1;
         this.moeOptimized = false;
+        this.backend = GpuBackend.AUTO;
     }
 
     public boolean isEnabled() { return enabled; }
@@ -34,4 +40,10 @@ public class GpuConfig {
 
     public boolean isMoeOptimized() { return moeOptimized; }
     public void setMoeOptimized(boolean moeOptimized) { this.moeOptimized = moeOptimized; }
+
+    public GpuBackend getBackend() { return backend; }
+    public void setBackend(GpuBackend backend) { this.backend = backend; }
+
+    public String getMemoryMode() { return memoryMode; }
+    public void setMemoryMode(String memoryMode) { this.memoryMode = memoryMode; }
 }

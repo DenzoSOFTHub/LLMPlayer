@@ -155,6 +155,87 @@ public class Attention {
     }
 
     /**
+     * Perform attention from pre-projected Q/K/V values (already in state.q/k/v).
+     * Does bias, QK-norm, RoPE, KV cache, attention scores, softmax, weighted sum.
+     * Result is in state.xb2. Does NOT perform output projection (Wo matmul).
+     * Used by GpuForwardPass which does projections and Wo on GPU.
+     */
+    public void forwardFromProjections(InferenceState state, TransformerLayerWeights weights,
+                                        int layer, int position) {
+        int headCount = config.headCount();
+        int headCountKV = config.headCountKV();
+        int headSize = config.headSize();
+        int kvDim = config.kvDim();
+        int qDim = headCount * headSize;
+        int kvMul = headCount / headCountKV;
+
+        // Apply Q/K/V bias if present (Qwen2)
+        if (weights.qBias() != null) {
+            addBias(state.q, weights.qBias(), qDim);
+        }
+        if (weights.kBias() != null) {
+            addBias(state.k, weights.kBias(), kvDim);
+        }
+        if (weights.vBias() != null) {
+            addBias(state.v, weights.vBias(), kvDim);
+        }
+
+        // Apply per-head QK-norm if present (Qwen3)
+        if (cachedQNorm != null) {
+            applyPerHeadNorm(state.q, cachedQNorm[layer], headCount, headSize, config.normEps());
+            applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
+        }
+
+        // Apply RoPE to Q and K
+        rope.applyAllHeads(state.q, headCount, position);
+        rope.applyAllHeads(state.k, headCountKV, position);
+
+        // Store K and V in cache
+        float[] keyCache = state.kvCache.keyLayer(layer);
+        float[] valueCache = state.kvCache.valueLayer(layer);
+        System.arraycopy(state.k, 0, keyCache, state.kvCache.offset(position), kvDim);
+        System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
+
+        // Attention computation - parallel over heads
+        float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
+
+        Arrays.fill(state.xb2, 0, qDim, 0f);
+
+        IntStream.range(0, headCount).parallel().forEach(h -> {
+            int kvHead = h / kvMul;
+
+            int attOffset = h * (position + 1);
+            for (int t = 0; t <= position; t++) {
+                float score = 0f;
+                int qOffset = h * headSize;
+                int kOffset = state.kvCache.offset(t) + kvHead * headSize;
+                for (int i = 0; i < headSize; i++) {
+                    score += state.q[qOffset + i] * keyCache[kOffset + i];
+                }
+                float s = score * scaleFactor;
+                if (attnLogitSoftCap > 0f) {
+                    s = attnLogitSoftCap * (float) Math.tanh(s / attnLogitSoftCap);
+                }
+                state.att[attOffset + t] = s;
+            }
+
+            VectorOpsFactory.get().softmax(state.att, attOffset, position + 1);
+
+            int outOffset = h * headSize;
+            for (int t = 0; t <= position; t++) {
+                float a = state.att[attOffset + t];
+                int vOffset = state.kvCache.offset(t) + kvHead * headSize;
+                for (int i = 0; i < headSize; i++) {
+                    state.xb2[outOffset + i] += a * valueCache[vOffset + i];
+                }
+            }
+        });
+        // Result in state.xb2 — caller does output projection (Wo matmul)
+    }
+
+    public RoPE getRope() { return rope; }
+
+    /**
      * Add bias from a FloatTensor to a float array: vec[i] += bias.getFloat(i)
      */
     private static void addBias(float[] vec, it.denzosoft.llmplayer.tensor.FloatTensor bias, int size) {

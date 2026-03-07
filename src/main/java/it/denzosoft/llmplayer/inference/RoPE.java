@@ -177,4 +177,10 @@ public class RoPE {
     public float getMscale() {
         return mscale;
     }
+
+    public float[] getCosTable() { return cosTable; }
+    public float[] getSinTable() { return sinTable; }
+    public int getHeadSize() { return headSize; }
+    public int getRopeDimCount() { return ropeDimCount; }
+    public int getRopeType() { return ropeType; }
 }

@@ -22,6 +22,14 @@ test-results-*.md
 # Claude Code local settings
 .claude/
 
+# Debug/temp files
+CheckTokens.java
+DebugQwen35.java
+InspectGGUF.java
+benchmark_results.txt
+work-llmplayer/
+code/
+
 # OS
 .DS_Store
 Thumbs.db
