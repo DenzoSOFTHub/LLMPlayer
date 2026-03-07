@@ -8,29 +8,24 @@
 - **Parameters:** `--max-tokens 60 --context-length 512`
 - **Date:** 2026-03-07
 
-## Results v1.4.0 — GPU vs CPU Comparison
+## Results v1.4.0 — CUDA GPU vs CPU (SIMD)
 
-| # | Model | Params | Quant | GPU tok/s | CPU tok/s | GPU Mode |
-|--:|-------|--------|-------|----------:|----------:|----------|
-| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | **52.2** | 53.1 | CUDA graph (16/16 layers) |
-| 2 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | **22.9** | 22.7 | CUDA graph (36/36 layers) |
-| 3 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | **20.8** | 20.3 | CUDA graph (28/28 layers) |
-| 4 | OLMo-2-1B-Instruct | 1B | Q4_K_M | 20.3 | — | Per-tensor CUDA matmul* |
-| 5 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | **17.4** | — | CUDA graph (28/28 layers) |
-| 6 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 5.1 | **11.6** | Per-tensor CUDA matmul |
-| 7 | DeepSeek-R1-0528-Qwen3-8B | 8B | Q4_K_M | **11.0** | — | CUDA graph (36/36 layers) |
-| 8 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 8.4 | **11.3** | Per-tensor CUDA matmul* |
-| 9 | Aya-23-8B | 8B | Q4_K_M | **7.0** | — | GPU full offload |
-| 10 | Qwen2.5-3B-Instruct | 3B | Q4_K_M | 6.1 | — | CUDA graph (36/36 layers) |
-| 11 | Qwen3.5-4B | 4B | Q4_K_M | 4.8 | **6.2** | Per-tensor CUDA matmul† |
-| 12 | Qwen3.5-9B | 9B | Q4_K_M | **2.3** | — | Per-tensor CUDA matmul† |
+Tested with `--gpu --gpu-backend cuda` and `--no-gpu` respectively.
 
-\* GPU chain not supported (OLMo2/Phi-4 architecture); falls back to individual CUDA matmul per tensor.
+| # | Model | Params | Quant | CUDA tok/s | CPU tok/s | Speedup | GPU Mode |
+|--:|-------|--------|-------|----------:|----------:|--------:|----------|
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | **50.9** | 2.6 | **20x** | CUDA graph (16/16 layers) |
+| 2 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | **23.9** | 1.0 | **24x** | CUDA graph (28/28 layers) |
+| 3 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | **22.4** | 1.0 | **22x** | CUDA graph (36/36 layers) |
+| 4 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | **11.6** | — | — | CUDA graph (28/28 layers) |
+| 5 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | **11.3** | 0.9 | **13x** | Per-tensor CUDA matmul* |
+| 6 | DeepSeek-R1-0528-Qwen3-8B | 8B | Q4_K_M | **11.1** | — | — | CUDA graph (36/36 layers) |
+| 7 | Qwen3.5-4B | 4B | Q4_K_M | **7.5** | 0.8 | **9x** | Per-tensor CUDA matmul† |
+
+\* GPU chain not supported (Phi-4 architecture); falls back to individual CUDA matmul per tensor.
 † Qwen3.5 uses `Qwen35InferenceEngine` (hybrid DeltaNet); CUDA graph not applicable.
 
-### Key finding: CUDA graph is essential for GPU speedup
-
-Models with CUDA graph (rows 1-5, 7, 10) show competitive or better GPU performance. Models without graph support (rows 6, 8, 11) are **slower on GPU** because per-tensor upload/download overhead exceeds the CUDA compute advantage. For these models, CPU SIMD is faster.
+Note: CPU results are pure SIMD (Vector API) on Intel Core Ultra 7 155H (22 cores). OpenCL CPU (PoCL) yields similar speeds (~2.8 tok/s for Llama 1B). The previous benchmark table (v1.3.0) was measured on Windows native; this WSL2 environment shows lower CPU throughput.
 
 ## Historical Results (v1.3.0) — Ranked by tok/s
 
@@ -78,9 +73,9 @@ Models with CUDA graph (rows 1-5, 7, 10) show competitive or better GPU performa
 
 ## Key Observations
 
-1. **CUDA graph is the key differentiator.** Models with CUDA graph support (Llama, Qwen2/2.5, DeepSeek-R1-Qwen3) achieve 11–52 tok/s on GPU. Models without graph support (OLMo2, Phi-4, Qwen3.5) can actually be **slower on GPU than CPU** because per-tensor upload/download overhead negates the CUDA compute advantage.
+1. **CUDA delivers 9–24x speedup over CPU.** All models benefit substantially from GPU acceleration. The speedup is highest for models with CUDA graph support (20-24x for Llama 1B/3B) and lower for models without graph (9-13x for Qwen3.5, Phi-4).
 
-2. **CPU SIMD is surprisingly competitive.** Phi-4-mini achieves 11.3 tok/s on CPU vs 8.4 tok/s on GPU. Qwen2.5-Coder-7B: 11.6 CPU vs 5.1 GPU. The Intel Core Ultra 7 155H's AVX-512 SIMD with the Vector API is very efficient for matrix-vector multiply.
+2. **CUDA graph is the key to peak performance.** Models with CUDA graph (Llama, Qwen2/2.5, DeepSeek-R1-Qwen3) achieve 11–51 tok/s. Models without graph support (Phi-4, Qwen3.5) still benefit from per-tensor CUDA matmul (7-11 tok/s) but miss the graph's elimination of per-kernel launch overhead.
 
 3. **Q4_K_M is the sweet spot.** Best speed/quality ratio. IQ4_NL and IQ4_XS lack GPU kernel support and fall back to CPU, making them significantly slower despite smaller file sizes.
 
@@ -90,13 +85,13 @@ Models with CUDA graph (rows 1-5, 7, 10) show competitive or better GPU performa
 
 6. **32B dense models are borderline.** GLM-4-32B and Qwen2.5-Coder-32B only fit 15–16 of 60+ layers in GPU, yielding 0.2 tok/s. Usable for short completions but not interactive chat.
 
-7. **CUDA graph capture/replay** delivers a major speedup. Qwen2.5-Coder-3B with CUDA graph achieves 22.9 tok/s vs 6.1 tok/s for the same-size Qwen2.5-3B — a 3.8× boost. Graph mode eliminates per-kernel launch overhead by replaying the entire forward pass as a single GPU operation. Requires all layers on GPU (full offload) and standard `InferenceEngine` architecture.
+7. **CUDA graph capture/replay** delivers a major speedup. Qwen2.5-Coder-3B with CUDA graph achieves 22.4 tok/s vs 1.0 tok/s CPU — a 22× boost. Graph mode eliminates per-kernel launch overhead by replaying the entire forward pass as a single GPU operation. Requires all layers on GPU (full offload) and standard `InferenceEngine` architecture.
 
-8. **Llama-3.2-1B with CUDA graph reaches 52 tok/s.** Combined CPU-side optimizations (reflection Method caching, quickselect sampler, sparse logits history) with CUDA graph mode deliver the fastest inference. Profiling shows 31% of peak 192 GB/s memory bandwidth utilization — the remaining gap is due to Q4_K non-coalesced memory access patterns and Panama FFM overhead (~2 ms/tok). Full analysis in `PERFORMANCE-ANALYSIS.md`.
+8. **Llama-3.2-1B with CUDA graph reaches 51 tok/s.** Combined CPU-side optimizations (reflection Method caching, quickselect sampler, sparse logits history) with CUDA graph mode deliver the fastest inference. Profiling shows 31% of peak 192 GB/s memory bandwidth utilization — the remaining gap is due to Q4_K non-coalesced memory access patterns and Panama FFM overhead (~2 ms/tok). Full analysis in `PERFORMANCE-ANALYSIS.md`.
 
-9. **DeepSeek-R1-Qwen3-8B** achieves 11.0 tok/s with CUDA graph — the fastest 8B model, likely due to optimized Qwen3 architecture with QK-norm enabling efficient GPU execution.
+9. **DeepSeek-R1-Qwen3-8B** achieves 11.1 tok/s with CUDA graph — the fastest 8B model, likely due to optimized Qwen3 architecture with QK-norm enabling efficient GPU execution.
 
-10. **Qwen3.5 hybrid DeltaNet+attention** models work but are slower on GPU. The 4B variant: 4.8 tok/s GPU vs 6.2 tok/s CPU. The 9B variant: 2.3 tok/s GPU. Qwen3.5 uses `Qwen35InferenceEngine` (not standard `InferenceEngine`), so CUDA graph is not used — GPU acceleration comes from per-tensor CUDA matmul only, which introduces more overhead than it saves for models under ~8B.
+10. **Qwen3.5 hybrid DeltaNet+attention** models benefit from GPU (7.5 tok/s GPU vs 0.8 tok/s CPU = 9x speedup for 4B variant). Qwen3.5 uses `Qwen35InferenceEngine` (not standard `InferenceEngine`), so CUDA graph is not used — GPU acceleration comes from per-tensor CUDA matmul only.
 
 ## GPU Strategy Summary
 
