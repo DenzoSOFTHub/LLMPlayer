@@ -139,6 +139,11 @@ public class LLMEngine implements AutoCloseable {
                 this.engine.tryInitGpuForwardPass(bufMgr);
             }
         }
+
+        // Try to initialize expert GPU cache for MoE models
+        if (this.q3moeEngine != null && gpuResources != null && moeOptimizedGpu) {
+            tryInitExpertGpuCache();
+        }
     }
 
     public static LLMEngine load(Path ggufPath) throws IOException {
@@ -1226,6 +1231,36 @@ public class LLMEngine implements AutoCloseable {
     private static long tensorByteSize(it.denzosoft.llmplayer.gguf.GGUFFile gguf, String name) {
         GGUFTensorInfo info = gguf.findTensor(name);
         return info != null ? info.byteSize() : 0;
+    }
+
+    /**
+     * Try to initialize expert GPU cache for MoE models with CUDA.
+     * Uses available VRAM (minus 200 MB safety margin) for caching expert slices.
+     */
+    private void tryInitExpertGpuCache() {
+        try {
+            // Get the CudaContext from TensorFactory's buffer manager
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr == null) return;
+
+            // Only works with CUDA buffer manager
+            Class<?> cudaBufMgrClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaBufferManager");
+            if (!cudaBufMgrClass.isInstance(bufMgr)) return;
+
+            Object cudaContext = cudaBufMgrClass.getMethod("getCudaContext").invoke(bufMgr);
+
+            // Query free VRAM
+            long[] memInfo = (long[]) cudaContext.getClass().getMethod("getMemoryInfo").invoke(cudaContext);
+            long freeVram = memInfo[0];
+            long safetyMargin = 200L * 1024 * 1024; // 200 MB reserved
+            long cacheBytes = Math.max(0, freeVram - safetyMargin);
+
+            if (cacheBytes > 50L * 1024 * 1024) { // At least 50 MB for cache
+                q3moeEngine.initExpertGpuCache(cudaContext, cacheBytes);
+            }
+        } catch (Exception e) {
+            // Expert GPU cache not available — no problem, CPU fallback works
+        }
     }
 
     /**

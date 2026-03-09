@@ -49,6 +49,8 @@ public class CLIOptions {
     private boolean datasetOnly;
     private String trainDataset;
 
+    private boolean force;         // Skip confirmation prompts (e.g., RAM warning)
+
     // Download options
     private String downloadSpec;   // HuggingFace repo: "owner/repo" or "owner/repo/file.gguf"
     private String hfToken;        // HuggingFace API token (optional, for private repos)
@@ -143,6 +145,8 @@ public class CLIOptions {
                 opts.datasetOnly = true;
             } else if ("--train-dataset".equals(arg)) {
                 opts.trainDataset = args[++i];
+            } else if ("--force".equals(arg) || "-y".equals(arg)) {
+                opts.force = true;
             } else if ("--download".equals(arg)) {
                 opts.downloadSpec = args[++i];
             } else if ("--hf-token".equals(arg)) {
@@ -207,6 +211,8 @@ public class CLIOptions {
     public boolean isDatasetOnly() { return datasetOnly; }
     public String getTrainDataset() { return trainDataset; }
 
+    public boolean isForce() { return force; }
+
     // Download getters
     public String getDownloadSpec() { return downloadSpec; }
     public String getHfToken() { return hfToken; }
@@ -264,6 +270,7 @@ public class CLIOptions {
         System.out.println("  --download <repo>        Download GGUF from HuggingFace (e.g. \"bartowski/Llama-3.2-1B-Instruct-GGUF\")");
         System.out.println("                           Or specify file: \"owner/repo/model-Q4_K_M.gguf\"");
         System.out.println("  --hf-token <token>       HuggingFace API token (for private/gated repos)");
+        System.out.println("  --force, -y              Skip confirmation prompts");
         System.out.println("  --help, -h               Show this help");
     }
 }

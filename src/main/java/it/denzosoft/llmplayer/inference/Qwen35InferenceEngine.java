@@ -119,6 +119,14 @@ public class Qwen35InferenceEngine {
     }
 
     public float[] forward(Qwen35State state, int token, int position) {
+        return forwardInternal(state, token, position, true);
+    }
+
+    public void forwardNoOutput(Qwen35State state, int token, int position) {
+        forwardInternal(state, token, position, false);
+    }
+
+    private float[] forwardInternal(Qwen35State state, int token, int position, boolean computeLogits) {
         // 1. Token embedding
         for (int i = 0; i < dim; i++) {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
@@ -134,6 +142,8 @@ public class Qwen35InferenceEngine {
             }
         }
 
+        if (!computeLogits) return null;
+
         // 3. Final RMSNorm
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
 
@@ -145,11 +155,10 @@ public class Qwen35InferenceEngine {
     }
 
     public float[] prefill(Qwen35State state, int[] tokens) {
-        float[] logits = null;
-        for (int i = 0; i < tokens.length; i++) {
-            logits = forward(state, tokens[i], i);
+        for (int i = 0; i < tokens.length - 1; i++) {
+            forwardNoOutput(state, tokens[i], i);
         }
-        return logits;
+        return forward(state, tokens[tokens.length - 1], tokens.length - 1);
     }
 
     // ==================== DeltaNet Forward Pass ====================

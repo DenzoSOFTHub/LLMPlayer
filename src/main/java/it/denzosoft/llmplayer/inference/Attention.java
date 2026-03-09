@@ -3,6 +3,8 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.TransformerLayerWeights;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
+import it.denzosoft.llmplayer.tensor.VectorOps;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.util.Arrays;
@@ -86,10 +88,9 @@ public class Attention {
             System.arraycopy(qkvBuf, qDim, state.k, 0, kvDim);
             System.arraycopy(qkvBuf, qDim + kvDim, state.v, 0, kvDim);
         } else {
-            // Separate Q, K, V (standard)
-            weights.wq().matmulParallel(state.xb, state.q, qDim, dim);
-            weights.wk().matmulParallel(state.xb, state.k, kvDim, dim);
-            weights.wv().matmulParallel(state.xb, state.v, kvDim, dim);
+            // Fused Q+K+V: single parallel dispatch, input stays in L1 cache
+            FloatTensor.fusedQKVMatmulParallel(weights.wq(), weights.wk(), weights.wv(),
+                state.xb, state.q, state.k, state.v, qDim, kvDim, dim);
         }
 
         // Apply Q/K/V bias if present (Qwen2)
@@ -139,18 +140,17 @@ public class Attention {
 
         Arrays.fill(state.xb2, 0, qDim, 0f);
 
+        final VectorOps vecOps = VectorOpsFactory.get();
+
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
 
-            // Compute attention scores: Q_h * K_h^T for attended positions
+            // Compute attention scores: Q_h * K_h^T for attended positions (SIMD dot)
             int attOffset = h * seqLen;
+            int qOffset = h * headSize;
             for (int t = attnStartPos; t <= position; t++) {
-                float score = 0f;
-                int qOffset = h * headSize;
                 int kOffset = state.kvCache.offset(t) + kvHead * headSize;
-                for (int i = 0; i < headSize; i++) {
-                    score += state.q[qOffset + i] * keyCache[kOffset + i];
-                }
+                float score = vecOps.dot(state.q, qOffset, keyCache, kOffset, headSize);
                 float s = score * scaleFactor;
                 // Attention logit soft-capping (Gemma2/3)
                 if (attnLogitSoftCap > 0f) {
@@ -160,16 +160,14 @@ public class Attention {
             }
 
             // Softmax over attention scores
-            VectorOpsFactory.get().softmax(state.att, attOffset, seqLen);
+            vecOps.softmax(state.att, attOffset, seqLen);
 
-            // Weighted sum of values
+            // Weighted sum of values (SIMD saxpy)
             int outOffset = h * headSize;
             for (int t = attnStartPos; t <= position; t++) {
                 float a = state.att[attOffset + (t - attnStartPos)];
                 int vOffset = state.kvCache.offset(t) + kvHead * headSize;
-                for (int i = 0; i < headSize; i++) {
-                    state.xb2[outOffset + i] += a * valueCache[vOffset + i];
-                }
+                vecOps.saxpy(a, valueCache, vOffset, state.xb2, outOffset, headSize);
             }
         });
 
@@ -259,17 +257,16 @@ public class Attention {
 
         Arrays.fill(state.xb2, 0, qDim, 0f);
 
+        final VectorOps vecOps = VectorOpsFactory.get();
+
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
 
             int attOffset = h * seqLen;
+            int qOffset = h * headSize;
             for (int t = attnStartPos; t <= position; t++) {
-                float score = 0f;
-                int qOffset = h * headSize;
                 int kOffset = state.kvCache.offset(t) + kvHead * headSize;
-                for (int i = 0; i < headSize; i++) {
-                    score += state.q[qOffset + i] * keyCache[kOffset + i];
-                }
+                float score = vecOps.dot(state.q, qOffset, keyCache, kOffset, headSize);
                 float s = score * scaleFactor;
                 if (attnLogitSoftCap > 0f) {
                     s = attnLogitSoftCap * (float) Math.tanh(s / attnLogitSoftCap);
@@ -277,15 +274,13 @@ public class Attention {
                 state.att[attOffset + (t - attnStartPos)] = s;
             }
 
-            VectorOpsFactory.get().softmax(state.att, attOffset, seqLen);
+            vecOps.softmax(state.att, attOffset, seqLen);
 
             int outOffset = h * headSize;
             for (int t = attnStartPos; t <= position; t++) {
                 float a = state.att[attOffset + (t - attnStartPos)];
                 int vOffset = state.kvCache.offset(t) + kvHead * headSize;
-                for (int i = 0; i < headSize; i++) {
-                    state.xb2[outOffset + i] += a * valueCache[vOffset + i];
-                }
+                vecOps.saxpy(a, valueCache, vOffset, state.xb2, outOffset, headSize);
             }
         });
         // Result in state.xb2 — caller does output projection (Wo matmul)
@@ -307,17 +302,14 @@ public class Attention {
      * The norm weights are shared across heads (same weights for all heads, size = headSize).
      */
     private static void applyPerHeadNorm(float[] vec, float[] normWeights, int nHeads, int headSize, float eps) {
+        VectorOps vecOps = VectorOpsFactory.get();
         for (int h = 0; h < nHeads; h++) {
             int offset = h * headSize;
-            // In-place RMSNorm on vec[offset..offset+headSize-1]
-            float ss = 0f;
-            for (int i = 0; i < headSize; i++) {
-                ss += vec[offset + i] * vec[offset + i];
-            }
+            // SIMD sum of squares via dot(vec, vec)
+            float ss = vecOps.dot(vec, offset, vec, offset, headSize);
             ss = 1.0f / (float) Math.sqrt(ss / headSize + eps);
-            for (int i = 0; i < headSize; i++) {
-                vec[offset + i] = vec[offset + i] * ss * normWeights[i];
-            }
+            // SIMD scale with weights
+            vecOps.scaleWeighted(vec, offset, normWeights, ss, headSize);
         }
     }
 }

@@ -46,6 +46,18 @@ public final class ArchitectureRegistry {
     public static String attnKvANorm(int layer) { return "blk." + layer + ".attn_kv_a_norm.weight"; }
     public static String attnKvB(int layer) { return "blk." + layer + ".attn_kv_b.weight"; }
 
+    // GLM-4.7-Flash / DeepSeek-V3: Q-LoRA decomposition (Q = Q_A * norm * Q_B)
+    public static String attnQA(int layer) { return "blk." + layer + ".attn_q_a.weight"; }
+    public static String attnQANorm(int layer) { return "blk." + layer + ".attn_q_a_norm.weight"; }
+    public static String attnQB(int layer) { return "blk." + layer + ".attn_q_b.weight"; }
+
+    // GLM-4.7-Flash / DeepSeek-V3: separate K_B and V_B (3D per-head tensors)
+    public static String attnKB(int layer) { return "blk." + layer + ".attn_k_b.weight"; }
+    public static String attnVB(int layer) { return "blk." + layer + ".attn_v_b.weight"; }
+
+    // GLM-4.7-Flash: expert probability bias
+    public static String expProbsBias(int layer) { return "blk." + layer + ".exp_probs_b.bias"; }
+
     // Attention output bias (GPT-OSS)
     public static String attnOutputBias(int layer) { return "blk." + layer + ".attn_output.bias"; }
 

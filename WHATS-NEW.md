@@ -1,14 +1,62 @@
 # LLMPlayer — What's New
 
-## v1.5.0 (2026-03-08)
+## v1.6.0 (2026-03-09)
 
-### BPE Tokenizer Fix — Non-ASCII Text Corruption
+### CPU Performance — Prefill Skip
 
-Fixed a critical bug in the GPT-2 byte-level BPE tokenizer that corrupted all non-ASCII text (accented characters, Cyrillic, Greek, CJK, emoji). The byte-to-Unicode mapping for bytes 127-160 used an incorrect formula, producing wrong codepoints (e.g., U+017F instead of U+0121 for byte 127). Both `byteToToken()` encoding and `tokenCharToByte()` decoding paths were corrected, along with missing identity-mapped byte ranges (161-172, 174-255). A buffer overflow in `decodeTokenPiece()` was also fixed (allocated `piece.length()` bytes but multi-byte UTF-8 chars could exceed that). Affects all BPE models: Llama 3, Mistral, Qwen2/3, OLMo, Aya, Yi-Coder.
+Output projection (final RMSNorm + vocabSize×dim matmul) is now skipped for all prefill tokens except the last. For 128K-vocab models, this saves ~262M multiply-adds per prefill token. Applied to all four inference engine paths (standard, DeepSeek2, Qwen3MoE, Qwen3.5).
 
-### CUDA Forward Pass — Per-Head QK-Norm on GPU
+### CPU Performance — SIMD Attention
 
-Models with per-head QK-norm (Qwen3-4B, DeepSeek-R1-Qwen3-8B, Qwen3-8B) now run the full CUDA forward pass including QK-norm on GPU. New `rmsnorm_per_head.cu` kernel normalizes each attention head independently — one CUDA block per head. Previously these models fell back to per-tensor CUDA matmul; now they can use the GPU-resident forward pass with CUDA graph for maximum throughput.
+Attention Q*K dot product and V accumulation loops replaced with `VectorOps.dot()` and `VectorOps.saxpy()` across all attention heads. Provides ~4x speedup for attention compute on AVX2+ hardware.
+
+### CPU Performance — SIMD Fused Dequant+Dot Tensors
+
+Four new SIMD tensor variants that fuse dequantization with dot product, eliminating ThreadLocal overhead, intermediate tmp[] buffers, and VectorOpsFactory dispatch:
+- **SimdQ6_KFloatTensor**: Critical for output projection in Q4_K_M models (largest matmul: vocabSize × dim). Processes 4 quadrants per half-block with fused multiply+accumulate.
+- **SimdQ5_0FloatTensor**: Critical for Gemma 3 (Q5_0 for Q, K, gate, up projections). Dequantizes 32 elements into split lo/hi arrays, then SIMD FMA.
+- **SimdQ5_KFloatTensor**: Group-based processing with low/high nibble SIMD FMA, same scale packing as Q4_K with extra high-bit.
+- **SimdQ3_KFloatTensor**: Decodes all 16 scales from 12-byte packed format, processes 2 halves × 4 pairs × 2 sub-blocks.
+
+### CPU Performance — SIMD QK-Norm
+
+Per-head QK-norm (Qwen3, Gemma 3) now uses SIMD for both the sum-of-squares computation (`VectorOps.dot`) and the scale+weight multiply phase (new `VectorOps.scaleWeighted`).
+
+### CPU Performance — SIMD RoPE
+
+RoPE in NEOX (split-half) mode now vectorized via `VectorOps.ropeNeox()`. Loads cos/sin/v0/v1 in SIMD lanes and computes both rotated outputs in parallel. Benefits Qwen2, Qwen3, GLM4, and other models using split-half RoPE.
+
+### CPU Performance — Tiled Matmul (Opt-in)
+
+New cache-friendly tiled GEMV enabled via `-Dmatmul.tiled=true`. Processes 4 rows simultaneously (ROW_TILE=4), sharing input vector reads from L1 cache. Supports Q4_K, Q8_0, Q6_K with automatic fallback for other types. Uses virtual thread executor for parallelization. Zero impact on default code path.
+
+### CPU Performance — CPU Profiling
+
+New `-Dcpu.profile=true` flag for per-section timing in TransformerBlock: attn_norm, attention, ffn_norm, FFN, residual, post-norms. Prints summary every 10 tokens.
+
+### New CUDA Kernels — IQ2_S, IQ3_S
+
+Added dedicated CUDA GPU kernels for IQ2_S and IQ3_S quantization formats:
+- **IQ2_S** (`matmul_iq2_s.cu`): 82 bytes/block, 256 elements. 10-bit grid index → IQ2S_GRID (1024 entries, uint64). Scale: `d * (0.5 + nibble) * 0.25`.
+- **IQ3_S** (`matmul_iq3_s.cu`): 110 bytes/block, 256 elements. 9-bit grid index → IQ3S_GRID (512 entries, uint32). Scale: `d * (1 + 2*nibble)`.
+
+Both use warp-per-row with `__shfl_down_sync` reduction and `__ldg` texture cache reads.
+
+### New CUDA Kernels — BF16, F16
+
+Added CUDA GPU kernels for BF16 (bfloat16) and F16 (IEEE half-precision) tensor types. BF16 uses simple bit-shift conversion (`bits << 16`), F16 uses manual half2float. Enables full GPU offload for BF16/F16 models.
+
+### CUDA Forward Pass — Packed FFN (Phi-3/4)
+
+Models with packed FFN (Phi-3/4 where `wGate` is null, `wUp` produces `2*ffnDim`) now supported in the CUDA forward pass. New `split_gate_up.cu` kernel splits the packed output into separate gate and up buffers. Single matmul + split replaces two separate matmuls.
+
+### Q8_0 SIMD Integer Dot
+
+`SimdQ8_0FloatTensor` now overrides Q8_0×Q8_0 dot product with direct MemorySegment access, eliminating ThreadLocal and tmp buffer overhead.
+
+---
+
+## v1.5.1 (2026-03-09)
 
 ### New CUDA Kernels — Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS
 
@@ -17,6 +65,10 @@ Added dedicated CUDA GPU kernels for Q5_0, IQ4_NL, IQ4_XS, and IQ3_XXS quantizat
 The Q5_0 kernel is critical for Gemma 2/3 models, which use Q5_0 for Q, K, gate, and up projections in Q4_K_M quantization. With Q5_0 on GPU, Gemma-3-1B now achieves **35.7 tok/s** with CUDA graph (previously 4.0 tok/s with per-tensor fallback — **9x improvement**).
 
 IQ4_NL Llama-3.2-1B now achieves **28.7 tok/s** with CUDA graph (previously 4.4 tok/s — **6.5x improvement**).
+
+### CUDA Forward Pass — Per-Head QK-Norm on GPU
+
+Models with per-head QK-norm (Qwen3-4B, DeepSeek-R1-Qwen3-8B, Qwen3-8B) now run the full CUDA forward pass including QK-norm on GPU. New `rmsnorm_per_head.cu` kernel normalizes each attention head independently — one CUDA block per head. Previously these models fell back to per-tensor CUDA matmul; now they can use the GPU-resident forward pass with CUDA graph for maximum throughput.
 
 ### CUDA Forward Pass — Post-Norm (Gemma 2/3)
 
@@ -31,6 +83,24 @@ Added `split_qkv.cu` kernel for splitting concatenated QKV output into separate 
 - **Combined upload**: embedding vector + token params uploaded in a single `cuMemcpyHtoD` via contiguous GPU buffer, saving one Panama FFM call per token.
 - **Fused gate+up kernel** (`matmul_q4_k_fused_gate_up.cu`): single kernel launch for both gate and up projections when both are Q4_K. Halves kernel launch count for FFN phase.
 - **GPU-side argmax** (`argmax.cu`): two-phase parallel argmax on GPU logits. Downloads 4 bytes instead of 512 KB for greedy sampling.
+
+### Comprehensive Benchmarks
+
+All 33 GGUF models in the test suite verified on both CPU (SIMD) and GPU (CUDA). Full results in BENCHMARKS.md. Highlights:
+- Llama-3.2-1B Q4_K_M: 54.7 tok/s GPU — CUDA graph (17x over CPU)
+- Qwen2.5-Coder-1.5B Q4_K_M: 41.5 tok/s GPU — CUDA graph (19x)
+- Gemma-3-1B Q4_K_M: 35.7 tok/s GPU — CUDA graph (9x, unlocked by Q5_0 kernel)
+- Llama-3.2-1B IQ4_NL: 28.7 tok/s GPU — CUDA graph (6.5x, unlocked by IQ4_NL kernel)
+- Qwen3-4B Q4_K_M: 19.0 tok/s GPU — CUDA graph (unlocked by QK-norm support)
+- DeepSeek-R1-Qwen3-8B Q4_K_M: 9.3 tok/s GPU — CUDA graph (unlocked by QK-norm support)
+
+---
+
+## v1.5.0 (2026-03-08)
+
+### BPE Tokenizer Fix — Non-ASCII Text Corruption
+
+Fixed a critical bug in the GPT-2 byte-level BPE tokenizer that corrupted all non-ASCII text (accented characters, Cyrillic, Greek, CJK, emoji). The byte-to-Unicode mapping for bytes 127-160 used an incorrect formula, producing wrong codepoints (e.g., U+017F instead of U+0121 for byte 127). Both `byteToToken()` encoding and `tokenCharToByte()` decoding paths were corrected, along with missing identity-mapped byte ranges (161-172, 174-255). A buffer overflow in `decodeTokenPiece()` was also fixed (allocated `piece.length()` bytes but multi-byte UTF-8 chars could exceed that). Affects all BPE models: Llama 3, Mistral, Qwen2/3, OLMo, Aya, Yi-Coder.
 
 ### HuggingFace Model Download
 
@@ -59,16 +129,6 @@ Added conditional RoPE for Llama4's interleaved RoPE architecture: every Nth lay
 ### Q5_0 Dequantization Fix
 
 Fixed element ordering in Q5_0 quantization: elements 0-15 use LOW nibbles of bytes 0-15 (qh bits 0-15), elements 16-31 use HIGH nibbles of bytes 0-15 (qh bits 16-31). The previous implementation used interleaved ordering. This was the root cause of Gemma 3 garbage output, since Gemma 3 Q4_K_M uses Q5_0 for Q, K, gate, and up projections.
-
-### Comprehensive Benchmarks
-
-All 33 GGUF models in the test suite verified on both CPU (SIMD) and GPU (CUDA). Full results in BENCHMARKS.md. Highlights:
-- Llama-3.2-1B Q4_K_M: 54.7 tok/s GPU — CUDA graph (17x over CPU)
-- Qwen2.5-Coder-1.5B Q4_K_M: 41.5 tok/s GPU — CUDA graph (19x)
-- Gemma-3-1B Q4_K_M: 35.7 tok/s GPU — CUDA graph (9x, unlocked by Q5_0 kernel)
-- Llama-3.2-1B IQ4_NL: 28.7 tok/s GPU — CUDA graph (6.5x, unlocked by IQ4_NL kernel)
-- Qwen3-4B Q4_K_M: 19.0 tok/s GPU — CUDA graph (unlocked by QK-norm support)
-- DeepSeek-R1-Qwen3-8B Q4_K_M: 9.3 tok/s GPU — CUDA graph (unlocked by QK-norm support)
 
 ---
 

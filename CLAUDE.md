@@ -61,7 +61,8 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 | `TensorDataFactory.mapFile()` | `MemorySegmentTensorData` | `ByteBufferTensorData` |
 | `TensorFactory.tryCreateGpuTensor()` | `Q4_KGpuTensor`/`Q4_KCudaTensor`, etc. | CPU tensor variant |
 | `LLMEngine.initGpu()` | `CudaContext` + `CudaBufferManager` (preferred) or `OpenCLContext` + `GpuBufferManager` | CPU-only |
-| `TensorFactory.create()` Q4_K/Q8_0 | `SimdQ4_KFloatTensor` / `SimdQ8_0FloatTensor` | `Q4_KFloatTensor` / `Q8_0FloatTensor` |
+| `TensorFactory.create()` Q4_K/Q8_0/Q6_K/Q5_0/Q5_K/Q3_K | `Simd*FloatTensor` variants | Scalar `*FloatTensor` variants |
+| `FloatTensor.tryTiledMatmul()` | `TiledMatmul` | Standard `matmulParallel()` path |
 | `FloatTensor.tryVirtualThreadMatmul()` | `VirtualThreadMatmul` | `IntStream.parallel()` ForkJoinPool matmul |
 | `LLMEngine.tryStructuredBatch()` | `StructuredBatchGenerator` | `ExecutorService` thread pool |
 | `InferenceEngine.tryInitGpuForwardPass()` | `CudaForwardPass` (preferred) or `GpuForwardPass` | CPU forward pass |
@@ -214,7 +215,7 @@ Three data scenarios auto-detected from CLI flags: `--source` (code), `--documen
 ### Resources
 
 - `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/kernels/cuda/` — 26 CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
+- `src/main/resources/kernels/cuda/` — 31 CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
 - `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
 - `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
@@ -261,7 +262,12 @@ The `CudaForwardPass` uses **zero-allocation hot paths**: all kernel param buffe
 - **Fused gate+up kernel** (`matmul_q4_k_fused_gate_up.cu`): single kernel launch for both gate and up projections when both are Q4_K. Reads input vector once, halves kernel launch count for FFN phase. Auto-detected per-layer.
 - **GPU-side argmax** (`argmax.cu`): two-phase parallel argmax (partial → final) on GPU logits. `forwardFinalArgmax()` and `forwardGraphArgmax()` return the token ID directly, downloading 4 bytes instead of 512 KB. Usable for greedy sampling without repetition penalty.
 
-Supported for dense models: Llama, Qwen2, Qwen3, Mistral3 (standard), Gemma 2/3 (post-norm via `rmsnorm_per_head.cu`). Per-head QK-norm (Qwen3) is supported via `rmsnorm_per_head.cu` kernel. Not supported for: MoE, packed FFN (Phi-3/4 — wGate=null, wUp has 2x output), or hybrid architectures (Qwen3.5 DeltaNet).
+**v1.6.0 optimizations:**
+- **Packed FFN** (`split_gate_up.cu`): Phi-3/4 models with `wGate==null` now supported. Single wUp matmul (2×ffnDim output) + split kernel replaces two separate matmuls.
+- **New CUDA kernels**: IQ2_S (10-bit grid, 1024-entry codebook), IQ3_S (9-bit grid, 512-entry codebook), BF16 (bit-shift conversion), F16 (half2float). All warp-per-row with `__ldg`.
+- **CPU-side**: Prefill skip (skip output projection for non-last tokens), SIMD attention, SIMD fused dequant+dot tensors (Q6_K, Q5_0, Q5_K, Q3_K), SIMD QK-norm, SIMD RoPE (NEOX mode), tiled matmul (`-Dmatmul.tiled=true`), CPU profiling (`-Dcpu.profile=true`).
+
+Supported for dense models: Llama, Qwen2, Qwen3, Mistral3 (standard), Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) is supported via `rmsnorm_per_head.cu` kernel. Not supported for: MoE or hybrid architectures (Qwen3.5 DeltaNet).
 
 ### GPU-virtual thread interaction
 

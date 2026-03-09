@@ -38,6 +38,11 @@ public class Qwen3MoEInferenceEngine {
     // Cached attention sinks per layer (GPT-OSS): float[blockCount][headCount]
     private final float[][] cachedAttnSinks;
 
+    // Expert GPU cache (loaded via reflection from java21, null if unavailable)
+    private Object expertGpuCache;
+    private java.lang.reflect.Method computeExpertsMethod;
+    private int currentLayer; // tracks current layer for GPU cache keying
+
     public Qwen3MoEInferenceEngine(ModelConfig config, Qwen3MoEWeights weights, int maxSeqLen,
                                     float[] ropeFreqFactors) {
         this.config = config;
@@ -93,13 +98,71 @@ public class Qwen3MoEInferenceEngine {
         }
     }
 
+    /**
+     * Initialize expert GPU cache for accelerated MoE FFN computation.
+     * Called from LLMEngine when CUDA is active and the model is MoE.
+     * @param cudaContext the CudaContext object (from java21)
+     * @param maxCacheBytes maximum VRAM to use for expert caching
+     */
+    public void initExpertGpuCache(Object cudaContext, long maxCacheBytes) {
+        try {
+            int expertFfnDim = config.expertFfnLength();
+            int dim = config.embeddingLength();
+            long elementsPerSlice = (long) expertFfnDim * dim;
+            int blockSize = 32;
+            int blockBytes = 17; // MXFP4
+            long bytesPerSlice = (elementsPerSlice / blockSize) * blockBytes;
+            int maxSlots = (int) (maxCacheBytes / bytesPerSlice);
+            if (maxSlots < 12) { // need at least 3 projections × 4 experts
+                System.out.println("  Expert GPU cache: not enough VRAM (" + maxSlots + " slots)");
+                return;
+            }
+
+            Class<?> cacheClass = Class.forName("it.denzosoft.llmplayer.gpu.ExpertGpuCache");
+            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
+            Object cache = cacheClass.getConstructor(ctxClass, int.class, long.class)
+                .newInstance(cudaContext, maxSlots, elementsPerSlice);
+            computeExpertsMethod = cacheClass.getMethod("computeExperts",
+                FloatTensor.class, FloatTensor.class, FloatTensor.class,
+                float[].class, int[].class, float[].class,
+                int.class, int.class, int.class, int.class,
+                float[][].class, float[][].class, float[][].class,
+                boolean.class,
+                FloatTensor.class, FloatTensor.class, FloatTensor.class);
+            expertGpuCache = cache;
+        } catch (ClassNotFoundException e) {
+            // java21 classes not available
+        } catch (Exception e) {
+            System.out.println("  Expert GPU cache init failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Get expert GPU cache statistics, or null if cache not active.
+     */
+    public String getExpertCacheStats() {
+        if (expertGpuCache == null) return null;
+        try {
+            return (String) expertGpuCache.getClass().getMethod("getStats").invoke(expertGpuCache);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public Qwen3MoEState createState(int maxSeqLen) {
         return new Qwen3MoEState(config, maxSeqLen);
     }
 
     public float[] forward(Qwen3MoEState state, int token, int position) {
+        return forwardInternal(state, token, position, true);
+    }
+
+    public void forwardNoOutput(Qwen3MoEState state, int token, int position) {
+        forwardInternal(state, token, position, false);
+    }
+
+    private float[] forwardInternal(Qwen3MoEState state, int token, int position, boolean computeLogits) {
         int dim = config.embeddingLength();
-        int vocabSize = config.vocabSize();
         int leadingDenseCount = config.leadingDenseBlockCount();
 
         // 1. Token embedding lookup
@@ -129,6 +192,7 @@ public class Qwen3MoEInferenceEngine {
             } else {
                 // Save xb before MoE (since xb is reused as output accumulator)
                 System.arraycopy(state.xb, 0, state.xbSaved, 0, dim);
+                currentLayer = layer;
                 // MoE FFN
                 moeFFN(state, layerWeights);
             }
@@ -137,10 +201,13 @@ public class Qwen3MoEInferenceEngine {
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
         }
 
+        if (!computeLogits) return null;
+
         // 3. Final RMSNorm
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
 
         // 4. Output projection
+        int vocabSize = config.vocabSize();
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
 
@@ -323,44 +390,39 @@ public class Qwen3MoEInferenceEngine {
             }
         }
 
-        // 2. Compute routed expert outputs - parallel across experts
+        // 2. Compute routed expert outputs
         Arrays.fill(state.xb, 0);
 
         // Capture for lambda
         final boolean useSwigluOai = isGptOss;
 
-        IntStream.range(0, expertUsedCount).parallel().forEach(new java.util.function.IntConsumer() {
-            @Override
-            public void accept(int k) {
-                int e = state.selectedExperts[k];
-
-                float[] gate = state.moeHbPerExpert[k];
-                float[] up = state.moeHb2PerExpert[k];
-                float[] out = state.expertOutPerExpert[k];
-
-                Arrays.fill(gate, 0, expertFfnDim, 0f);
-                Arrays.fill(up, 0, expertFfnDim, 0f);
-
-                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim);
-                expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim);
-
-                // Expert biases (GPT-OSS): shape [ffnDim, expertCount]
-                if (weights.ffnGateExpsBias() != null) addExpertBias(gate, weights.ffnGateExpsBias(), e, expertFfnDim);
-                if (weights.ffnUpExpsBias() != null) addExpertBias(up, weights.ffnUpExpsBias(), e, expertFfnDim);
-
-                if (useSwigluOai) {
-                    // GPT-OSS custom SwiGLU: alpha=1.702, limit=7, (up + 1)
-                    swigluOai(gate, up, expertFfnDim);
-                } else {
-                    VectorOpsFactory.get().silu(gate, expertFfnDim);
-                    VectorOpsFactory.get().elementwiseMul(gate, up, gate, expertFfnDim);
+        if (expertGpuCache != null && computeExpertsMethod != null) {
+            // GPU-accelerated path: batch all experts on GPU with LRU caching
+            try {
+                // Zero per-expert buffers
+                for (int k = 0; k < expertUsedCount; k++) {
+                    Arrays.fill(state.moeHbPerExpert[k], 0, expertFfnDim, 0f);
+                    Arrays.fill(state.moeHb2PerExpert[k], 0, expertFfnDim, 0f);
+                    Arrays.fill(state.expertOutPerExpert[k], 0, dim, 0f);
                 }
-
-                Arrays.fill(out, 0, dim, 0f);
-                expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim);
-                if (weights.ffnDownExpsBias() != null) addExpertBias(out, weights.ffnDownExpsBias(), e, dim);
+                computeExpertsMethod.invoke(expertGpuCache,
+                    weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
+                    state.xbSaved, state.selectedExperts, state.selectedWeights,
+                    expertUsedCount, currentLayer, dim, expertFfnDim,
+                    state.moeHbPerExpert, state.moeHb2PerExpert, state.expertOutPerExpert,
+                    useSwigluOai,
+                    weights.ffnGateExpsBias(), weights.ffnUpExpsBias(), weights.ffnDownExpsBias());
+            } catch (Exception e) {
+                // Fallback to CPU on error, disable cache
+                System.err.println("Expert GPU cache error: " + e.getMessage() + " — falling back to CPU");
+                expertGpuCache = null;
+                computeExpertsMethod = null;
+                cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
             }
-        });
+        } else {
+            // CPU parallel path
+            cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
+        }
 
         // Sequential accumulation of weighted expert outputs
         for (int k = 0; k < expertUsedCount; k++) {
@@ -386,6 +448,44 @@ public class Qwen3MoEInferenceEngine {
 
             VectorOpsFactory.get().accumulate(state.xb, sharedOut, dim);
         }
+    }
+
+    /**
+     * CPU parallel expert computation (original path).
+     */
+    private void cpuExpertCompute(Qwen3MoEState state, Qwen3MoELayerWeights weights,
+                                   int expertUsedCount, int expertFfnDim, int dim,
+                                   boolean useSwigluOai) {
+        IntStream.range(0, expertUsedCount).parallel().forEach(new java.util.function.IntConsumer() {
+            @Override
+            public void accept(int k) {
+                int e = state.selectedExperts[k];
+
+                float[] gate = state.moeHbPerExpert[k];
+                float[] up = state.moeHb2PerExpert[k];
+                float[] out = state.expertOutPerExpert[k];
+
+                Arrays.fill(gate, 0, expertFfnDim, 0f);
+                Arrays.fill(up, 0, expertFfnDim, 0f);
+
+                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim);
+                expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim);
+
+                if (weights.ffnGateExpsBias() != null) addExpertBias(gate, weights.ffnGateExpsBias(), e, expertFfnDim);
+                if (weights.ffnUpExpsBias() != null) addExpertBias(up, weights.ffnUpExpsBias(), e, expertFfnDim);
+
+                if (useSwigluOai) {
+                    swigluOai(gate, up, expertFfnDim);
+                } else {
+                    VectorOpsFactory.get().silu(gate, expertFfnDim);
+                    VectorOpsFactory.get().elementwiseMul(gate, up, gate, expertFfnDim);
+                }
+
+                Arrays.fill(out, 0, dim, 0f);
+                expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim);
+                if (weights.ffnDownExpsBias() != null) addExpertBias(out, weights.ffnDownExpsBias(), e, dim);
+            }
+        });
     }
 
     /**
@@ -495,15 +595,15 @@ public class Qwen3MoEInferenceEngine {
     }
 
     public float[] prefill(Qwen3MoEState state, int[] tokens) {
-        float[] logits = null;
         long t0 = System.currentTimeMillis();
-        for (int i = 0; i < tokens.length; i++) {
-            logits = forward(state, tokens[i], i);
+        for (int i = 0; i < tokens.length - 1; i++) {
+            forwardNoOutput(state, tokens[i], i);
             if (tokens.length > 10) {
                 long elapsed = System.currentTimeMillis() - t0;
                 System.out.printf("[prefill] token %d/%d (%.1fs)%n", i + 1, tokens.length, elapsed / 1000.0);
             }
         }
+        float[] logits = forward(state, tokens[tokens.length - 1], tokens.length - 1);
         long total = System.currentTimeMillis() - t0;
         System.out.printf("[prefill] done: %d tokens in %.1fs%n", tokens.length, total / 1000.0);
         return logits;

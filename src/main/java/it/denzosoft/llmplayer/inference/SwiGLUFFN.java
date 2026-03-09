@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.TransformerLayerWeights;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.util.Arrays;
@@ -35,14 +36,11 @@ public class SwiGLUFFN {
         int ffnDim = config.intermediateSize();
 
         if (weights.wGate() != null) {
-            // Standard mode (Llama, Qwen): gate and up are separate tensors
-            // gate = wGate * xb
+            // Fused gate+up: single parallel dispatch, input stays in L1 cache
             Arrays.fill(state.hb, 0);
-            weights.wGate().matmulParallel(state.xb, state.hb, ffnDim, dim);
-
-            // up = wUp * xb
             Arrays.fill(state.hb2, 0);
-            weights.wUp().matmulParallel(state.xb, state.hb2, ffnDim, dim);
+            FloatTensor.fusedGateUpMatmulParallel(weights.wGate(), weights.wUp(),
+                state.xb, state.hb, state.hb2, ffnDim, dim);
         } else {
             // Packed mode (GLM4): wUp has shape [2*ffnDim, dim]
             // Single matmul produces [gate, up] concatenated

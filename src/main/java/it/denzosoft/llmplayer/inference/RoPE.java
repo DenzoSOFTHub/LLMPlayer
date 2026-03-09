@@ -162,10 +162,24 @@ public class RoPE {
 
     /**
      * Apply RoPE to all heads in a Q or K vector.
+     * Uses SIMD-optimized path for NEOX (split-half) mode via VectorOps.
      */
     public void applyAllHeads(float[] vec, int nHeads, int position) {
-        for (int h = 0; h < nHeads; h++) {
-            apply(vec, h * headSize, position);
+        int halfRope = ropeDimCount / 2;
+        int tableOffset = position * halfRope;
+
+        if (ropeType == ROPE_TYPE_NEOX) {
+            // Split-half: SIMD-friendly — vec[i] and vec[halfRope+i] are contiguous blocks
+            it.denzosoft.llmplayer.tensor.VectorOps vecOps = it.denzosoft.llmplayer.tensor.VectorOpsFactory.get();
+            for (int h = 0; h < nHeads; h++) {
+                int offset = h * headSize;
+                vecOps.ropeNeox(vec, offset, cosTable, sinTable, tableOffset, halfRope);
+            }
+        } else {
+            // NORMAL mode: interleaved pairs (2i, 2i+1) — scalar path
+            for (int h = 0; h < nHeads; h++) {
+                apply(vec, h * headSize, position);
+            }
         }
     }
 

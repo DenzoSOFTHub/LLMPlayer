@@ -5,10 +5,10 @@ import it.denzosoft.llmplayer.tensor.FloatTensor;
 public final class DeepSeek2LayerWeights {
     private final FloatTensor attnNorm;
     private final FloatTensor ffnNorm;
-    private final FloatTensor wq;
+    private final FloatTensor wq;       // null when Q-LoRA is used (wqA/wqANorm/wqB instead)
     private final FloatTensor wkvA;
     private final FloatTensor kvANorm;
-    private final FloatTensor wkvB;
+    private final FloatTensor wkvB;     // combined K+V decompression (null when separate wkB/wvB)
     private final FloatTensor wo;
     private final FloatTensor wGate;
     private final FloatTensor wUp;
@@ -20,6 +20,15 @@ public final class DeepSeek2LayerWeights {
     private final FloatTensor ffnGateShexp;
     private final FloatTensor ffnUpShexp;
     private final FloatTensor ffnDownShexp;
+    // Q-LoRA (GLM-4.7-Flash / DeepSeek-V3): decompose Q into Q_A * norm * Q_B
+    private final FloatTensor wqA;
+    private final FloatTensor wqANorm;
+    private final FloatTensor wqB;
+    // Separate K_B and V_B (3D per-head tensors, GLM-4.7-Flash / DeepSeek-V3)
+    private final FloatTensor wkB;
+    private final FloatTensor wvB;
+    // Expert probability bias (GLM-4.7-Flash)
+    private final FloatTensor expProbsBias;
 
     public DeepSeek2LayerWeights(FloatTensor attnNorm, FloatTensor ffnNorm,
                                  FloatTensor wq, FloatTensor wkvA, FloatTensor kvANorm,
@@ -29,6 +38,23 @@ public final class DeepSeek2LayerWeights {
                                  FloatTensor ffnUpExps, FloatTensor ffnDownExps,
                                  FloatTensor ffnGateShexp, FloatTensor ffnUpShexp,
                                  FloatTensor ffnDownShexp) {
+        this(attnNorm, ffnNorm, wq, wkvA, kvANorm, wkvB, wo,
+             wGate, wUp, wDown, ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps,
+             ffnGateShexp, ffnUpShexp, ffnDownShexp,
+             null, null, null, null, null, null);
+    }
+
+    public DeepSeek2LayerWeights(FloatTensor attnNorm, FloatTensor ffnNorm,
+                                 FloatTensor wq, FloatTensor wkvA, FloatTensor kvANorm,
+                                 FloatTensor wkvB, FloatTensor wo,
+                                 FloatTensor wGate, FloatTensor wUp, FloatTensor wDown,
+                                 FloatTensor ffnGateInp, FloatTensor ffnGateExps,
+                                 FloatTensor ffnUpExps, FloatTensor ffnDownExps,
+                                 FloatTensor ffnGateShexp, FloatTensor ffnUpShexp,
+                                 FloatTensor ffnDownShexp,
+                                 FloatTensor wqA, FloatTensor wqANorm, FloatTensor wqB,
+                                 FloatTensor wkB, FloatTensor wvB,
+                                 FloatTensor expProbsBias) {
         this.attnNorm = attnNorm;
         this.ffnNorm = ffnNorm;
         this.wq = wq;
@@ -46,6 +72,12 @@ public final class DeepSeek2LayerWeights {
         this.ffnGateShexp = ffnGateShexp;
         this.ffnUpShexp = ffnUpShexp;
         this.ffnDownShexp = ffnDownShexp;
+        this.wqA = wqA;
+        this.wqANorm = wqANorm;
+        this.wqB = wqB;
+        this.wkB = wkB;
+        this.wvB = wvB;
+        this.expProbsBias = expProbsBias;
     }
 
     public FloatTensor attnNorm() { return attnNorm; }
@@ -65,8 +97,22 @@ public final class DeepSeek2LayerWeights {
     public FloatTensor ffnGateShexp() { return ffnGateShexp; }
     public FloatTensor ffnUpShexp() { return ffnUpShexp; }
     public FloatTensor ffnDownShexp() { return ffnDownShexp; }
+    public FloatTensor wqA() { return wqA; }
+    public FloatTensor wqANorm() { return wqANorm; }
+    public FloatTensor wqB() { return wqB; }
+    public FloatTensor wkB() { return wkB; }
+    public FloatTensor wvB() { return wvB; }
+    public FloatTensor expProbsBias() { return expProbsBias; }
 
     public boolean isMoELayer() {
         return ffnGateInp != null;
+    }
+
+    public boolean hasQLoRA() {
+        return wqA != null;
+    }
+
+    public boolean hasSeparateKVB() {
+        return wkB != null;
     }
 }

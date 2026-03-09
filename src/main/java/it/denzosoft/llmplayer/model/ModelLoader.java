@@ -265,6 +265,10 @@ public class ModelLoader {
         boolean moeMode = moeOptimizedGpu && hasGpu;
         Object savedGpuManager = (partialOffload || moeMode) ? TensorFactory.getGpuBufferManager() : null;
 
+        // Detect GLM-4.7-Flash / DeepSeek-V3 Q-LoRA variant
+        boolean hasQLoRA = config.qLoraRank() > 0;
+        boolean hasSeparateKVB = gguf.findTensor(ArchitectureRegistry.attnKB(0)) != null;
+
         DeepSeek2LayerWeights[] layers = new DeepSeek2LayerWeights[blockCount];
 
         for (int i = 0; i < blockCount; i++) {
@@ -276,10 +280,29 @@ public class ModelLoader {
                 TensorFactory.setGpuBufferManager(savedGpuManager);
                 FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
                 FloatTensor ffnNorm = loadTensor(gguf, ArchitectureRegistry.ffnNorm(i));
-                FloatTensor attnQ = loadTensor(gguf, ArchitectureRegistry.attnQ(i));
+
+                // Q projection: Q-LoRA (q_a * norm * q_b) or direct wq
+                FloatTensor wq = null, wqA = null, wqANorm = null, wqB = null;
+                if (hasQLoRA) {
+                    wqA = loadTensor(gguf, ArchitectureRegistry.attnQA(i));
+                    wqANorm = loadTensor(gguf, ArchitectureRegistry.attnQANorm(i));
+                    wqB = loadTensor(gguf, ArchitectureRegistry.attnQB(i));
+                } else {
+                    wq = loadTensor(gguf, ArchitectureRegistry.attnQ(i));
+                }
+
                 FloatTensor attnKvAMqa = loadTensor(gguf, ArchitectureRegistry.attnKvAMqa(i));
                 FloatTensor attnKvANorm = loadTensor(gguf, ArchitectureRegistry.attnKvANorm(i));
-                FloatTensor attnKvB = loadTensor(gguf, ArchitectureRegistry.attnKvB(i));
+
+                // KV decompression: separate K_B/V_B (3D per-head) or combined wkvB
+                FloatTensor attnKvB = null, wkB = null, wvB = null;
+                if (hasSeparateKVB) {
+                    wkB = loadTensor(gguf, ArchitectureRegistry.attnKB(i));
+                    wvB = loadTensor(gguf, ArchitectureRegistry.attnVB(i));
+                } else {
+                    attnKvB = loadTensor(gguf, ArchitectureRegistry.attnKvB(i));
+                }
+
                 FloatTensor attnOutput = loadTensor(gguf, ArchitectureRegistry.attnOutput(i));
 
                 // GPU OFF for expert tensors (large, only top-K used per token)
@@ -295,11 +318,15 @@ public class ModelLoader {
                 FloatTensor ffnUpShexp = loadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
                 FloatTensor ffnDownShexp = loadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
 
+                // Expert probability bias (GLM-4.7-Flash MoE layers)
+                FloatTensor expProbsBias = tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i));
+
                 layers[i] = new DeepSeek2LayerWeights(
-                    attnNorm, ffnNorm, attnQ, attnKvAMqa, attnKvANorm, attnKvB, attnOutput,
+                    attnNorm, ffnNorm, wq, attnKvAMqa, attnKvANorm, attnKvB, attnOutput,
                     null, null, null, // no dense FFN
                     ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps,
-                    ffnGateShexp, ffnUpShexp, ffnDownShexp
+                    ffnGateShexp, ffnUpShexp, ffnDownShexp,
+                    wqA, wqANorm, wqB, wkB, wvB, expProbsBias
                 );
             } else {
                 // Standard first-N-layers offload or dense leading layers
@@ -310,13 +337,35 @@ public class ModelLoader {
                     TensorFactory.setGpuBufferManager(null);
                 }
 
+                // Q projection: Q-LoRA or direct
+                FloatTensor wq = null, wqA = null, wqANorm = null, wqB = null;
+                if (hasQLoRA) {
+                    wqA = loadTensor(gguf, ArchitectureRegistry.attnQA(i));
+                    wqANorm = loadTensor(gguf, ArchitectureRegistry.attnQANorm(i));
+                    wqB = loadTensor(gguf, ArchitectureRegistry.attnQB(i));
+                } else {
+                    wq = loadTensor(gguf, ArchitectureRegistry.attnQ(i));
+                }
+
+                // KV decompression: separate K_B/V_B or combined
+                FloatTensor attnKvB = null, wkB = null, wvB = null;
+                if (hasSeparateKVB) {
+                    wkB = loadTensor(gguf, ArchitectureRegistry.attnKB(i));
+                    wvB = loadTensor(gguf, ArchitectureRegistry.attnVB(i));
+                } else {
+                    attnKvB = loadTensor(gguf, ArchitectureRegistry.attnKvB(i));
+                }
+
+                // Expert probability bias (MoE layers only)
+                FloatTensor expProbsBias = isDense ? null : tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i));
+
                 layers[i] = new DeepSeek2LayerWeights(
                     loadTensor(gguf, ArchitectureRegistry.attnNorm(i)),
                     loadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                    wq,
                     loadTensor(gguf, ArchitectureRegistry.attnKvAMqa(i)),
                     loadTensor(gguf, ArchitectureRegistry.attnKvANorm(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnKvB(i)),
+                    attnKvB,
                     loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
                     isDense ? loadTensor(gguf, ArchitectureRegistry.ffnGate(i)) : null,
                     isDense ? loadTensor(gguf, ArchitectureRegistry.ffnUp(i)) : null,
@@ -327,7 +376,8 @@ public class ModelLoader {
                     isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i)),
                     isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i)),
                     isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i)),
-                    isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i))
+                    isDense ? null : loadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i)),
+                    wqA, wqANorm, wqB, wkB, wvB, expProbsBias
                 );
             }
         }

@@ -9,15 +9,17 @@ import java.util.Arrays;
 import java.util.stream.IntStream;
 
 /**
- * Mixture of Experts Feed-Forward Network for DeepSeek2.
+ * Mixture of Experts Feed-Forward Network for DeepSeek2, GLM-4.7-Flash, and DeepSeek-V3.
+ *
+ * Gating modes:
+ * - expertGatingFunc=0 (default): softmax over router logits, no renormalization
+ * - expertGatingFunc=2 (GLM-4.7-Flash): sigmoid per expert, with exp_probs_b bias added to logits,
+ *   L2 normalization of selected weights, then multiply by expertWeightsScale
  *
  * Flow:
- * 1. Router: logits = x * ffnGateInp → softmax → top-K expert selection
+ * 1. Router: logits = x * ffnGateInp (+ exp_probs_b bias if present) → gating → top-K expert selection
  * 2. For each selected expert: SwiGLU with sliced 3D weight tensors
  * 3. Output = weighted sum of expert outputs + shared expert output
- *
- * The 3D expert tensors (ffnGateExps, ffnUpExps, ffnDownExps) contain all experts
- * packed along the 3rd dimension. Expert e's weights start at offset e * dim0 * dim1.
  */
 public class MoEFFN {
 
@@ -43,17 +45,46 @@ public class MoEFFN {
         Arrays.fill(routerLogits, 0, expertCount, 0f);
         weights.ffnGateInp().matmul(state.xb, routerLogits, expertCount, dim);
 
-        // Softmax over all expert logits
-        VectorOpsFactory.get().softmax(routerLogits, 0, expertCount);
+        // Add expert probability bias if present (GLM-4.7-Flash)
+        if (weights.expProbsBias() != null) {
+            for (int i = 0; i < expertCount; i++) {
+                routerLogits[i] += weights.expProbsBias().getFloat(i);
+            }
+        }
+
+        int gatingFunc = config.expertGatingFunc();
+        if (gatingFunc == 2) {
+            // Sigmoid gating: apply sigmoid to each logit independently
+            for (int i = 0; i < expertCount; i++) {
+                routerLogits[i] = 1.0f / (1.0f + (float) Math.exp(-routerLogits[i]));
+            }
+        } else {
+            // Softmax gating (default, DeepSeek-V2)
+            VectorOpsFactory.get().softmax(routerLogits, 0, expertCount);
+        }
 
         // Select top-K experts
         int[] selectedExperts = state.selectedExperts;
         float[] selectedWeights = state.selectedWeights;
         selectTopK(routerLogits, expertCount, expertUsedCount, selectedExperts, selectedWeights);
 
+        // Post-selection weight normalization for sigmoid gating
+        if (gatingFunc == 2) {
+            // L2 normalization of selected weights, then scale
+            float l2Norm = 0f;
+            for (int k = 0; k < expertUsedCount; k++) {
+                l2Norm += selectedWeights[k] * selectedWeights[k];
+            }
+            l2Norm = (float) Math.sqrt(l2Norm);
+            if (l2Norm > 0f) {
+                float scale = config.expertWeightsScale() / l2Norm;
+                for (int k = 0; k < expertUsedCount; k++) {
+                    selectedWeights[k] *= scale;
+                }
+            }
+        }
         // Note: DeepSeek-V2 has norm_topk_prob=false, so we do NOT renormalize weights.
-        // The sub-1.0 sum acts as intentional gating (tokens that don't strongly match
-        // any expert get attenuated FFN output). DeepSeek-V3 uses renormalization.
+        // The sub-1.0 sum acts as intentional gating.
 
         // 2. Compute routed expert outputs — parallel across experts
         Arrays.fill(state.xb, 0);  // Will accumulate weighted expert outputs here

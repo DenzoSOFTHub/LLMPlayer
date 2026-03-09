@@ -8,10 +8,16 @@ public class ChatTemplate {
 
     private final ModelArchitecture architecture;
     private final String chatTemplate;
+    // GLM-4.7-Flash uses DEEPSEEK2 GGUF architecture but needs GLM4 chat format
+    private final boolean isGlmVariant;
 
     public ChatTemplate(ModelArchitecture architecture, String chatTemplate) {
         this.architecture = architecture;
         this.chatTemplate = chatTemplate;
+        // Detect GLM models masquerading as deepseek2 (e.g., GLM-4.7-Flash)
+        this.isGlmVariant = architecture == ModelArchitecture.DEEPSEEK2
+                && chatTemplate != null
+                && (chatTemplate.contains("[gMASK]") || chatTemplate.contains("<|user|>"));
     }
 
     public String formatUserMessage(String userMessage) {
@@ -25,7 +31,7 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4(userMessage);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
-            return formatDeepSeek(userMessage);
+            return isGlmVariant ? formatGLM4(userMessage) : formatDeepSeek(userMessage);
         } else if (architecture == ModelArchitecture.PHI3) {
             return formatPhi3(userMessage);
         } else if (architecture == ModelArchitecture.MISTRAL3) {
@@ -53,7 +59,7 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
-            return formatDeepSeekChat(systemMessage, userMessage);
+            return isGlmVariant ? formatGLM4Chat(systemMessage, userMessage) : formatDeepSeekChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.PHI3) {
             return formatPhi3Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.MISTRAL3) {
@@ -156,7 +162,7 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Conversation(messages);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
-            return formatDeepSeekConversation(messages);
+            return isGlmVariant ? formatGLM4Conversation(messages) : formatDeepSeekConversation(messages);
         } else if (architecture == ModelArchitecture.PHI3) {
             return formatPhi3Conversation(messages);
         } else if (architecture == ModelArchitecture.MISTRAL3) {

@@ -71,8 +71,15 @@ public class DeepSeek2InferenceEngine {
     }
 
     public float[] forward(DeepSeek2State state, int token, int position) {
+        return forwardInternal(state, token, position, true);
+    }
+
+    public void forwardNoOutput(DeepSeek2State state, int token, int position) {
+        forwardInternal(state, token, position, false);
+    }
+
+    private float[] forwardInternal(DeepSeek2State state, int token, int position, boolean computeLogits) {
         int dim = config.embeddingLength();
-        int vocabSize = config.vocabSize();
         int leadingDenseCount = config.leadingDenseBlockCount();
 
         // 1. Token embedding lookup
@@ -110,10 +117,13 @@ public class DeepSeek2InferenceEngine {
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
         }
 
+        if (!computeLogits) return null;
+
         // 3. Final RMSNorm
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
 
         // 4. Output projection
+        int vocabSize = config.vocabSize();
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
 
@@ -141,13 +151,13 @@ public class DeepSeek2InferenceEngine {
     }
 
     public float[] prefill(DeepSeek2State state, int[] tokens) {
-        float[] logits = null;
         long t0 = System.currentTimeMillis();
-        for (int i = 0; i < tokens.length; i++) {
-            logits = forward(state, tokens[i], i);
+        for (int i = 0; i < tokens.length - 1; i++) {
+            forwardNoOutput(state, tokens[i], i);
             long elapsed = System.currentTimeMillis() - t0;
             System.out.printf("[prefill] token %d/%d (%.1fs)%n", i + 1, tokens.length, elapsed / 1000.0);
         }
+        float[] logits = forward(state, tokens[tokens.length - 1], tokens.length - 1);
         long total = System.currentTimeMillis() - t0;
         System.out.printf("[prefill] done: %d tokens in %.1fs%n", tokens.length, total / 1000.0);
         return logits;

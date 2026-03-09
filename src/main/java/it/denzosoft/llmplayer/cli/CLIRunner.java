@@ -75,7 +75,7 @@ public class CLIRunner {
         System.out.println(plan.summary());
         System.out.println("--------------------\n");
 
-        if (!plan.isRecommended()) {
+        if (!plan.isRecommended() && !options.isForce()) {
             System.out.print("This configuration is not recommended. Continue? [y/N] ");
             System.out.flush();
             BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
