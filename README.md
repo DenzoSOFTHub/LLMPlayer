@@ -1,4 +1,4 @@
-# LLMPlayer
+# LLMPlayer v1.6.0
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
