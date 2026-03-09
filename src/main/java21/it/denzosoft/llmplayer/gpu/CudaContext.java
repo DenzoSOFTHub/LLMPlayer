@@ -270,6 +270,9 @@ public class CudaContext implements AutoCloseable {
             {"kernels/cuda/accumulate.cu", "accumulate"},
             {"kernels/cuda/elementwise_mul.cu", "elementwise_mul"},
             {"kernels/cuda/fill_zero.cu", "fill_zero"},
+            {"kernels/cuda/matmul_q4_k_fused_gate_up.cu", "matmul_q4_k_fused_gate_up"},
+            {"kernels/cuda/argmax.cu", "argmax_partial"},
+            {"kernels/cuda/argmax.cu", "argmax_final"},
         };
         for (String[] kv : kernels) {
             try {

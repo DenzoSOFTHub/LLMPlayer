@@ -4,28 +4,53 @@
 
 - **Hardware:** Intel Core Ultra 7 155H (22 cores) + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM) + 31 GB RAM
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
-- **Prompt:** `"Write a Java class that calculates factorial recursively"`
-- **Parameters:** `--max-tokens 60 --context-length 512`
-- **Date:** 2026-03-07
+- **Prompt:** `"Write a Java hello world program"`
+- **Parameters:** `--max-tokens 100 --context-length 256` (GPU); `--max-tokens 20-50 --context-length 256` (CPU)
+- **Date:** 2026-03-09
 
-## Results v1.4.0 — CUDA GPU vs CPU (SIMD)
+## Results v1.5.1 — CUDA GPU (updated)
 
-Tested with `--gpu --gpu-backend cuda` and `--no-gpu` respectively.
+Tested with `--gpu --gpu-backend cuda`. Key improvements over v1.5.0: QK-norm CUDA forward pass (Qwen3), Q5_0 CUDA kernel (unlocks Gemma 2/3 graph), IQ4_NL/IQ4_XS/IQ3_XXS CUDA kernels, post-norm CUDA forward pass (Gemma 2/3).
 
-| # | Model | Params | Quant | CUDA tok/s | CPU tok/s | Speedup | GPU Mode |
-|--:|-------|--------|-------|----------:|----------:|--------:|----------|
-| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | **50.9** | 2.6 | **20x** | CUDA graph (16/16 layers) |
-| 2 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | **23.9** | 1.0 | **24x** | CUDA graph (28/28 layers) |
-| 3 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | **22.4** | 1.0 | **22x** | CUDA graph (36/36 layers) |
-| 4 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | **11.6** | — | — | CUDA graph (28/28 layers) |
-| 5 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | **11.3** | 0.9 | **13x** | Per-tensor CUDA matmul* |
-| 6 | DeepSeek-R1-0528-Qwen3-8B | 8B | Q4_K_M | **11.1** | — | — | CUDA graph (36/36 layers) |
-| 7 | Qwen3.5-4B | 4B | Q4_K_M | **7.5** | 0.8 | **9x** | Per-tensor CUDA matmul† |
+### Full GPU offload (model fits in 6 GB VRAM)
 
-\* GPU chain not supported (Phi-4 architecture); falls back to individual CUDA matmul per tensor.
+| # | Model | Params | Quant | Size | CUDA tok/s | v1.5.0 | Change | GPU Mode |
+|--:|-------|--------|-------|-----:|----------:|-------:|-------:|----------|
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | 771M | **54.7** | 51.7 | +6% | CUDA graph (16/16) |
+| 2 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | 1.1G | **41.5** | 39.9 | +4% | CUDA graph (28/28) |
+| 3 | Gemma-3-1B-it | 1B | Q4_K_M | 769M | **35.7** | 4.0 | **9x** | CUDA graph (26/26) ★ |
+| 4 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | 738M | **28.7** | 4.4 | **6.5x** | CUDA graph (16/16) ★ |
+| 5 | OLMo-2-1B-Instruct | 1B | Q4_K_M | 893M | **25.5** | 24.0 | +6% | CUDA graph (16/16) |
+| 6 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | 1.9G | **23.8** | 23.4 | +2% | CUDA graph (28/28) |
+| 7 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | 2.0G | **21.8** | 21.3 | +2% | CUDA graph (36/36) |
+| 8 | Qwen2.5-3B-Instruct | 3B | Q4_K_M | 2.0G | **21.7** | — | new | CUDA graph (36/36) |
+| 9 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **19.0** | 10.6 | **1.8x** | CUDA graph (36/36) ★ |
+| 10 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **11.5** | 11.1 | +4% | Per-tensor CUDA matmul* |
+| 11 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **11.3** | 11.4 | = | CUDA graph (28/28) |
+| 12 | DeepSeek-R1-0528-Qwen3-8B | 8B | Q4_K_M | 4.7G | **9.3** | 7.3 | **+27%** | CUDA graph (36/36) ★ |
+| 13 | Gemma-2-2B-it | 2B | IQ4_XS | 1.5G | **9.0** | 2.4 | **3.8x** | CUDA graph (26/26) ★ |
+| 14 | Llama-3.2-3B-Instruct | 3B | Q3_K_L | 1.7G | **8.3** | 8.5 | = | CUDA graph (28/28) |
+| 15 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | **8.0** | 8.0 | = | Per-tensor CUDA matmul† |
+| 16 | Aya-23-8B | 8B | Q4_K_M | 4.8G | **7.0** | 7.1 | = | CUDA graph (32/32) |
+| 17 | Phi-3-mini-4k-Instruct | 3.8B | IQ4_NL | 2.1G | **6.5** | 1.6 | **4x** | Per-tensor CUDA matmul*‡ |
+| 18 | Llama-3.2-1B-Instruct | 1B | IQ3_XXS | 537M | **1.3** | 1.3 | = | Mixed (IQ2_S/IQ3_S no kernel)§ |
+| 19 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | **0.2** | — | new | Mixed (IQ2_S/IQ3_S no kernel)§ |
+
+★ Major improvement from new CUDA kernels or CUDA forward pass features in v1.5.1.
+\* Phi-3/4 uses packed FFN (wGate=null); CUDA forward pass not yet supported, falls back to per-tensor CUDA matmul.
 † Qwen3.5 uses `Qwen35InferenceEngine` (hybrid DeltaNet); CUDA graph not applicable.
+‡ IQ4_NL CUDA kernel active for IQ4_NL tensors; model also has packed FFN blocking full CUDA forward pass.
+§ IQ3_XXS GGUF files use mixed quant types (IQ2_S for Q/K, IQ3_S for Wo); these types have no CUDA kernels yet.
 
-Note: CPU results are pure SIMD (Vector API) on Intel Core Ultra 7 155H (22 cores). OpenCL CPU (PoCL) yields similar speeds (~2.8 tok/s for Llama 1B). The previous benchmark table (v1.3.0) was measured on Windows native; this WSL2 environment shows lower CPU throughput.
+### Partial GPU offload / MoE-optimized (model exceeds 6 GB VRAM)
+
+| # | Model | Params | Quant | Size | CUDA tok/s | GPU Layers | Strategy |
+|--:|-------|--------|-------|-----:|----------:|------------|----------|
+| 1 | DeepSeek-Coder-V2-Lite | 16B (2.4B active) | Q4_K_M | 9.7G | **1.5** | 27/27 attn | MoE-optimized |
+| 2 | Qwen3-Coder-30B-A3B | 30B (3B active) | Q4_K_M | 18G | **1.1** | 48/48 attn | MoE-optimized |
+| 3 | Phi-4 | 14B | Q4_K | 8.5G | **0.7** | 22/40 | First-N-layers |
+
+Note: CPU results are pure SIMD (Vector API) on Intel Core Ultra 7 155H (22 cores) with `--no-gpu`.
 
 ## Historical Results (v1.3.0) — Ranked by tok/s
 
@@ -60,44 +85,48 @@ Note: CPU results are pure SIMD (Vector API) on Intel Core Ultra 7 155H (22 core
 | 27 | Qwen2.5-Coder-32B | 32B | Q4_K_M | 19 GB | GPU partial | 16/64 | 4732 MB | 0.2 |
 | 28 | Qwen2.5-Coder-14B FP16 | 14B | F16 | 28 GB | GPU partial | 8/48 | 4696 MB | 0.2 |
 
-## Failed Models
+## Known Issues (v1.5.1)
 
-| Model | Quant | Error |
-|-------|-------|-------|
-| Llama-3.2-1B-Instruct | IQ3_XXS | Segfault — requires IQ2_S support (not implemented) |
-| Aya-23-8B | IQ3_XXS | Segfault — requires IQ2_S support (not implemented) |
-| GLM-4.7-Flash | Q4_K_M | `Required tensor not found: blk.0.attn_q.weight` — loader bug |
-| Devstral-Small-2-24B | Q4_K_M | Segfault on both GPU and CPU-only |
-| Yi-Coder-9B-Chat | Q4_K_M | Segfault on GPU (46/48 layers partial offload); works on CPU at 3.5 tok/s |
-| Qwen3-4B | Q4_K_M | ArrayIndexOutOfBoundsException in BPETokenizer.decodeTokenPiece (v1.4.0) |
+No critical issues. All 22 tested models produce correct output on GPU.
 
-## Key Observations
+### Known Limitations
 
-1. **CUDA delivers 9–24x speedup over CPU.** All models benefit substantially from GPU acceleration. The speedup is highest for models with CUDA graph support (20-24x for Llama 1B/3B) and lower for models without graph (9-13x for Qwen3.5, Phi-4).
+| Model / Quant | Issue | Status |
+|---------------|-------|--------|
+| Phi-3/4 (packed FFN) | CUDA forward pass not supported — wGate=null, wUp has 2x output | Per-tensor CUDA matmul fallback |
+| IQ3_XXS GGUF models | Mixed quant types (IQ2_S for Q/K, IQ3_S for Wo) — no CUDA kernels | Per-tensor CUDA for IQ3_XXS tensors only |
+| Qwen3.5 (DeltaNet) | Hybrid architecture — no CUDA forward pass | Per-tensor CUDA matmul |
 
-2. **CUDA graph is the key to peak performance.** Models with CUDA graph (Llama, Qwen2/2.5, DeepSeek-R1-Qwen3) achieve 11–51 tok/s. Models without graph support (Phi-4, Qwen3.5) still benefit from per-tensor CUDA matmul (7-11 tok/s) but miss the graph's elimination of per-kernel launch overhead.
+### Fixed in v1.5.1 (vs v1.5.0)
 
-3. **Q4_K_M is the sweet spot.** Best speed/quality ratio. IQ4_NL and IQ4_XS lack GPU kernel support and fall back to CPU, making them significantly slower despite smaller file sizes.
+| Model | Issue (v1.5.0) | Fix | Speedup |
+|-------|----------------|-----|---------|
+| Gemma-3-1B | No CUDA graph (Q5_0 tensors on CPU) | Added Q5_0 CUDA kernel → full CUDA graph | 4.0 → **35.7** tok/s (9x) |
+| Qwen3-4B | Per-tensor matmul (QK-norm unsupported) | Per-head QK-norm on GPU → CUDA graph | 10.6 → **19.0** tok/s (1.8x) |
+| DSR1-Qwen3-8B | Per-tensor matmul (QK-norm unsupported) | Per-head QK-norm on GPU → CUDA graph | 7.3 → **9.3** tok/s (+27%) |
+| Llama-1B IQ4_NL | No IQ4_NL kernel (Q8_0 only on GPU) | IQ4_NL CUDA kernel → full CUDA graph | 4.4 → **28.7** tok/s (6.5x) |
+| Gemma-2 IQ4_XS | No IQ4_XS kernel (Q8_0 only on GPU) | IQ4_XS CUDA kernel → CUDA graph | 2.4 → **9.0** tok/s (3.8x) |
+| Phi-3 IQ4_NL | No IQ4_NL kernel | IQ4_NL CUDA kernel (per-tensor, packed FFN blocks graph) | 1.6 → **6.5** tok/s (4x) |
 
-4. **MoE-optimized GPU placement works.** Models from 10–18 GB run with only 500–900 MB VRAM by placing all attention tensors on GPU and keeping expert tensors on CPU. This enables 30B MoE models on a 6 GB GPU.
+## Key Observations (v1.5.1)
 
-5. **14B+ without full GPU is impractical.** Phi-4 (14B) on CPU runs at 0.4 tok/s — 30x slower than Llama-3.2-1B on GPU. Models that don't fit in VRAM need partial offload, with diminishing returns.
+1. **New CUDA kernels deliver massive improvements.** Q5_0 kernel unlocks Gemma 2/3 CUDA graph (9x). IQ4_NL kernel unlocks Llama IQ4_NL graph (6.5x). QK-norm enables Qwen3 graph (1.8x).
 
-6. **32B dense models are borderline.** GLM-4-32B and Qwen2.5-Coder-32B only fit 15–16 of 60+ layers in GPU, yielding 0.2 tok/s. Usable for short completions but not interactive chat.
+2. **CUDA graph remains the key to peak performance.** Models with CUDA graph achieve 7–55 tok/s. Per-tensor fallback (Phi-4, Qwen3.5) achieves 6-12 tok/s.
 
-7. **CUDA graph capture/replay** delivers a major speedup. Qwen2.5-Coder-3B with CUDA graph achieves 22.4 tok/s vs 1.0 tok/s CPU — a 22× boost. Graph mode eliminates per-kernel launch overhead by replaying the entire forward pass as a single GPU operation. Requires all layers on GPU (full offload) and standard `InferenceEngine` architecture.
+3. **Llama-3.2-1B-Q4K peaks at 54.7 tok/s** — near-interactive speed. This is the fastest model in the test suite.
 
-8. **Llama-3.2-1B with CUDA graph reaches 51 tok/s.** Combined CPU-side optimizations (reflection Method caching, quickselect sampler, sparse logits history) with CUDA graph mode deliver the fastest inference. Profiling shows 31% of peak 192 GB/s memory bandwidth utilization — the remaining gap is due to Q4_K non-coalesced memory access patterns and Panama FFM overhead (~2 ms/tok). Full analysis in `PERFORMANCE-ANALYSIS.md`.
+4. **MoE-optimized GPU placement enables 30B on 6 GB VRAM.** DeepSeek-Coder-V2-Lite and Qwen3-Coder-30B run with only ~500-540 MB VRAM.
 
-9. **DeepSeek-R1-Qwen3-8B** achieves 11.1 tok/s with CUDA graph — the fastest 8B model, likely due to optimized Qwen3 architecture with QK-norm enabling efficient GPU execution.
+5. **IQ3_XXS models use mixed quantization** — the GGUF contains IQ2_S (Q/K), IQ3_S (Wo), IQ3_XXS (FFN), Q4_K (V). Only IQ3_XXS and Q4_K have CUDA kernels. Adding IQ2_S and IQ3_S kernels would unlock full GPU acceleration.
 
-10. **Qwen3.5 hybrid DeltaNet+attention** models benefit from GPU (7.5 tok/s GPU vs 0.8 tok/s CPU = 9x speedup for 4B variant). Qwen3.5 uses `Qwen35InferenceEngine` (not standard `InferenceEngine`), so CUDA graph is not used — GPU acceleration comes from per-tensor CUDA matmul only.
+6. **Packed FFN (Phi-3/4) blocks CUDA forward pass.** Phi-4-mini's wGate=null packed FFN prevents CUDA graph despite merged QKV support being ready. Adding packed FFN support would unlock CUDA graph for Phi-3/4.
 
 ## GPU Strategy Summary
 
 | Strategy | When Used | VRAM Needed | Typical Speed |
 |----------|-----------|-------------|---------------|
-| Full offload | Model fits in VRAM (< 6 GB) | 770–4822 MB | 3–56 tok/s |
+| Full offload + CUDA graph | Dense model fits in VRAM, all tensors have CUDA kernels | 770–4822 MB | 7–55 tok/s |
+| Full offload + per-tensor | Model fits in VRAM but architecture not supported for graph | 770–2600 MB | 6–12 tok/s |
 | MoE-optimized | MoE model, attention fits in VRAM | 517–913 MB | 0.8–1.6 tok/s |
-| Partial offload | Dense/hybrid model, most layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |
-| CPU only (SIMD) | No GPU or unsupported quant (IQ*) | 0 | 0.3–4.1 tok/s |
+| Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |

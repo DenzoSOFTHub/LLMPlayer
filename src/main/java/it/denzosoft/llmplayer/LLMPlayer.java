@@ -2,6 +2,7 @@ package it.denzosoft.llmplayer;
 
 import it.denzosoft.llmplayer.cli.CLIOptions;
 import it.denzosoft.llmplayer.cli.CLIRunner;
+import it.denzosoft.llmplayer.cli.HuggingFaceDownloader;
 import it.denzosoft.llmplayer.tuning.FineTunePipeline;
 import it.denzosoft.llmplayer.tuning.PipelineConfig;
 import it.denzosoft.llmplayer.ui.LLMPlayerUI;
@@ -33,6 +34,9 @@ public class LLMPlayer {
         try {
             if (options.isHelp()) {
                 CLIOptions.printUsage();
+            } else if (options.getDownloadSpec() != null) {
+                new HuggingFaceDownloader(options.getGgufDirectory(), options.getHfToken())
+                    .download(options.getDownloadSpec());
             } else if (options.isGpuList()) {
                 // GPU device listing: handled by CLIRunner
                 new CLIRunner(options).run();

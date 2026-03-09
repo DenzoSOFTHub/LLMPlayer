@@ -1,6 +1,6 @@
 # LLMPlayer
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 56 tok/s on RTX 4050, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
 ## Requirements
 
@@ -138,6 +138,21 @@ Starts an HTTP server at `http://localhost:8080` with two web interfaces and RES
 
 The chat UI stores conversations as JSON files in the `chats/` directory (created automatically). Editing a user message or regenerating an assistant response creates a branch — alternative paths in the conversation tree, navigable with arrow controls.
 
+### Download models from HuggingFace
+
+```bash
+# Download Q4_K_M (auto-selected) from a HuggingFace repo
+./run.sh --download "bartowski/Llama-3.2-1B-Instruct-GGUF"
+
+# Download a specific file
+./run.sh --download "bartowski/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+
+# Use with custom directory and HuggingFace token for gated models
+./run.sh --download "meta-llama/Llama-4-Scout-17B-16E-Instruct-GGUF" --gguf-dir models --hf-token hf_xxx
+```
+
+Skips download if the file already exists locally with matching size.
+
 ### Model info
 
 ```bash
@@ -191,7 +206,7 @@ When GPU is enabled, the system:
 4. For dense models with all layers on GPU, enables the GPU-resident forward pass — activations stay on GPU between layers
 5. Compute-heavy operations (matmul, RMSNorm, softmax, SiLU, etc.) are executed via GPU kernels compiled on-demand
 
-GPU-supported quantized formats: F32, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0. Other formats automatically fall back to CPU.
+GPU-supported quantized formats (CUDA): F32, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ3_XXS, IQ4_NL, IQ4_XS. Other formats automatically fall back to CPU.
 
 If Java is < 21 or GPU drivers are not present, the system prints a warning and continues in CPU-only mode.
 
@@ -248,6 +263,9 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 | `--gpu-backend` | — | String | `auto` | GPU backend: `auto`, `cuda`, `opencl` |
 | `--gpu-layers` | — | Integer | -1 | GPU layers (-1 = auto-detect, 0 = CPU only) |
 | `--gpu-list` | — | Flag | false | List GPU devices and exit |
+| `--download` | — | String | — | Download GGUF model from HuggingFace (e.g. `owner/repo`) |
+| `--hf-token` | — | String | — | HuggingFace API token for private/gated repos |
+| `--no-gpu` | — | Flag | false | Disable GPU, use CPU only |
 | `--fine-tune` | — | Flag | false | Start LoRA fine-tuning pipeline |
 | `--target-model` | — | String | — | Target model for fine-tuning |
 | `--help` | `-h` | Flag | false | Show help |
@@ -352,6 +370,8 @@ engine.close();
 | Qwen3.5 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
 | DeepSeek2 | `deepseek2` | BPE (gpt2) | `User: ... Assistant:` |
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
+| Gemma 2 | `gemma2` | SentencePiece | `<start_of_turn>user` |
+| Gemma 3 | `gemma3` | SentencePiece | `<start_of_turn>user` |
 | Phi-3/4 | `phi3` | BPE (gpt2) | `<\|user\|>` |
 | Mistral3/Devstral | `mistral3` | SentencePiece | `[INST]` |
 
@@ -365,26 +385,27 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 
 | # | Model | Params | Quant | GPU Config | tok/s |
 |--:|-------|--------|-------|------------|------:|
-| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | GPU full + CUDA graph | 53-56 |
-| 2 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | GPU full + CUDA graph | 19.6 |
-| 3 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | GPU full (no graph) | 13.1 |
-| 4 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | GPU full offload | 11.4 |
-| 5 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | GPU full offload | 6.9 |
-| 6 | Qwen3.5-4B | 4B | Q4_K_M | GPU full offload | 6.6 |
-| 7 | Qwen3-4B | 4B | Q4_K_M | GPU full offload | 6.4 |
-| 8 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | GPU full offload | 5.0 |
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 54.7 |
+| 2 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 41.5 |
+| 3 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 35.7 |
+| 4 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 28.7 |
+| 5 | OLMo-2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 25.5 |
+| 6 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 23.8 |
+| 7 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.8 |
+| 8 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 19.0 |
+| 9 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.3 |
+| 10 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | CUDA graph | 9.3 |
 
-Full benchmark results (28 models) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
+Full benchmark results (33 models) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 
 ### GPU strategy summary
 
 | Strategy | When Used | VRAM Needed | Typical Speed |
 |----------|-----------|-------------|---------------|
-| Full offload + CUDA graph | Dense model fits in VRAM | 770–4822 MB | 6–56 tok/s |
-| Full offload (no graph) | Dense model, graph disabled | 770–4822 MB | 3–13 tok/s |
+| Full offload + CUDA graph | Dense model fits in VRAM, all tensors have CUDA kernels | 770–4822 MB | 7–55 tok/s |
+| Full offload + per-tensor | Model fits in VRAM, architecture not supported for graph | 770–2600 MB | 6–12 tok/s |
 | MoE-optimized | MoE model, attention fits in VRAM | 517–913 MB | 0.8–1.6 tok/s |
-| Partial offload | Dense/hybrid model, most layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |
-| CPU only (SIMD) | No GPU or unsupported quant (IQ*) | 0 | 0.3–4.1 tok/s |
+| Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |
 
 ## Fine-Tuning
 

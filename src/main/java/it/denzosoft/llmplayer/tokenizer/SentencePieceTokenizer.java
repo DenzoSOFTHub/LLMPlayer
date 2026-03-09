@@ -46,6 +46,7 @@ public class SentencePieceTokenizer implements Tokenizer {
         // Split on special tokens first
         List<String> parts = splitOnSpecialTokens(text);
 
+        boolean isFirstTextPart = true;
         for (String part : parts) {
             Integer specialId = specialTokenMap.get(part);
             if (specialId != null) {
@@ -55,10 +56,11 @@ public class SentencePieceTokenizer implements Tokenizer {
 
             // Replace spaces with ▁ for SentencePiece
             String processed = part.replace(' ', SPACE_REPLACEMENT);
-            // Prepend ▁ if text starts fresh (SentencePiece convention)
-            if (!processed.isEmpty() && processed.charAt(0) != SPACE_REPLACEMENT) {
+            // Prepend ▁ only to the first non-special text part (SentencePiece convention)
+            if (isFirstTextPart && !processed.isEmpty() && processed.charAt(0) != SPACE_REPLACEMENT) {
                 processed = SPACE_REPLACEMENT + processed;
             }
+            isFirstTextPart = false;
 
             List<Integer> partTokens = greedyEncode(processed);
             allTokens.addAll(partTokens);
@@ -136,6 +138,8 @@ public class SentencePieceTokenizer implements Tokenizer {
                     if (id != null) {
                         tokens.add(id);
                         pieces.add(byteToken);
+                    } else {
+                        System.err.println("Warning: byte fallback token " + byteToken + " not found in vocabulary");
                     }
                 }
                 i++;

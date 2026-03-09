@@ -944,11 +944,11 @@ public class LLMEngine implements AutoCloseable {
         } else if (bestOclGpuIdx >= 0) {
             config.setDeviceId(bestOclGpuIdx);
             config.setBackend(GpuConfig.GpuBackend.OPENCL);
-        } else if (bestOclCpuIdx >= 0) {
-            config.setDeviceId(bestOclCpuIdx);
-            config.setBackend(GpuConfig.GpuBackend.OPENCL);
         } else {
-            config.setDeviceId(0);
+            // No real GPU found (only OpenCL CPU / PoCL).
+            // OpenCL on CPU is slower than native SIMD due to marshaling overhead.
+            // Return null to use CPU SIMD path instead.
+            return null;
         }
 
         return config;

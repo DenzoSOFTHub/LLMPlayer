@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Gemma 2, Gemma 3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -97,7 +97,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 
 ### Inference engine dispatch (four paths)
 
-1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, GLM4, Phi-3/4, Mistral3. Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias) + `SwiGLUFFN`.
+1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3. Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias, sliding window, dual RoPE) + `SwiGLUFFN` (with GeGLU for Gemma). Gemma 2/3 use pre+post attention/FFN norms and embedding scaling.
 2. **DeepSeek2** (`DeepSeek2InferenceEngine`): DeepSeek2 and GLM-4.7-Flash (also uses `deepseek2` GGUF arch). Uses MLA (Multi-Head Latent Attention) + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 3. **Qwen3 MoE** (`Qwen3MoEInferenceEngine`): Qwen3-Coder-30B-A3B and similar. Standard GQA attention with QK-norm + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 4. **Qwen3.5** (`Qwen35InferenceEngine`): Hybrid DeltaNet + full attention architecture. Alternates Gated DeltaNet (linear attention/SSM) and standard GQA layers in a 3:1 ratio (`full_attention_interval=4`). DeltaNet layers use recurrent state `S` with update rule `S_new = alpha*S + beta*outer(k, v - alpha*S^T@k)`, output `o = S^T_new @ q`. Full attention layers use a packed Q+gate projection where `wq` outputs interleaved `[Q_h0, gate_h0, Q_h1, gate_h1, ...]` — these must be deinterleaved into separate Q and gate arrays before use. Gate is applied as `sigmoid(gate) * attn_output`. Both layer types include short conv1d (width 4) on Q/K and use QK-norm. State is maintained per-layer in `Qwen35State`.
@@ -117,6 +117,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 - **`--model <path>`** → CLI mode (single prompt with `--prompt` or `--interactive` chat)
 - **`--fine-tune`** → LoRA fine-tuning pipeline (requires `--target-model` and one of `--source`, `--documents`, `--data`, or `--train-dataset`)
 - **`--gpu-list`** → enumerate CUDA and OpenCL devices and exit
+- **`--download <repo>`** → download GGUF model from HuggingFace (`owner/repo` or `owner/repo/file.gguf`)
 
 ### REST API (web mode)
 
@@ -213,7 +214,7 @@ Three data scenarios auto-detected from CLI flags: `--source` (code), `--documen
 ### Resources
 
 - `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/kernels/cuda/` — 15 CUDA kernel files (`.cu`), parallel to OpenCL kernels. Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
+- `src/main/resources/kernels/cuda/` — 26 CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
 - `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
 - `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
@@ -255,7 +256,12 @@ Two modes for keeping activations on GPU between transformer layers, reducing CP
 
 The `CudaForwardPass` uses **zero-allocation hot paths**: all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-Only supported for dense pre-norm models with separate Q/K/V projections (Llama, Qwen2, Qwen3, Mistral3). Not supported for: MoE, merged QKV, post-norm, parallel FFN, or hybrid architectures (Qwen3.5 DeltaNet).
+**v1.5.0 optimizations:**
+- **Combined upload** (`uploadXAndUpdateParams()`): embedding vector + token params uploaded in a single `cuMemcpyHtoD` via contiguous GPU buffer (`gpuCombined`). Saves one Panama FFM call per token.
+- **Fused gate+up kernel** (`matmul_q4_k_fused_gate_up.cu`): single kernel launch for both gate and up projections when both are Q4_K. Reads input vector once, halves kernel launch count for FFN phase. Auto-detected per-layer.
+- **GPU-side argmax** (`argmax.cu`): two-phase parallel argmax (partial → final) on GPU logits. `forwardFinalArgmax()` and `forwardGraphArgmax()` return the token ID directly, downloading 4 bytes instead of 512 KB. Usable for greedy sampling without repetition penalty.
+
+Supported for dense models: Llama, Qwen2, Qwen3, Mistral3 (standard), Gemma 2/3 (post-norm via `rmsnorm_per_head.cu`). Per-head QK-norm (Qwen3) is supported via `rmsnorm_per_head.cu` kernel. Not supported for: MoE, packed FFN (Phi-3/4 — wGate=null, wUp has 2x output), or hybrid architectures (Qwen3.5 DeltaNet).
 
 ### GPU-virtual thread interaction
 
@@ -274,7 +280,7 @@ The `--gpu-backend` CLI flag controls backend selection: `auto` (default, prefer
 
 ### GPU auto-detection priority
 
-When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backends in order: CUDA GPU > OpenCL GPU > OpenCL CPU. CUDA is preferred because it provides native NVIDIA GPU access without the overhead of PoCL. Falls back to CPU OpenCL device only if no real GPU is available. Device type is detected via the `deviceType` field from `enumerateDevices()` (type "2" or containing "CPU"), with fallback to name-based heuristics ("cpu", "pocl").
+When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backends in order: CUDA GPU > OpenCL GPU. CUDA is preferred because it provides native NVIDIA GPU access without the overhead of PoCL. Returns `null` (CPU SIMD path) if only OpenCL CPU devices (PoCL) are available — OpenCL on CPU adds marshaling overhead without compute benefit. Device type is detected via the `deviceType` field from `enumerateDevices()` (type "2" or containing "CPU"), with fallback to name-based heuristics ("cpu", "pocl").
 
 ### Adding a new quantization type
 

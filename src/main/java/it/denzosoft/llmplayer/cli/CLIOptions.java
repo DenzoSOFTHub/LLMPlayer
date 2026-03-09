@@ -49,6 +49,10 @@ public class CLIOptions {
     private boolean datasetOnly;
     private String trainDataset;
 
+    // Download options
+    private String downloadSpec;   // HuggingFace repo: "owner/repo" or "owner/repo/file.gguf"
+    private String hfToken;        // HuggingFace API token (optional, for private repos)
+
     public static CLIOptions parse(String[] args) {
         CLIOptions opts = new CLIOptions();
         for (int i = 0; i < args.length; i++) {
@@ -139,6 +143,10 @@ public class CLIOptions {
                 opts.datasetOnly = true;
             } else if ("--train-dataset".equals(arg)) {
                 opts.trainDataset = args[++i];
+            } else if ("--download".equals(arg)) {
+                opts.downloadSpec = args[++i];
+            } else if ("--hf-token".equals(arg)) {
+                opts.hfToken = args[++i];
             } else if ("--help".equals(arg) || "-h".equals(arg)) {
                 opts.help = true;
             } else {
@@ -199,6 +207,10 @@ public class CLIOptions {
     public boolean isDatasetOnly() { return datasetOnly; }
     public String getTrainDataset() { return trainDataset; }
 
+    // Download getters
+    public String getDownloadSpec() { return downloadSpec; }
+    public String getHfToken() { return hfToken; }
+
     public static void printUsage() {
         System.out.println("Usage: java -jar LLMPlayer.jar [options]");
         System.out.println();
@@ -247,6 +259,11 @@ public class CLIOptions {
         System.out.println("  --ft-work-dir <path>     Working directory (default: work)");
         System.out.println("  --dataset-only           Stop after dataset generation");
         System.out.println("  --train-dataset <path>   Skip to training with existing dataset");
+        System.out.println();
+        System.out.println("Model download:");
+        System.out.println("  --download <repo>        Download GGUF from HuggingFace (e.g. \"bartowski/Llama-3.2-1B-Instruct-GGUF\")");
+        System.out.println("                           Or specify file: \"owner/repo/model-Q4_K_M.gguf\"");
+        System.out.println("  --hf-token <token>       HuggingFace API token (for private/gated repos)");
         System.out.println("  --help, -h               Show this help");
     }
 }
