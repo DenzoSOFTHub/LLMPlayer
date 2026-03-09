@@ -1,5 +1,6 @@
 package it.denzosoft.llmplayer.inference;
 
+import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.TransformerLayerWeights;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
@@ -15,15 +16,23 @@ public class Attention {
 
     private final ModelConfig config;
     private final RoPE rope;
+    private final RoPE ropeLocal; // for sliding window layers (Gemma 3: theta=10000), null if not used
     private final float attnLogitSoftCap;
+    private final int slidingWindow; // 0 = no sliding window
     // Cached per-head QK norm weights (null if not used)
     private float[][] cachedQNorm;
     private float[][] cachedKNorm;
 
     public Attention(ModelConfig config, RoPE rope) {
+        this(config, rope, null);
+    }
+
+    public Attention(ModelConfig config, RoPE rope, RoPE ropeLocal) {
         this.config = config;
         this.rope = rope;
+        this.ropeLocal = ropeLocal;
         this.attnLogitSoftCap = config.attnLogitSoftCap();
+        this.slidingWindow = config.slidingWindow();
     }
 
     /**
@@ -94,15 +103,20 @@ public class Attention {
             addBias(state.v, weights.vBias(), kvDim);
         }
 
-        // Apply per-head QK-norm if present (Qwen3)
+        // Apply per-head QK-norm if present (Qwen3, Gemma3)
         if (cachedQNorm != null) {
             applyPerHeadNorm(state.q, cachedQNorm[layer], headCount, headSize, config.normEps());
             applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
         }
 
-        // Apply RoPE to Q and K
-        rope.applyAllHeads(state.q, headCount, position);
-        rope.applyAllHeads(state.k, headCountKV, position);
+        // Apply RoPE to Q and K (skip for NoPE layers in Llama4 iRoPE)
+        int noRopeInterval = config.noRopeLayerInterval();
+        if (noRopeInterval == 0 || (layer % noRopeInterval) != (noRopeInterval - 1)) {
+            // Gemma 3: local layers use theta=10000, global use main theta
+            RoPE activeRope = (ropeLocal != null && !isGlobalLayer(layer)) ? ropeLocal : rope;
+            activeRope.applyAllHeads(state.q, headCount, position);
+            activeRope.applyAllHeads(state.k, headCountKV, position);
+        }
 
         // Store K and V in cache
         float[] keyCache = state.kvCache.keyLayer(layer);
@@ -113,14 +127,24 @@ public class Attention {
         // Attention computation - parallel over heads
         float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
 
+        // Sliding window: local layers attend only to last slidingWindow positions
+        // Gemma 3: every 6th layer is global (layer % 6 == 5), rest are local
+        // GPT-OSS: alternating layers use sliding window
+        int startPos = 0;
+        if (slidingWindow > 0 && !isGlobalLayer(layer)) {
+            startPos = Math.max(0, position - slidingWindow + 1);
+        }
+        final int attnStartPos = startPos;
+        int seqLen = position + 1 - attnStartPos;
+
         Arrays.fill(state.xb2, 0, qDim, 0f);
 
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
 
-            // Compute attention scores: Q_h * K_h^T for all past positions
-            int attOffset = h * (position + 1);
-            for (int t = 0; t <= position; t++) {
+            // Compute attention scores: Q_h * K_h^T for attended positions
+            int attOffset = h * seqLen;
+            for (int t = attnStartPos; t <= position; t++) {
                 float score = 0f;
                 int qOffset = h * headSize;
                 int kOffset = state.kvCache.offset(t) + kvHead * headSize;
@@ -132,16 +156,16 @@ public class Attention {
                 if (attnLogitSoftCap > 0f) {
                     s = attnLogitSoftCap * (float) Math.tanh(s / attnLogitSoftCap);
                 }
-                state.att[attOffset + t] = s;
+                state.att[attOffset + (t - attnStartPos)] = s;
             }
 
             // Softmax over attention scores
-            VectorOpsFactory.get().softmax(state.att, attOffset, position + 1);
+            VectorOpsFactory.get().softmax(state.att, attOffset, seqLen);
 
             // Weighted sum of values
             int outOffset = h * headSize;
-            for (int t = 0; t <= position; t++) {
-                float a = state.att[attOffset + t];
+            for (int t = attnStartPos; t <= position; t++) {
+                float a = state.att[attOffset + (t - attnStartPos)];
                 int vOffset = state.kvCache.offset(t) + kvHead * headSize;
                 for (int i = 0; i < headSize; i++) {
                     state.xb2[outOffset + i] += a * valueCache[vOffset + i];
@@ -152,6 +176,28 @@ public class Attention {
         // Output projection: xb = Wo * xb2 (qDim -> dim)
         Arrays.fill(state.xb, 0);
         weights.wo().matmulParallel(state.xb2, state.xb, dim, qDim);
+    }
+
+    /**
+     * Determine if a layer uses global (full) attention or local (sliding window).
+     * Gemma 2: alternating — odd layers are global, even layers are local (sliding window).
+     * Gemma 3: every 6th layer (layer % 6 == 5) is global, rest are local.
+     * GPT-OSS: even layers are global, odd layers use sliding window.
+     */
+    private boolean isGlobalLayer(int layer) {
+        // Gemma 2: alternating (even = local/sliding, odd = global/full)
+        if (config.architecture() == ModelArchitecture.GEMMA2) {
+            return layer % 2 == 1;
+        }
+        // Gemma 3: 5 local + 1 global, repeating
+        if (config.architecture() == ModelArchitecture.GEMMA3) {
+            return layer % 6 == 5;
+        }
+        // GPT-OSS: alternating (even = global, odd = local)
+        if (config.architecture() == ModelArchitecture.GPT_OSS) {
+            return layer % 2 == 0;
+        }
+        return true; // default: global (shouldn't reach here with slidingWindow > 0)
     }
 
     /**
@@ -186,9 +232,14 @@ public class Attention {
             applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
         }
 
-        // Apply RoPE to Q and K
-        rope.applyAllHeads(state.q, headCount, position);
-        rope.applyAllHeads(state.k, headCountKV, position);
+        // Apply RoPE to Q and K (skip for NoPE layers in Llama4 iRoPE)
+        int noRopeInterval = config.noRopeLayerInterval();
+        if (noRopeInterval == 0 || (layer % noRopeInterval) != (noRopeInterval - 1)) {
+            // Gemma 3: local layers use theta=10000, global use main theta
+            RoPE activeRope = (ropeLocal != null && !isGlobalLayer(layer)) ? ropeLocal : rope;
+            activeRope.applyAllHeads(state.q, headCount, position);
+            activeRope.applyAllHeads(state.k, headCountKV, position);
+        }
 
         // Store K and V in cache
         float[] keyCache = state.kvCache.keyLayer(layer);
@@ -199,13 +250,20 @@ public class Attention {
         // Attention computation - parallel over heads
         float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
 
+        int startPos = 0;
+        if (slidingWindow > 0 && !isGlobalLayer(layer)) {
+            startPos = Math.max(0, position - slidingWindow + 1);
+        }
+        final int attnStartPos = startPos;
+        int seqLen = position + 1 - attnStartPos;
+
         Arrays.fill(state.xb2, 0, qDim, 0f);
 
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
 
-            int attOffset = h * (position + 1);
-            for (int t = 0; t <= position; t++) {
+            int attOffset = h * seqLen;
+            for (int t = attnStartPos; t <= position; t++) {
                 float score = 0f;
                 int qOffset = h * headSize;
                 int kOffset = state.kvCache.offset(t) + kvHead * headSize;
@@ -216,14 +274,14 @@ public class Attention {
                 if (attnLogitSoftCap > 0f) {
                     s = attnLogitSoftCap * (float) Math.tanh(s / attnLogitSoftCap);
                 }
-                state.att[attOffset + t] = s;
+                state.att[attOffset + (t - attnStartPos)] = s;
             }
 
-            VectorOpsFactory.get().softmax(state.att, attOffset, position + 1);
+            VectorOpsFactory.get().softmax(state.att, attOffset, seqLen);
 
             int outOffset = h * headSize;
-            for (int t = 0; t <= position; t++) {
-                float a = state.att[attOffset + t];
+            for (int t = attnStartPos; t <= position; t++) {
+                float a = state.att[attOffset + (t - attnStartPos)];
                 int vOffset = state.kvCache.offset(t) + kvHead * headSize;
                 for (int i = 0; i < headSize; i++) {
                     state.xb2[outOffset + i] += a * valueCache[vOffset + i];

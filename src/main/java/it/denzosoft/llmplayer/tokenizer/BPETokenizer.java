@@ -109,10 +109,6 @@ public class BPETokenizer implements Tokenizer {
             boolean found = false;
             for (String special : sortedSpecials) {
                 if (text.startsWith(special, pos)) {
-                    if (pos > 0) {
-                        String before = text.substring(pos - (pos - (parts.isEmpty() ? 0 : pos)), pos);
-                        // Already handled by previous iterations
-                    }
                     parts.add(special);
                     pos += special.length();
                     found = true;
@@ -199,7 +195,8 @@ public class BPETokenizer implements Tokenizer {
         if (v == 9) return "\u0109";  // tab
         // General mapping for other bytes
         if (v >= 0 && v <= 32) return String.valueOf((char) (v + 0x100));
-        if (v >= 127 && v <= 160) return String.valueOf((char) (v + 0x100 - 127 + 0x7F));
+        if (v >= 127 && v <= 160) return String.valueOf((char) (v - 127 + 0x121));
+        if (v == 173) return String.valueOf((char) 0x143);
         return String.valueOf((char) v);
     }
 
@@ -226,7 +223,8 @@ public class BPETokenizer implements Tokenizer {
             return piece;
         }
         // Convert byte-level BPE back to actual bytes
-        byte[] bytes = new byte[piece.length()];
+        // Allocate extra space since chars may produce multi-byte UTF-8
+        byte[] bytes = new byte[piece.length() * 4];
         int byteLen = 0;
         for (int i = 0; i < piece.length(); i++) {
             char c = piece.charAt(i);
@@ -247,13 +245,16 @@ public class BPETokenizer implements Tokenizer {
     }
 
     private static int tokenCharToByte(char c) {
-        if (c >= 33 && c <= 126) return c;
+        if (c >= 33 && c <= 126) return c;       // printable ASCII
+        if (c >= 161 && c <= 172) return c;       // identity-mapped (¡-¬)
+        if (c >= 174 && c <= 255) return c;       // identity-mapped (®-ÿ)
         if (c == 0x0120) return 32;  // Ġ -> space
         if (c == 0x010A) return 10;  // Ċ -> newline
         if (c == 0x010D) return 13;
         if (c == 0x0109) return 9;
-        if (c >= 0x100 && c <= 0x120) return c - 0x100;
-        if (c >= 0x17F && c <= 0x19F) return c - 0x100 + 127;
+        if (c >= 0x100 && c <= 0x120) return c - 0x100; // bytes 0-32
+        if (c >= 0x121 && c <= 0x142) return c - 0x121 + 127; // bytes 127-160
+        if (c == 0x143) return 173; // soft hyphen
         return -1;
     }
 

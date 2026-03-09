@@ -33,6 +33,7 @@ public class Qwen3MoEInferenceEngine {
     private final int maxSeqLen;
     private final boolean isGptOss;
     private final int slidingWindow; // ISWA: 0 = disabled, >0 = window size for SWA layers
+    private final int noRopeLayerInterval; // Llama4 iRoPE: 0 = all layers use RoPE
 
     // Cached attention sinks per layer (GPT-OSS): float[blockCount][headCount]
     private final float[][] cachedAttnSinks;
@@ -44,6 +45,7 @@ public class Qwen3MoEInferenceEngine {
         this.maxSeqLen = maxSeqLen;
         this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
         this.slidingWindow = config.slidingWindow();
+        this.noRopeLayerInterval = config.noRopeLayerInterval();
 
         int ropeDimCount = config.ropeDimensionCount();
         RoPE.YarnParams yarnParams = null;
@@ -178,9 +180,11 @@ public class Qwen3MoEInferenceEngine {
             applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
         }
 
-        // Apply RoPE
-        rope.applyAllHeads(state.q, headCount, position);
-        rope.applyAllHeads(state.k, headCountKV, position);
+        // Apply RoPE (skip for NoPE layers in Llama4 iRoPE: every Nth layer)
+        if (noRopeLayerInterval == 0 || (layer % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
+            rope.applyAllHeads(state.q, headCount, position);
+            rope.applyAllHeads(state.k, headCountKV, position);
+        }
 
         // Store K and V in cache
         float[] keyCache = state.kvCache.keyLayer(layer);

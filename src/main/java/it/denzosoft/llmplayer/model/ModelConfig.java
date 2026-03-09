@@ -40,6 +40,10 @@ public final class ModelConfig {
     private final int ssmInnerSize;
     private final int fullAttentionInterval;
 
+    // Llama4 iRoPE: interval at which layers skip RoPE (NoPE layers)
+    // e.g., 4 means every 4th layer (layer % 4 == 3) is a NoPE layer
+    private final int noRopeLayerInterval;
+
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
                        float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
@@ -54,7 +58,7 @@ public final class ModelConfig {
              ropeDimensionCount, keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
              expertCount, expertUsedCount, expertSharedCount, expertFfnLength, ropeScalingFactor,
              ropeOrigContextLength, yarnLogMultiplier, finalLogitSoftCap, attnLogitSoftCap, logitScale,
-             slidingWindow, 0, 0, 0, 0, 0, 0);
+             slidingWindow, 0, 0, 0, 0, 0, 0, 0);
     }
 
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
@@ -67,7 +71,8 @@ public final class ModelConfig {
                        float finalLogitSoftCap, float attnLogitSoftCap, float logitScale,
                        int slidingWindow,
                        int ssmConvKernel, int ssmStateSize, int ssmGroupCount,
-                       int ssmTimeStepRank, int ssmInnerSize, int fullAttentionInterval) {
+                       int ssmTimeStepRank, int ssmInnerSize, int fullAttentionInterval,
+                       int noRopeLayerInterval) {
         this.architecture = architecture;
         this.name = name;
         this.embeddingLength = embeddingLength;
@@ -104,6 +109,7 @@ public final class ModelConfig {
         this.ssmTimeStepRank = ssmTimeStepRank;
         this.ssmInnerSize = ssmInnerSize;
         this.fullAttentionInterval = fullAttentionInterval;
+        this.noRopeLayerInterval = noRopeLayerInterval;
     }
 
     public ModelArchitecture architecture() { return architecture; }
@@ -142,6 +148,7 @@ public final class ModelConfig {
     public int ssmTimeStepRank() { return ssmTimeStepRank; }
     public int ssmInnerSize() { return ssmInnerSize; }
     public int fullAttentionInterval() { return fullAttentionInterval; }
+    public int noRopeLayerInterval() { return noRopeLayerInterval; }
 
     public static ModelConfig fromMetadata(it.denzosoft.llmplayer.gguf.GGUFMetadata metadata) {
         String archName = metadata.getString("general.architecture", "llama");
@@ -246,6 +253,10 @@ public final class ModelConfig {
         int ssmInnerSize = metadata.getInt(prefix + "ssm.inner_size", 0);
         int fullAttentionInterval = metadata.getInt(prefix + "full_attention_interval", 0);
 
+        // Llama4 iRoPE: every Nth layer is a NoPE (no RoPE) layer
+        // Default 4 for Llama4 (layers where layer % 4 == 3 skip RoPE), 0 for all others
+        int noRopeLayerInterval = (arch == ModelArchitecture.LLAMA4) ? 4 : 0;
+
         return new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
             contextLength, vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim,
             ropeType, ropeDimensionCount,
@@ -254,7 +265,7 @@ public final class ModelConfig {
             ropeScalingFactor, ropeOrigContextLength, yarnLogMultiplier,
             finalLogitSoftCap, attnLogitSoftCap, logitScale, slidingWindow,
             ssmConvKernel, ssmStateSize, ssmGroupCount, ssmTimeStepRank, ssmInnerSize,
-            fullAttentionInterval);
+            fullAttentionInterval, noRopeLayerInterval);
     }
 
     @Override

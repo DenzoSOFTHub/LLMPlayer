@@ -35,9 +35,12 @@ public class InferenceEngine {
     // Cached reflection Method handles for GPU hot path (avoids per-token getMethod lookups)
     private java.lang.reflect.Method cachedUploadX;
     private java.lang.reflect.Method cachedUpdateTokenParams;
+    private java.lang.reflect.Method cachedUploadXAndUpdateParams;
     private java.lang.reflect.Method cachedForwardGraph;
+    private java.lang.reflect.Method cachedForwardGraphArgmax;
     private java.lang.reflect.Method cachedForwardLayer;
     private java.lang.reflect.Method cachedForwardFinalLogits;
+    private java.lang.reflect.Method cachedForwardFinalArgmax;
     private java.lang.reflect.Method cachedDownloadX;
 
     public InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen) {
@@ -50,9 +53,16 @@ public class InferenceEngine {
         this.maxSeqLen = maxSeqLen;
 
         int ropeDimCount = config.ropeDimensionCount();
+        ModelArchitecture arch = config.architecture();
         RoPE rope = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, config.ropeFreqBase(),
             config.ropeType(), ropeFreqFactors);
-        this.attention = new Attention(config, rope);
+        // Gemma 3: local (sliding window) layers use theta=10000, global layers use the main theta
+        RoPE ropeLocal = null;
+        if (arch == ModelArchitecture.GEMMA3 && config.slidingWindow() > 0) {
+            ropeLocal = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, 10000f,
+                config.ropeType(), ropeFreqFactors);
+        }
+        this.attention = new Attention(config, rope, ropeLocal);
         attention.initNormCachesIfNeeded(weights.layers());
         SwiGLUFFN ffn = new SwiGLUFFN(config);
         this.block = new TransformerBlock(config, attention, ffn, weights.layers());
@@ -61,7 +71,6 @@ public class InferenceEngine {
         this.logitScale = config.logitScale();
 
         // Gemma models scale embeddings by sqrt(dim)
-        ModelArchitecture arch = config.architecture();
         if (arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3) {
             this.embeddingScale = (float) Math.sqrt(config.embeddingLength());
         } else {
@@ -70,10 +79,7 @@ public class InferenceEngine {
 
         // Pre-cache output norm weights
         int dim = config.embeddingLength();
-        this.normWeightCache = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            normWeightCache[i] = weights.outputNorm().getFloat(i);
-        }
+        this.normWeightCache = RMSNorm.cacheWeights(weights.outputNorm(), dim);
     }
 
     /**
@@ -208,9 +214,15 @@ public class InferenceEngine {
             cachedDownloadX = fpClass.getMethod("downloadX", float[].class);
             try { cachedUpdateTokenParams = fpClass.getMethod("updateTokenParams", int.class); }
             catch (NoSuchMethodException ignored) {}
+            try { cachedUploadXAndUpdateParams = fpClass.getMethod("uploadXAndUpdateParams", float[].class, int.class); }
+            catch (NoSuchMethodException ignored) {}
             try { cachedForwardGraph = fpClass.getMethod("forwardGraph", float[].class); }
             catch (NoSuchMethodException ignored) {}
+            try { cachedForwardGraphArgmax = fpClass.getMethod("forwardGraphArgmax"); }
+            catch (NoSuchMethodException ignored) {}
             try { cachedForwardFinalLogits = fpClass.getMethod("forwardFinalLogits", float[].class); }
+            catch (NoSuchMethodException ignored) {}
+            try { cachedForwardFinalArgmax = fpClass.getMethod("forwardFinalArgmax"); }
             catch (NoSuchMethodException ignored) {}
         } catch (NoSuchMethodException e) {
             throw new RuntimeException("GPU forward pass missing required methods", e);
@@ -224,10 +236,14 @@ public class InferenceEngine {
      */
     private boolean forwardGpu(InferenceState state, int position) {
         try {
-            cachedUploadX.invoke(gpuForwardPass, state.x);
-
-            if (cachedUpdateTokenParams != null) {
-                cachedUpdateTokenParams.invoke(gpuForwardPass, position);
+            // Combined upload: embedding + token params in single cuMemcpyHtoD
+            if (cachedUploadXAndUpdateParams != null) {
+                cachedUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
+            } else {
+                cachedUploadX.invoke(gpuForwardPass, state.x);
+                if (cachedUpdateTokenParams != null) {
+                    cachedUpdateTokenParams.invoke(gpuForwardPass, position);
+                }
             }
 
             // Try CUDA graph mode first (all layers + output in single API call)

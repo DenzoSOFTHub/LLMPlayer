@@ -150,6 +150,10 @@ public final class TensorFactory {
         if (type == GGMLType.Q6_K) return base + (cuda ? "Q6_KCudaTensor" : "Q6_KGpuTensor");
         if (type == GGMLType.Q8_0) return base + (cuda ? "Q8_0CudaTensor" : "Q8_0GpuTensor");
         if (type == GGMLType.Q4_0) return base + (cuda ? "Q4_0CudaTensor" : "Q4_0GpuTensor");
+        if (type == GGMLType.Q5_0 && cuda) return base + "Q5_0CudaTensor";
+        if (type == GGMLType.IQ4_NL && cuda) return base + "IQ4_NLCudaTensor";
+        if (type == GGMLType.IQ4_XS && cuda) return base + "IQ4_XSCudaTensor";
+        if (type == GGMLType.IQ3_XXS && cuda) return base + "IQ3_XXSCudaTensor";
         return null; // No GPU version for this type
     }
 }

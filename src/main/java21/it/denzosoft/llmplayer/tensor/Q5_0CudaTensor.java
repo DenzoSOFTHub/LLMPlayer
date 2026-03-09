@@ -1,24 +1,41 @@
 package it.denzosoft.llmplayer.tensor;
 
+import it.denzosoft.llmplayer.gpu.CudaBufferManager;
+
 /**
- * Q5_0 quantization: 32 weights per block.
- * Block layout: [float16 scale (2 bytes)] [uint32 qh (4 bytes)] [16 bytes nibbles] = 22 bytes/block
- * Element mapping (SPLIT, not interleaved like Q4_0):
+ * CUDA GPU-accelerated Q5_0 tensor.
+ * Delegates matmulParallel to CUDA GPU kernel, falls back to CPU on error.
+ *
+ * Q5_0: 32 weights per block, 22 bytes per block.
+ * Layout: [fp16 scale (2B)] [uint32 qh (4B)] [16 bytes nibbles]
+ * Split element mapping:
  *   Elements  0..15 = LOW nibbles of bytes 0..15, high bits from qh bits 0..15
  *   Elements 16..31 = HIGH nibbles of bytes 0..15, high bits from qh bits 16..31
  * value = ((nibble | (high_bit << 4)) - 16) * scale
  */
-public class Q5_0FloatTensor extends FloatTensor {
+public class Q5_0CudaTensor extends CudaFloatTensor {
 
     private static final int BLOCK_SIZE = 32;
     private static final int BLOCK_BYTES = 22;
 
-    public Q5_0FloatTensor(TensorData data, long size) {
-        super(data, size);
+    public Q5_0CudaTensor(TensorData data, long size, CudaBufferManager bufferManager) {
+        super(data, size, bufferManager);
     }
 
     @Override
     public GGMLType type() { return GGMLType.Q5_0; }
+
+    @Override
+    protected String kernelResourcePath() { return "kernels/cuda/matmul_q5_0.cu"; }
+
+    @Override
+    protected String kernelName() { return "matmul_q5_0"; }
+
+    @Override
+    protected int blockBytes() { return BLOCK_BYTES; }
+
+    @Override
+    protected int blockSize() { return BLOCK_SIZE; }
 
     @Override
     public float getFloat(long index) {
@@ -60,7 +77,7 @@ public class Q5_0FloatTensor extends FloatTensor {
             int qh = data.getIntLE(blockStart + 2);
 
             float blockSum = 0f;
-            // Q5_0 split layout: low nibbles → elements 0..15, high nibbles → elements 16..31
+            // Q5_0 split layout: low nibbles -> elements 0..15, high nibbles -> elements 16..31
             for (int j = 0; j < 16; j++) {
                 byte packed = data.getByte(blockStart + 6 + j);
                 int lo4 = packed & 0x0F;

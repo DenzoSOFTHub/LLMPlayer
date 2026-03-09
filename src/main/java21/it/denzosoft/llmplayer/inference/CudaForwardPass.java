@@ -12,7 +12,7 @@ import it.denzosoft.llmplayer.tensor.FloatTensor;
 import java.lang.foreign.*;
 
 /**
- * CUDA GPU-resident forward pass for dense pre-norm transformer architectures.
+ * CUDA GPU-resident forward pass for dense transformer architectures (pre-norm and post-norm).
  * Keeps ALL computation on GPU — including attention (RoPE, KV cache, scores, softmax, weighted V).
  * No mid-layer CPU sync points. Only syncs at uploadX/downloadX boundaries.
  *
@@ -55,12 +55,35 @@ public class CudaForwardPass implements AutoCloseable {
     private final MemorySegment kvCacheUpdateFunc;
     private final MemorySegment attentionFullFunc;
     private final MemorySegment accumulateFunc;
+    private final MemorySegment argmaxPartialFunc;
+    private final MemorySegment argmaxFinalFunc;
+    private final MemorySegment fusedGateUpFunc; // null if not Q4_K
+
+    // Merged QKV support (Phi-3/4): single wqkv weight matrix → split into Q, K, V on GPU
+    private final boolean hasMergedQKV;
+    private final long gpuQKV;           // GPU buffer for concatenated QKV output (0 if not merged)
+    private final int qkvDim;            // qDim + kvDim + kvDim
+    private final MemorySegment splitQkvFunc; // null if not merged
+    private final ParamBuffer splitQkvPB;     // null if not merged
+    private final int splitQkvGridDim;
 
     // Per-layer QKV bias buffers (null arrays if no biases)
     private final long[] gpuQBias;
     private final long[] gpuKBias;
     private final long[] gpuVBias;
     private final boolean hasBias;
+
+    // Per-layer QK-norm weight buffers (null if no QK-norm)
+    private final long[] gpuQNormWeights;
+    private final long[] gpuKNormWeights;
+    private final boolean hasQKNorm;
+    private final MemorySegment perHeadNormFunc; // null if no QK-norm
+
+    // Per-layer post-attention/FFN norm weight buffers (null if no post-norm, Gemma2/3)
+    private final long[] gpuPostAttnNormWeights;
+    private final long[] gpuPostFfnNormWeights;
+    private final boolean hasPostNorm;
+    private final ParamBuffer postNormPB; // null if no post-norm
 
     // Default CUDA stream
     private final MemorySegment defaultStream;
@@ -70,6 +93,13 @@ public class CudaForwardPass implements AutoCloseable {
     private final long gpuLogits;           // [vocabSize] — output logits
     private final long gpuLogitsBytes;
     private final MemorySegment hostLogits;   // host staging for logits download
+
+    // GPU-side argmax buffers
+    private final long gpuArgmaxPartialVal;   // partial max values (one per block)
+    private final long gpuArgmaxPartialIdx;   // partial max indices (one per block)
+    private final long gpuArgmaxResult;       // int[1] — final argmax index
+    private final MemorySegment hostArgmaxResult; // host staging for result download
+    private final int argmaxNumBlocks;        // number of blocks for partial argmax
 
     // Dimensions
     private final int dim;
@@ -90,6 +120,11 @@ public class CudaForwardPass implements AutoCloseable {
 
     // Host-side staging buffers (only for uploadX/downloadX)
     private final MemorySegment hostX;
+
+    // Combined upload buffer: [dim floats (embedding)] + [2 ints (position, seqLen)]
+    // Enables single cuMemcpyHtoD for both embedding and token params
+    private final MemorySegment hostCombined;   // dim*4 + 8 bytes
+    private final long gpuCombined;             // GPU buffer for combined upload
 
     // GPU-stored dynamic params: [position, seqLen] — kernels read via device pointer
     // Enables CUDA graph replay: graph captures the pointer (fixed), data changes per token
@@ -171,10 +206,21 @@ public class CudaForwardPass implements AutoCloseable {
     private final ParamBuffer attnPB;     // 9 args: out, q, kCache, vCache, headCount, headCountKV, headSize, kvDim, tokenParams(ptr)
     private final ParamBuffer siluPB;     // 3 args: a, b, size
     private final ParamBuffer biasPB;    // 3 args: y, x, size (for QKV bias accumulate)
+    private final ParamBuffer fusedGateUpPB; // 8 args: gateWeights, upWeights, input, gateOutput, upOutput, gateRows, cols, addToOutput
+    private final ParamBuffer argmaxPartialPB; // 4 args: data, partialVal, partialIdx, size
+    private final ParamBuffer argmaxFinalPB;   // 4 args: partialVal, partialIdx, resultIdx, numPartials
+    private final ParamBuffer perHeadNormPB;   // 4 args: vec, weights, headSize, eps (null if no QK-norm)
 
     // Per-layer matmul launch descriptors: [blockCount][7]
     // Index: 0=wq, 1=wk, 2=wv, 3=wo, 4=gate, 5=up, 6=down
     private final MatmulLaunch[][] layerMatmuls;
+
+    // Per-layer fused gate+up weight pointers (only if fusedGateUpFunc != null)
+    private final long[] fusedGateWeights; // gate weight GPU pointers per layer
+    private final long[] fusedUpWeights;   // up weight GPU pointers per layer
+    private final int fusedGateUpGridDim;
+    private final int fusedGateUpBlockDim;
+    private final boolean useFusedGateUp;
 
     // Output projection launch descriptor
     private final MatmulLaunch outputMatmul; // null if output not on GPU
@@ -189,6 +235,8 @@ public class CudaForwardPass implements AutoCloseable {
     private final int siluGridDim;
     private final int biasQGridDim;
     private final int biasKVGridDim;
+    private final int perHeadNormBlockDim;
+    private final int perHeadNormSharedMem;
 
     public CudaForwardPass(ModelConfig config, ModelWeights weights, CudaBufferManager bufferManager,
                             Attention attention, int maxSeqLen) {
@@ -219,7 +267,14 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Allocate GPU activation buffers
         long fb = Float.BYTES;
-        gpuX = bufferManager.createBuffer(dim * fb);
+
+        // Allocate combined contiguous buffer: [embedding (dim*4 bytes)] + [tokenParams (8 bytes)]
+        // Enables single cuMemcpyHtoD for both embedding upload and token params update
+        long combinedBytes = dim * fb + 8;
+        gpuCombined = bufferManager.createBuffer(combinedBytes);
+        gpuX = gpuCombined;                      // first dim*4 bytes
+        gpuTokenParams = gpuCombined + dim * fb;  // last 8 bytes
+
         gpuXb = bufferManager.createBuffer(dim * fb);
         gpuQ = bufferManager.createBuffer(qDim * fb);
         gpuK = bufferManager.createBuffer(kvDim * fb);
@@ -229,11 +284,9 @@ public class CudaForwardPass implements AutoCloseable {
         gpuHb2 = bufferManager.createBuffer(ffnDim * fb);
         gpuPartialSums = bufferManager.createBuffer((long) numWorkGroups * fb);
 
-        // Allocate host staging buffer
+        // Allocate host staging buffers
         hostX = arena.allocate(ValueLayout.JAVA_FLOAT, dim);
-
-        // Allocate GPU tokenParams buffer (2 ints: position + seqLen)
-        gpuTokenParams = bufferManager.createBuffer(8);
+        hostCombined = arena.allocate(combinedBytes, 8);
         hostTokenParams = arena.allocate(ValueLayout.JAVA_INT, 2);
 
         // Upload RoPE tables to GPU
@@ -253,6 +306,22 @@ public class CudaForwardPass implements AutoCloseable {
             cudaContext.fillBufferZero(gpuValueCache[i], kvLayerBytes);
         }
 
+        // Probe QK-norm, bias, and merged QKV presence early (needed for kernel compilation decisions)
+        TransformerLayerWeights firstLayer = weights.layers()[0];
+        hasBias = firstLayer.qBias() != null;
+        hasQKNorm = firstLayer.qNorm() != null;
+        hasPostNorm = firstLayer.postAttnNorm() != null;
+        hasMergedQKV = firstLayer.wqkv() != null;
+
+        // Allocate merged QKV buffer if needed
+        if (hasMergedQKV) {
+            this.qkvDim = qDim + kvDim + kvDim;
+            gpuQKV = bufferManager.createBuffer((long) qkvDim * fb);
+        } else {
+            this.qkvDim = 0;
+            gpuQKV = 0;
+        }
+
         // Compile auxiliary CUDA kernels
         rmsnormFusedFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
@@ -260,6 +329,29 @@ public class CudaForwardPass implements AutoCloseable {
         kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
+        argmaxPartialFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_partial");
+        argmaxFinalFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_final");
+
+        // Compile split_qkv kernel (for merged QKV — Phi3/4)
+        if (hasMergedQKV) {
+            splitQkvFunc = cudaContext.compileKernel("kernels/cuda/split_qkv.cu", "split_qkv");
+        } else {
+            splitQkvFunc = null;
+        }
+
+        // Compile per-head norm kernel (for QK-norm)
+        if (hasQKNorm) {
+            perHeadNormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm_per_head.cu", "rmsnorm_per_head");
+        } else {
+            perHeadNormFunc = null;
+        }
+
+        // Try to compile fused gate+up kernel (only works if gate/up are Q4_K)
+        MemorySegment fusedFunc = null;
+        try {
+            fusedFunc = cudaContext.compileKernel("kernels/cuda/matmul_q4_k_fused_gate_up.cu", "matmul_q4_k_fused_gate_up");
+        } catch (Exception ignored) {}
+        fusedGateUpFunc = fusedFunc;
 
         // Upload per-layer norm weights to GPU
         gpuAttnNormWeights = new long[blockCount];
@@ -275,8 +367,6 @@ public class CudaForwardPass implements AutoCloseable {
         }
 
         // Upload per-layer QKV bias tensors to GPU (if present)
-        TransformerLayerWeights firstLayer = weights.layers()[0];
-        hasBias = firstLayer.qBias() != null;
         if (hasBias) {
             gpuQBias = new long[blockCount];
             gpuKBias = new long[blockCount];
@@ -291,6 +381,34 @@ public class CudaForwardPass implements AutoCloseable {
             gpuQBias = null;
             gpuKBias = null;
             gpuVBias = null;
+        }
+
+        // Upload per-layer QK-norm weights to GPU (if present, Qwen3/Gemma3)
+        if (hasQKNorm) {
+            gpuQNormWeights = new long[blockCount];
+            gpuKNormWeights = new long[blockCount];
+            for (int i = 0; i < blockCount; i++) {
+                TransformerLayerWeights layer = weights.layers()[i];
+                gpuQNormWeights[i] = uploadNormWeights(layer.qNorm(), headSize);
+                gpuKNormWeights[i] = uploadNormWeights(layer.kNorm(), headSize);
+            }
+        } else {
+            gpuQNormWeights = null;
+            gpuKNormWeights = null;
+        }
+
+        // Upload per-layer post-attention/FFN norm weights to GPU (if present, Gemma2/3)
+        if (hasPostNorm) {
+            gpuPostAttnNormWeights = new long[blockCount];
+            gpuPostFfnNormWeights = new long[blockCount];
+            for (int i = 0; i < blockCount; i++) {
+                TransformerLayerWeights layer = weights.layers()[i];
+                gpuPostAttnNormWeights[i] = uploadNormWeights(layer.postAttnNorm(), dim);
+                gpuPostFfnNormWeights[i] = uploadNormWeights(layer.postFfnNorm(), dim);
+            }
+        } else {
+            gpuPostAttnNormWeights = null;
+            gpuPostFfnNormWeights = null;
         }
 
         // Upload output norm weights and prepare output projection on GPU
@@ -309,6 +427,13 @@ public class CudaForwardPass implements AutoCloseable {
             outputMatmul = null;
         }
 
+        // Allocate GPU-side argmax buffers
+        argmaxNumBlocks = Math.min(256, (vocabSize + 255) / 256);
+        gpuArgmaxPartialVal = bufferManager.createBuffer((long) argmaxNumBlocks * Float.BYTES);
+        gpuArgmaxPartialIdx = bufferManager.createBuffer((long) argmaxNumBlocks * Integer.BYTES);
+        gpuArgmaxResult = bufferManager.createBuffer(Integer.BYTES);
+        hostArgmaxResult = arena.allocate(ValueLayout.JAVA_INT, 1);
+
         // === Pre-allocate reusable param buffers ===
         matmulPB = new ParamBuffer(arena, 6);
         normPB = new ParamBuffer(arena, 5);
@@ -317,6 +442,49 @@ public class CudaForwardPass implements AutoCloseable {
         attnPB = new ParamBuffer(arena, 9);
         siluPB = new ParamBuffer(arena, 3);
         biasPB = new ParamBuffer(arena, 3);
+        fusedGateUpPB = new ParamBuffer(arena, 8);
+        argmaxPartialPB = new ParamBuffer(arena, 4);
+        argmaxFinalPB = new ParamBuffer(arena, 4);
+
+        // Per-head norm param buffer (4 args: vec, weights, headSize, eps)
+        if (hasQKNorm) {
+            perHeadNormPB = new ParamBuffer(arena, 4);
+            // perHeadNormPB[0] = vec — set per launch (gpuQ or gpuK)
+            // perHeadNormPB[1] = weights — set per launch
+            perHeadNormPB.setInt(2, headSize);
+            perHeadNormPB.setFloat(3, normEps);
+        } else {
+            perHeadNormPB = null;
+        }
+
+        // Post-norm param buffer (5 args: out, in, weights, size, eps) — reuses rmsnormFusedFunc
+        // For post-attn norm: in-place on gpuXb (both out and in = gpuXb)
+        // For post-FFN norm: in-place on gpuXb (both out and in = gpuXb)
+        if (hasPostNorm) {
+            postNormPB = new ParamBuffer(arena, 5);
+            postNormPB.setLong(0, gpuXb); // out — always gpuXb
+            postNormPB.setLong(1, gpuXb); // in — same as out (in-place)
+            // postNormPB[2] = weights — set per launch (postAttnNorm or postFfnNorm)
+            postNormPB.setInt(3, dim);
+            postNormPB.setFloat(4, normEps);
+        } else {
+            postNormPB = null;
+        }
+
+        // Split QKV param buffer (7 args: qkv, q, k, v, qDim, kvDim)
+        if (hasMergedQKV) {
+            splitQkvPB = new ParamBuffer(arena, 6);
+            splitQkvPB.setLong(0, gpuQKV);
+            splitQkvPB.setLong(1, gpuQ);
+            splitQkvPB.setLong(2, gpuK);
+            splitQkvPB.setLong(3, gpuV);
+            splitQkvPB.setInt(4, qDim);
+            splitQkvPB.setInt(5, kvDim);
+            splitQkvGridDim = (int) ((qkvDim + blockSize - 1) / blockSize);
+        } else {
+            splitQkvPB = null;
+            splitQkvGridDim = 0;
+        }
 
         // Set fixed norm params (out=gpuXb, in=gpuX, size=dim, eps=normEps)
         normPB.setLong(0, gpuXb);
@@ -359,6 +527,25 @@ public class CudaForwardPass implements AutoCloseable {
         siluPB.setLong(1, gpuHb2);
         siluPB.setInt(2, ffnDim);
 
+        // Set fixed argmax partial params (partialVal, partialIdx, size — data set per launch)
+        argmaxPartialPB.setLong(1, gpuArgmaxPartialVal);
+        argmaxPartialPB.setLong(2, gpuArgmaxPartialIdx);
+        argmaxPartialPB.setInt(3, vocabSize);
+
+        // Set fixed argmax final params
+        argmaxFinalPB.setLong(0, gpuArgmaxPartialVal);
+        argmaxFinalPB.setLong(1, gpuArgmaxPartialIdx);
+        argmaxFinalPB.setLong(2, gpuArgmaxResult);
+        argmaxFinalPB.setInt(3, argmaxNumBlocks);
+
+        // Set fixed fused gate+up params (input, gateOutput, upOutput, gateRows, cols, addToOutput)
+        fusedGateUpPB.setLong(2, gpuXb);       // input
+        fusedGateUpPB.setLong(3, gpuHb);       // gateOutput
+        fusedGateUpPB.setLong(4, gpuHb2);      // upOutput
+        fusedGateUpPB.setInt(5, ffnDim);       // gateRows
+        fusedGateUpPB.setInt(6, dim);          // cols
+        fusedGateUpPB.setInt(7, 0);            // addToOutput (write mode)
+
         // Pre-compute auxiliary kernel grid sizes
         this.normNumWarps = (int) (blockSize / 32);
         this.normSharedMem = (normNumWarps + 1) * Float.BYTES;
@@ -373,18 +560,65 @@ public class CudaForwardPass implements AutoCloseable {
         this.siluGridDim = (int) ((ffnDim + blockSize - 1) / blockSize);
         this.biasQGridDim = (int) ((qDim + blockSize - 1) / blockSize);
         this.biasKVGridDim = (int) ((kvDim + blockSize - 1) / blockSize);
+        // Per-head norm: one block per head, blockDim covers headSize
+        this.perHeadNormBlockDim = hasQKNorm ? (int) Math.min(Math.max(32, ((headSize + 31) / 32) * 32), blockSize) : 0;
+        this.perHeadNormSharedMem = hasQKNorm ? ((perHeadNormBlockDim / 32) + 1) * Float.BYTES : 0;
 
         // === Pre-compute per-layer matmul launch descriptors ===
         layerMatmuls = new MatmulLaunch[blockCount][7];
+        boolean canFuseGateUp = fusedGateUpFunc != null;
+        long[] fGateWeights = canFuseGateUp ? new long[blockCount] : null;
+        long[] fUpWeights = canFuseGateUp ? new long[blockCount] : null;
         for (int i = 0; i < blockCount; i++) {
             TransformerLayerWeights layer = weights.layers()[i];
-            layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wq(), gpuXb, gpuQ, qDim, dim, 0);
-            layerMatmuls[i][1] = new MatmulLaunch((CudaFloatTensor) layer.wk(), gpuXb, gpuK, kvDim, dim, 0);
-            layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) layer.wv(), gpuXb, gpuV, kvDim, dim, 0);
-            layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) layer.wo(), gpuXb2, gpuX, dim, qDim, 1);
+            if (hasMergedQKV) {
+                // Merged QKV: single matmul wqkv → gpuQKV, then split kernel
+                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wqkv(), gpuXb, gpuQKV, qkvDim, dim, 0);
+                layerMatmuls[i][1] = null; // unused — split kernel handles K
+                layerMatmuls[i][2] = null; // unused — split kernel handles V
+            } else {
+                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wq(), gpuXb, gpuQ, qDim, dim, 0);
+                layerMatmuls[i][1] = new MatmulLaunch((CudaFloatTensor) layer.wk(), gpuXb, gpuK, kvDim, dim, 0);
+                layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) layer.wv(), gpuXb, gpuV, kvDim, dim, 0);
+            }
+            // Post-norm: Wo/Down write to gpuXb (not accumulate to gpuX), post-norm then accumulate
+            // Pre-norm: Wo/Down accumulate directly to gpuX (addToOutput=1)
+            layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) layer.wo(), gpuXb2,
+                    hasPostNorm ? gpuXb : gpuX, dim, qDim, hasPostNorm ? 0 : 1);
             layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0);
             layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
-            layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) layer.wDown(), gpuHb, gpuX, dim, ffnDim, 1);
+            layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) layer.wDown(), gpuHb,
+                    hasPostNorm ? gpuXb : gpuX, dim, ffnDim, hasPostNorm ? 0 : 1);
+
+            // Check if gate and up are both Q4_K for fused kernel
+            if (canFuseGateUp && layer.wGate() instanceof CudaFloatTensor && layer.wUp() instanceof CudaFloatTensor) {
+                CudaFloatTensor gate = (CudaFloatTensor) layer.wGate();
+                CudaFloatTensor up = (CudaFloatTensor) layer.wUp();
+                if (gate.type() == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K
+                        && up.type() == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) {
+                    fGateWeights[i] = gate.getGpuWeights();
+                    fUpWeights[i] = up.getGpuWeights();
+                } else {
+                    canFuseGateUp = false;
+                }
+            } else if (canFuseGateUp) {
+                canFuseGateUp = false;
+            }
+        }
+        useFusedGateUp = canFuseGateUp;
+        fusedGateWeights = fGateWeights;
+        fusedUpWeights = fUpWeights;
+        if (canFuseGateUp) {
+            // totalRows = ffnDim * 2, 1 warp per row
+            int totalRows = ffnDim * 2;
+            int fusedBlockDimVal = (int) Math.min(256, maxWg);
+            int warpsPerBlock = fusedBlockDimVal / 32;
+            fusedGateUpGridDim = (totalRows + warpsPerBlock - 1) / warpsPerBlock;
+            fusedGateUpBlockDim = fusedBlockDimVal;
+            System.err.println("CUDA: fused gate+up Q4_K kernel enabled (" + blockCount + " layers)");
+        } else {
+            fusedGateUpGridDim = 0;
+            fusedGateUpBlockDim = 0;
         }
 
         // CUDA graph: pre-compute fixed attention shared mem (max seqLen)
@@ -436,15 +670,15 @@ public class CudaForwardPass implements AutoCloseable {
         TransformerLayerWeights firstLayer = weights.layers()[0];
         if (firstLayer.attnNorm() == null) return false;
         if (firstLayer.ffnNorm() == null) return false;
-        if (firstLayer.wqkv() != null) return false;
-        if (firstLayer.postAttnNorm() != null) return false;
-        if (firstLayer.postFfnNorm() != null) return false;
-        if (firstLayer.wGate() == null) return false;
-
-        // All weight tensors must be CudaFloatTensor
-        if (!(firstLayer.wq() instanceof CudaFloatTensor)) return false;
-        if (!(firstLayer.wk() instanceof CudaFloatTensor)) return false;
-        if (!(firstLayer.wv() instanceof CudaFloatTensor)) return false;
+        if (firstLayer.wGate() == null) return false; // packed FFN (Phi-3/4) not yet supported
+        // All weight tensors must be CudaFloatTensor — merged QKV or separate Q/K/V
+        if (firstLayer.wqkv() != null) {
+            if (!(firstLayer.wqkv() instanceof CudaFloatTensor)) return false;
+        } else {
+            if (!(firstLayer.wq() instanceof CudaFloatTensor)) return false;
+            if (!(firstLayer.wk() instanceof CudaFloatTensor)) return false;
+            if (!(firstLayer.wv() instanceof CudaFloatTensor)) return false;
+        }
         if (!(firstLayer.wo() instanceof CudaFloatTensor)) return false;
         if (!(firstLayer.wGate() instanceof CudaFloatTensor)) return false;
         if (!(firstLayer.wUp() instanceof CudaFloatTensor)) return false;
@@ -458,6 +692,21 @@ public class CudaForwardPass implements AutoCloseable {
         if (PROFILING) t0 = System.nanoTime();
         MemorySegment.copy(x, 0, hostX, ValueLayout.JAVA_FLOAT, 0, dim);
         cudaContext.writeBuffer(gpuX, hostX, (long) dim * Float.BYTES);
+        if (PROFILING) profUpload += System.nanoTime() - t0;
+    }
+
+    /**
+     * Combined upload: embedding vector + token params in a single cuMemcpyHtoD.
+     * Saves one Panama FFM call per token (~0.1ms).
+     */
+    public void uploadXAndUpdateParams(float[] x, int position) {
+        long t0 = 0;
+        if (PROFILING) t0 = System.nanoTime();
+        long embBytes = (long) dim * Float.BYTES;
+        MemorySegment.copy(x, 0, hostCombined, ValueLayout.JAVA_FLOAT, 0, dim);
+        hostCombined.set(ValueLayout.JAVA_INT, embBytes, position);
+        hostCombined.set(ValueLayout.JAVA_INT, embBytes + 4, position + 1);
+        cudaContext.writeBuffer(gpuCombined, hostCombined, embBytes + 8);
         if (PROFILING) profUpload += System.nanoTime() - t0;
     }
 
@@ -493,6 +742,90 @@ public class CudaForwardPass implements AutoCloseable {
 
         if (PROFILING) profOutputMatmul += System.nanoTime() - t0;
         return true;
+    }
+
+    /**
+     * Compute final RMSNorm + output projection + argmax on GPU.
+     * Returns the token ID with the highest logit, downloading only 4 bytes instead of 512KB.
+     * Returns -1 if output is not on GPU (caller falls back to CPU path).
+     *
+     * Use for greedy sampling (temperature=0) without repetition penalty.
+     */
+    public int forwardFinalArgmax() {
+        if (outputMatmul == null) return -1;
+
+        // Final RMSNorm: gpuX → gpuXb
+        normPB.setLong(2, gpuOutputNormWeights);
+        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+
+        // Output projection
+        launchMatmul(outputMatmul);
+
+        // GPU-side argmax (two-phase: partial → final)
+        argmaxPartialPB.setLong(0, gpuLogits);
+        launchKernel(argmaxPartialFunc, argmaxNumBlocks, 256, 0, argmaxPartialPB.ptrs);
+        launchKernel(argmaxFinalFunc, 1, 256, 0, argmaxFinalPB.ptrs);
+
+        // Download only 4 bytes (the token index)
+        cudaContext.readBuffer(gpuArgmaxResult, hostArgmaxResult, Integer.BYTES);
+        return hostArgmaxResult.get(ValueLayout.JAVA_INT, 0);
+    }
+
+    /**
+     * Execute all layers + output projection + argmax via CUDA graph.
+     * Like forwardGraph() but returns the argmax token ID instead of downloading full logits.
+     * Returns -1 to fall back to normal path.
+     */
+    public int forwardGraphArgmax() {
+        // GPU-side argmax can't be included in the CUDA graph because argmax is a 2-phase kernel
+        // and would add variable shared memory requirements. Instead, run graph + argmax separately.
+        if (!graphAvailable || PROFILING) return -1;
+
+        if (graphExec == null) {
+            // First call — capture graph (same as forwardGraph)
+            boolean capturing = false;
+            try {
+                cudaContext.beginCapture();
+                capturing = true;
+
+                for (int layer = 0; layer < blockCount; layer++) {
+                    forwardLayerKernels(layer);
+                }
+
+                normPB.setLong(2, gpuOutputNormWeights);
+                launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+                launchMatmul(outputMatmul);
+
+                MemorySegment graph = cudaContext.endCapture();
+                capturing = false;
+                graphExec = cudaContext.instantiateGraph(graph);
+                cudaContext.destroyGraph(graph);
+
+                System.err.println("CUDA graph: captured " + blockCount + " layers + output projection");
+            } catch (Exception e) {
+                if (capturing) {
+                    try { cudaContext.endCapture(); } catch (Exception ignored) {}
+                }
+                System.err.println("CUDA graph: capture failed — " + e.getMessage());
+                graphExec = null;
+                return -1;
+            }
+        }
+
+        // Launch graph (all layers + output projection)
+        cudaContext.launchGraph(graphExec);
+
+        // Sync before argmax (graph might still be running)
+        cudaContext.finish();
+
+        // GPU-side argmax on the logits (already computed on GPU by graph)
+        argmaxPartialPB.setLong(0, gpuLogits);
+        launchKernel(argmaxPartialFunc, argmaxNumBlocks, 256, 0, argmaxPartialPB.ptrs);
+        launchKernel(argmaxFinalFunc, 1, 256, 0, argmaxFinalPB.ptrs);
+
+        // Download only 4 bytes
+        cudaContext.readBuffer(gpuArgmaxResult, hostArgmaxResult, Integer.BYTES);
+        return hostArgmaxResult.get(ValueLayout.JAVA_INT, 0);
     }
 
     // Profiling accumulators (nanoseconds, across all layers and tokens)
@@ -543,9 +876,14 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
         // 2. Q/K/V projections (write mode)
-        launchMatmul(ml[0]); // wq
-        launchMatmul(ml[1]); // wk
-        launchMatmul(ml[2]); // wv
+        if (hasMergedQKV) {
+            launchMatmul(ml[0]); // wqkv → gpuQKV
+            launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
+        } else {
+            launchMatmul(ml[0]); // wq
+            launchMatmul(ml[1]); // wk
+            launchMatmul(ml[2]); // wv
+        }
 
         // 2b. Add QKV bias if present (Qwen2)
         if (hasBias) {
@@ -577,22 +915,40 @@ public class CudaForwardPass implements AutoCloseable {
 
         // === FFN Phase ===
 
-        // 6. Wo matmul (accumulate to residual)
+        // 6. Wo matmul
         launchMatmul(ml[3]); // wo
+
+        // 6b. Post-attention norm + accumulate (Gemma2/3)
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
 
         // 7. FFN RMSNorm: gpuX → gpuXb
         normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
-        // 8. Gate + Up projections (write mode)
-        launchMatmul(ml[4]); // gate
-        launchMatmul(ml[5]); // up
+        // 8. Gate + Up projections (write mode) — fused or separate
+        if (useFusedGateUp) {
+            launchFusedGateUp(layerIdx);
+        } else {
+            launchMatmul(ml[4]); // gate
+            launchMatmul(ml[5]); // up
+        }
 
         // 9. Fused SiLU + element-wise multiply (fully fixed params)
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
 
-        // 10. Down projection (accumulate to residual)
+        // 10. Down projection
         launchMatmul(ml[6]); // down
+
+        // 10b. Post-FFN norm + accumulate (Gemma2/3)
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
     }
 
     private void forwardLayerProfiled(InferenceState state, TransformerLayerWeights layerWeights,
@@ -605,9 +961,14 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
         cudaContext.finish(); t1 = System.nanoTime(); profAttnNorm += t1 - t0; t0 = t1;
 
-        launchMatmul(ml[0]);
-        launchMatmul(ml[1]);
-        launchMatmul(ml[2]);
+        if (hasMergedQKV) {
+            launchMatmul(ml[0]);
+            launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
+        } else {
+            launchMatmul(ml[0]);
+            launchMatmul(ml[1]);
+            launchMatmul(ml[2]);
+        }
         if (hasBias) {
             launchBias(gpuQ, gpuQBias[layerIdx], qDim, biasQGridDim);
             launchBias(gpuK, gpuKBias[layerIdx], kvDim, biasKVGridDim);
@@ -633,18 +994,32 @@ public class CudaForwardPass implements AutoCloseable {
         cudaContext.finish(); t1 = System.nanoTime(); profAttn += t1 - t0; t0 = t1;
 
         launchMatmul(ml[3]);
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
         cudaContext.finish(); t1 = System.nanoTime(); profWo += t1 - t0; t0 = t1;
 
         normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
         cudaContext.finish(); t1 = System.nanoTime(); profFfnNorm += t1 - t0; t0 = t1;
 
-        launchMatmul(ml[4]);
-        launchMatmul(ml[5]);
+        if (useFusedGateUp) {
+            launchFusedGateUp(layerIdx);
+        } else {
+            launchMatmul(ml[4]);
+            launchMatmul(ml[5]);
+        }
         cudaContext.finish(); t1 = System.nanoTime(); profGateUp += t1 - t0; t0 = t1;
 
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
         launchMatmul(ml[6]);
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
         cudaContext.finish(); t1 = System.nanoTime(); profSiluDown += t1 - t0;
 
         profTotal += System.nanoTime() - tTotal;
@@ -729,15 +1104,30 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
         // QKV projections
-        launchMatmul(ml[0]);
-        launchMatmul(ml[1]);
-        launchMatmul(ml[2]);
+        if (hasMergedQKV) {
+            launchMatmul(ml[0]); // wqkv → gpuQKV
+            launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
+        } else {
+            launchMatmul(ml[0]);
+            launchMatmul(ml[1]);
+            launchMatmul(ml[2]);
+        }
 
         // QKV bias (Qwen2)
         if (hasBias) {
             launchBias(gpuQ, gpuQBias[layerIdx], qDim, biasQGridDim);
             launchBias(gpuK, gpuKBias[layerIdx], kvDim, biasKVGridDim);
             launchBias(gpuV, gpuVBias[layerIdx], kvDim, biasKVGridDim);
+        }
+
+        // Per-head QK-norm (Qwen3, Gemma3): normalize each head independently
+        if (hasQKNorm) {
+            perHeadNormPB.setLong(0, gpuQ);
+            perHeadNormPB.setLong(1, gpuQNormWeights[layerIdx]);
+            launchKernel(perHeadNormFunc, headCount, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
+            perHeadNormPB.setLong(0, gpuK);
+            perHeadNormPB.setLong(1, gpuKNormWeights[layerIdx]);
+            launchKernel(perHeadNormFunc, headCountKV, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
         }
 
         // RoPE on Q and K
@@ -758,25 +1148,53 @@ public class CudaForwardPass implements AutoCloseable {
         attnPB.setLong(3, gpuValueCache[layerIdx]);
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, graphAttnSharedMem, attnPB.ptrs);
 
-        // Wo (accumulate to residual)
+        // Wo projection
         launchMatmul(ml[3]);
+
+        // Post-attention norm + accumulate (Gemma2/3): rmsnorm(gpuXb) in-place, then gpuX += gpuXb
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
 
         // FFN norm
         normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
-        // Gate + Up projections
-        launchMatmul(ml[4]);
-        launchMatmul(ml[5]);
+        // Gate + Up projections — fused or separate
+        if (useFusedGateUp) {
+            launchFusedGateUp(layerIdx);
+        } else {
+            launchMatmul(ml[4]);
+            launchMatmul(ml[5]);
+        }
 
         // SiLU + element-wise multiply
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
 
-        // Down projection (accumulate to residual)
+        // Down projection
         launchMatmul(ml[6]);
+
+        // Post-FFN norm + accumulate (Gemma2/3): rmsnorm(gpuXb) in-place, then gpuX += gpuXb
+        if (hasPostNorm) {
+            postNormPB.setLong(2, gpuPostFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
+            launchBias(gpuX, gpuXb, dim, numWorkGroups);
+        }
     }
 
     // --- Launch helpers (zero allocation) ---
+
+    /**
+     * Launch fused gate+up Q4_K kernel for a given layer.
+     * Single kernel computes both gate and up projections, reading input once.
+     */
+    private void launchFusedGateUp(int layerIdx) {
+        fusedGateUpPB.setLong(0, fusedGateWeights[layerIdx]);
+        fusedGateUpPB.setLong(1, fusedUpWeights[layerIdx]);
+        launchKernel(fusedGateUpFunc, fusedGateUpGridDim, fusedGateUpBlockDim, 0, fusedGateUpPB.ptrs);
+    }
 
     /**
      * Launch a matmul kernel using pre-computed descriptor. Updates shared matmulPB in-place.
@@ -822,13 +1240,13 @@ public class CudaForwardPass implements AutoCloseable {
         if (graphExec != null) {
             try { cudaContext.destroyGraphExec(graphExec); } catch (Exception ignored) {}
         }
-        try { cudaContext.freeBuffer(gpuTokenParams); } catch (Exception ignored) {}
-        try { cudaContext.freeBuffer(gpuX); } catch (Exception ignored) {}
+        try { cudaContext.freeBuffer(gpuCombined); } catch (Exception ignored) {} // frees gpuX + gpuTokenParams
         try { cudaContext.freeBuffer(gpuXb); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuXb2); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuHb); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuHb2); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuQ); } catch (Exception ignored) {}
+        if (gpuQKV != 0) try { cudaContext.freeBuffer(gpuQKV); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuK); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuV); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuPartialSums); } catch (Exception ignored) {}
@@ -836,10 +1254,21 @@ public class CudaForwardPass implements AutoCloseable {
         try { cudaContext.freeBuffer(gpuSinTable); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuOutputNormWeights); } catch (Exception ignored) {}
         if (gpuLogits != 0) try { cudaContext.freeBuffer(gpuLogits); } catch (Exception ignored) {}
+        try { cudaContext.freeBuffer(gpuArgmaxPartialVal); } catch (Exception ignored) {}
+        try { cudaContext.freeBuffer(gpuArgmaxPartialIdx); } catch (Exception ignored) {}
+        try { cudaContext.freeBuffer(gpuArgmaxResult); } catch (Exception ignored) {}
         if (gpuQBias != null) {
             for (long ptr : gpuQBias) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
             for (long ptr : gpuKBias) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
             for (long ptr : gpuVBias) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
+        }
+        if (gpuQNormWeights != null) {
+            for (long ptr : gpuQNormWeights) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
+            for (long ptr : gpuKNormWeights) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
+        }
+        if (gpuPostAttnNormWeights != null) {
+            for (long ptr : gpuPostAttnNormWeights) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
+            for (long ptr : gpuPostFfnNormWeights) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
         }
         for (long ptr : gpuAttnNormWeights) {
             if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {}
