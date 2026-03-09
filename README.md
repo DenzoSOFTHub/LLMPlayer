@@ -1,6 +1,6 @@
 # LLMPlayer
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
 ## Requirements
 
@@ -241,34 +241,71 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 
 ## CLI Options
 
+### General
+
 | Option | Alias | Type | Default | Description |
 |---|---|---|---|---|
 | `--model` | `-m` | String | — | Path to the GGUF file |
 | `--prompt` | `-p` | String | — | Prompt for single generation |
 | `--interactive` | `-i` | Flag | false | Interactive chat mode |
-| `--max-tokens` | `-n` | Integer | 256 | Maximum number of tokens to generate |
-| `--temperature` | `-t` | Float | 0.7 | Sampling temperature (0 = deterministic, >1 = more random) |
-| `--top-k` | — | Integer | 40 | Keep only the K most probable tokens |
-| `--top-p` | — | Float | 0.9 | Nucleus sampling: cumulative probability threshold |
-| `--repetition-penalty` | — | Float | 1.1 | Penalty for repeated tokens (>1 reduces repetition) |
-| `--seed` | — | Long | random | Seed for reproducibility |
-| `--threads` | — | Integer | num CPUs | Number of worker threads |
-| `--context-length` | `-c` | Integer | 2048 | Maximum context length (tokens) |
 | `--info` | — | Flag | false | Show model info and exit |
 | `--web` | `-w` | Flag | false | Start the web server |
 | `--port` | — | Integer | 8080 | Web server port |
 | `--gguf-dir` | — | String | `gguf` | GGUF file directory |
-| `--gpu` | — | Flag | false | Enable GPU acceleration |
-| `--gpu-device` | — | Integer | 0 | GPU device index |
-| `--gpu-backend` | — | String | `auto` | GPU backend: `auto`, `cuda`, `opencl` |
-| `--gpu-layers` | — | Integer | -1 | GPU layers (-1 = auto-detect, 0 = CPU only) |
-| `--gpu-list` | — | Flag | false | List GPU devices and exit |
-| `--download` | — | String | — | Download GGUF model from HuggingFace (e.g. `owner/repo`) |
-| `--hf-token` | — | String | — | HuggingFace API token for private/gated repos |
-| `--no-gpu` | — | Flag | false | Disable GPU, use CPU only |
-| `--fine-tune` | — | Flag | false | Start LoRA fine-tuning pipeline |
-| `--target-model` | — | String | — | Target model for fine-tuning |
+| `--force` | `-y` | Flag | false | Skip confirmation prompts (e.g., RAM warning) |
 | `--help` | `-h` | Flag | false | Show help |
+
+### Generation Parameters
+
+These flags control how tokens are generated. They affect output quality and creativity.
+
+| Option | Alias | Type | Default | Description |
+|---|---|---|---|---|
+| `--max-tokens` | `-n` | Integer | 256 | Maximum number of tokens to generate. Generation stops at this limit or when the model produces an end-of-sequence token. |
+| `--temperature` | `-t` | Float | 0.7 | Sampling temperature. 0 = greedy (always pick most probable), 0.1-0.5 = focused, 0.7-1.0 = creative, >1.0 = chaotic. Lower values produce more predictable output. |
+| `--top-k` | — | Integer | 40 | After computing probabilities, keep only the K most probable tokens and renormalize. Prevents unlikely tokens from being selected. 0 = no top-K filtering. |
+| `--top-p` | — | Float | 0.9 | Nucleus sampling: keep the smallest set of tokens whose cumulative probability exceeds P, then renormalize. 1.0 = no filtering. Applied after top-K. |
+| `--repetition-penalty` | — | Float | 1.1 | Penalty applied to tokens that already appeared in the context. 1.0 = no penalty, 1.1-1.3 = light penalty, >1.5 = aggressive. Reduces loops and repetitive output. |
+| `--seed` | — | Long | random | Random seed for reproducibility. Same seed + same prompt = same output (when temperature > 0). |
+| `--threads` | — | Integer | num CPUs | Number of threads for parallel operations. By default uses all available CPU cores. |
+| `--context-length` | `-c` | Integer | 2048 | Maximum context window in tokens. Larger values allow longer conversations but use more RAM. Model's maximum is shown in `--info` output. |
+
+### GPU Flags
+
+LLMPlayer **auto-detects** NVIDIA GPUs and enables CUDA when available. These flags override the default behavior.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--gpu` | Flag | false | Force GPU enablement. Not usually needed — auto-detection handles this. Use when auto-detect picks the wrong device or when you want to be explicit. |
+| `--no-gpu` | Flag | false | **Disable GPU entirely**, force CPU-only inference. Useful for benchmarking or when GPU causes issues. Note: CPU-only is significantly slower (see Benchmarks). |
+| `--gpu-device` | Integer | auto | Select GPU device by index. Use `--gpu-list` to see available devices and their indices. By default, the best available GPU is selected automatically. |
+| `--gpu-backend` | String | `auto` | GPU compute backend: `auto` (prefers CUDA over OpenCL), `cuda` (NVIDIA only), `opencl` (any OpenCL device). |
+| `--gpu-layers` | Integer | -1 | How many transformer layers to place on GPU. `-1` = auto-detect (fills VRAM optimally). `0` = no layers on GPU (equivalent to `--no-gpu`). Positive value N = put the first N layers on GPU. For MoE models with auto-detect, uses MoE-optimized placement (all attention on GPU, experts on CPU). |
+| `--gpu-list` | Flag | false | List all detected CUDA and OpenCL devices with name, memory, and capabilities, then exit. |
+| `--gpu-chain` | Flag | true | Enable GPU-resident forward pass (activations stay on GPU between layers). On by default. |
+| `--no-gpu-chain` | Flag | false | Disable GPU-resident forward pass. Falls back to per-tensor GPU matmul (upload/compute/download per operation). Useful for debugging. |
+| `--gpu-backend` | String | `auto` | GPU backend: `auto` (CUDA preferred), `cuda`, `opencl` |
+| `--gpu-memory` | String | `device` | GPU memory allocation mode: `device` (GPU-only), `managed` (CUDA managed), `host-mapped` (host-pinned). |
+
+**GPU auto-detection behavior:** When no GPU flags are specified, LLMPlayer probes for CUDA, then OpenCL. If an NVIDIA GPU is found, CUDA is enabled automatically with auto-detected layer count. CPU-only devices (PoCL) are skipped. To prevent this, use `--no-gpu`.
+
+**Disable CUDA graph at runtime:** Use the JVM property `-Dcuda.nograph=true` to disable CUDA graph capture (useful for debugging or when shared memory is insufficient).
+
+### HuggingFace Download
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--download` | String | — | Download GGUF model from HuggingFace. Format: `owner/repo` (auto-selects Q4_K_M) or `owner/repo/filename.gguf` (specific file). |
+| `--hf-token` | String | — | HuggingFace API token for gated/private model access. |
+
+### Fine-Tuning
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--fine-tune` | Flag | false | Start LoRA fine-tuning pipeline |
+| `--target-model` | String | — | Target model for fine-tuning |
+
+See [FINE-TUNING.md](FINE-TUNING.md) for full fine-tuning documentation.
 
 ## REST API (web mode)
 
@@ -369,11 +406,15 @@ engine.close();
 | Qwen3 MoE | `qwen3moe` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3.5 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
 | DeepSeek2 | `deepseek2` | BPE (gpt2) | `User: ... Assistant:` |
+| GLM-4.7-Flash | `deepseek2` | SentencePiece | `[gMASK]<sop><\|user\|>` (auto-detected) |
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
 | Gemma 2 | `gemma2` | SentencePiece | `<start_of_turn>user` |
 | Gemma 3 | `gemma3` | SentencePiece | `<start_of_turn>user` |
 | Phi-3/4 | `phi3` | BPE (gpt2) | `<\|user\|>` |
 | Mistral3/Devstral | `mistral3` | SentencePiece | `[INST]` |
+| Command-R/Cohere (Aya-23) | `command-r` | SentencePiece | `<\|START_OF_TURN_TOKEN\|><\|USER_TOKEN\|>` |
+| OLMo2 | `olmo2` | BPE (gpt2) | `<\|user\|>` |
+| GPT-OSS (Sonar) | `llama` (MoE) | BPE (gpt2) | `<\|start_header_id\|>user<\|end_header_id\|>` |
 
 The architecture is automatically detected from the `general.architecture` field in GGUF metadata.
 
@@ -381,31 +422,33 @@ The architecture is automatically detected from the `general.architecture` field
 
 Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s), Java 25, SimdVectorOps.
 
-### Top results (ranked by tok/s)
+**27 models tested, 25 produce output** across 14 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS).
+
+### Top results — CUDA GPU (ranked by tok/s)
 
 | # | Model | Params | Quant | GPU Config | tok/s |
 |--:|-------|--------|-------|------------|------:|
-| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 54.7 |
-| 2 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 41.5 |
-| 3 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 35.7 |
-| 4 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 28.7 |
-| 5 | OLMo-2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 25.5 |
-| 6 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 23.8 |
-| 7 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.8 |
-| 8 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 19.0 |
-| 9 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.3 |
-| 10 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | CUDA graph | 9.3 |
+| 1 | OLMo-2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 52.1 |
+| 2 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 48.8 |
+| 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 40.8 |
+| 4 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 33.1 |
+| 5 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 27.8 |
+| 6 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
+| 7 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
+| 8 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
+| 9 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
+| 10 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
 
-Full benchmark results (33 models) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
+Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 
 ### GPU strategy summary
 
 | Strategy | When Used | VRAM Needed | Typical Speed |
 |----------|-----------|-------------|---------------|
-| Full offload + CUDA graph | Dense model fits in VRAM, all tensors have CUDA kernels | 770–4822 MB | 7–55 tok/s |
-| Full offload + per-tensor | Model fits in VRAM, architecture not supported for graph | 770–2600 MB | 6–12 tok/s |
-| MoE-optimized | MoE model, attention fits in VRAM | 517–913 MB | 0.8–1.6 tok/s |
-| Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.2–1.6 tok/s |
+| Full offload + CUDA graph | Dense model fits in VRAM, supported architecture | 770–4794 MB | 8–52 tok/s |
+| Full offload + per-tensor | Model fits in VRAM, architecture not supported for graph | 770–5000 MB | 1–7 tok/s |
+| MoE-optimized + expert cache | MoE model, attention fits in VRAM | 517–913 MB | 0.7–2.5 tok/s |
+| Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.3–0.7 tok/s |
 
 ## Fine-Tuning
 

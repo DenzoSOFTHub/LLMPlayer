@@ -38,6 +38,15 @@ public final class TensorFactory {
     private static volatile Boolean simdAvailable;
     private static volatile Constructor<?> simdQ4KCtor;
     private static volatile Constructor<?> simdQ8_0Ctor;
+    private static volatile Constructor<?> simdQ6KCtor;
+    private static volatile Constructor<?> simdQ5_0Ctor;
+    private static volatile Constructor<?> simdQ5KCtor;
+    private static volatile Constructor<?> simdQ3KCtor;
+    private static volatile Constructor<?> simdIQ4NLCtor;
+    private static volatile Constructor<?> simdIQ4XSCtor;
+    private static volatile Constructor<?> simdIQ3XXSCtor;
+    private static volatile Constructor<?> simdIQ3SCtor;
+    private static volatile Constructor<?> simdIQ2SCtor;
 
     public static FloatTensor create(GGMLType type, TensorData data, long elementCount) {
         // Try GPU tensor first
@@ -75,8 +84,12 @@ public final class TensorFactory {
         Boolean avail = simdAvailable;
         if (avail != null && !avail) return null;
 
-        // Only Q4_K and Q8_0 have SIMD variants
-        if (type != GGMLType.Q4_K && type != GGMLType.Q8_0) return null;
+        // Only these types have SIMD variants
+        if (type != GGMLType.Q4_K && type != GGMLType.Q8_0
+            && type != GGMLType.Q6_K && type != GGMLType.Q5_0
+            && type != GGMLType.Q5_K && type != GGMLType.Q3_K
+            && type != GGMLType.IQ4_NL && type != GGMLType.IQ4_XS
+            && type != GGMLType.IQ3_XXS && type != GGMLType.IQ3_S && type != GGMLType.IQ2_S) return null;
 
         // Probe SIMD availability on first call
         if (avail == null) {
@@ -86,7 +99,18 @@ public final class TensorFactory {
         }
 
         try {
-            Constructor<?> ctor = (type == GGMLType.Q4_K) ? simdQ4KCtor : simdQ8_0Ctor;
+            Constructor<?> ctor = null;
+            if (type == GGMLType.Q4_K) ctor = simdQ4KCtor;
+            else if (type == GGMLType.Q8_0) ctor = simdQ8_0Ctor;
+            else if (type == GGMLType.Q6_K) ctor = simdQ6KCtor;
+            else if (type == GGMLType.Q5_0) ctor = simdQ5_0Ctor;
+            else if (type == GGMLType.Q5_K) ctor = simdQ5KCtor;
+            else if (type == GGMLType.Q3_K) ctor = simdQ3KCtor;
+            else if (type == GGMLType.IQ4_NL) ctor = simdIQ4NLCtor;
+            else if (type == GGMLType.IQ4_XS) ctor = simdIQ4XSCtor;
+            else if (type == GGMLType.IQ3_XXS) ctor = simdIQ3XXSCtor;
+            else if (type == GGMLType.IQ3_S) ctor = simdIQ3SCtor;
+            else if (type == GGMLType.IQ2_S) ctor = simdIQ2SCtor;
             if (ctor == null) return null;
             return (FloatTensor) ctor.newInstance(data, elementCount);
         } catch (Exception e) {
@@ -101,24 +125,48 @@ public final class TensorFactory {
             // Check that MemorySegmentTensorData is available (Java 21+)
             Class.forName("it.denzosoft.llmplayer.tensor.MemorySegmentTensorData");
 
-            try {
-                Class<?> cls = Class.forName(base + "SimdQ4_KFloatTensor");
-                simdQ4KCtor = cls.getConstructor(TensorData.class, long.class);
-            } catch (Exception ignored) {}
+            simdQ4KCtor = probeCtor(base + "SimdQ4_KFloatTensor");
+            simdQ8_0Ctor = probeCtor(base + "SimdQ8_0FloatTensor");
+            simdQ6KCtor = probeCtor(base + "SimdQ6_KFloatTensor");
+            simdQ5_0Ctor = probeCtor(base + "SimdQ5_0FloatTensor");
+            simdQ5KCtor = probeCtor(base + "SimdQ5_KFloatTensor");
+            simdQ3KCtor = probeCtor(base + "SimdQ3_KFloatTensor");
+            simdIQ4NLCtor = probeCtor(base + "SimdIQ4_NLFloatTensor");
+            simdIQ4XSCtor = probeCtor(base + "SimdIQ4_XSFloatTensor");
+            simdIQ3XXSCtor = probeCtor(base + "SimdIQ3_XXSFloatTensor");
+            simdIQ3SCtor = probeCtor(base + "SimdIQ3_SFloatTensor");
+            simdIQ2SCtor = probeCtor(base + "SimdIQ2_SFloatTensor");
 
-            try {
-                Class<?> cls = Class.forName(base + "SimdQ8_0FloatTensor");
-                simdQ8_0Ctor = cls.getConstructor(TensorData.class, long.class);
-            } catch (Exception ignored) {}
-
-            simdAvailable = (simdQ4KCtor != null || simdQ8_0Ctor != null);
+            simdAvailable = (simdQ4KCtor != null || simdQ8_0Ctor != null || simdQ6KCtor != null
+                || simdQ5_0Ctor != null || simdQ5KCtor != null || simdQ3KCtor != null
+                || simdIQ4NLCtor != null || simdIQ4XSCtor != null
+                || simdIQ3XXSCtor != null || simdIQ3SCtor != null || simdIQ2SCtor != null);
             if (simdAvailable) {
-                System.out.println("  SIMD tensors: " +
-                    (simdQ4KCtor != null ? "Q4_K " : "") +
-                    (simdQ8_0Ctor != null ? "Q8_0" : ""));
+                StringBuilder sb = new StringBuilder("  SIMD tensors:");
+                if (simdQ4KCtor != null) sb.append(" Q4_K");
+                if (simdQ8_0Ctor != null) sb.append(" Q8_0");
+                if (simdQ6KCtor != null) sb.append(" Q6_K");
+                if (simdQ5_0Ctor != null) sb.append(" Q5_0");
+                if (simdQ5KCtor != null) sb.append(" Q5_K");
+                if (simdQ3KCtor != null) sb.append(" Q3_K");
+                if (simdIQ4NLCtor != null) sb.append(" IQ4_NL");
+                if (simdIQ4XSCtor != null) sb.append(" IQ4_XS");
+                if (simdIQ3XXSCtor != null) sb.append(" IQ3_XXS");
+                if (simdIQ3SCtor != null) sb.append(" IQ3_S");
+                if (simdIQ2SCtor != null) sb.append(" IQ2_S");
+                System.out.println(sb);
             }
         } catch (ClassNotFoundException e) {
             simdAvailable = Boolean.FALSE;
+        }
+    }
+
+    private static Constructor<?> probeCtor(String className) {
+        try {
+            Class<?> cls = Class.forName(className);
+            return cls.getConstructor(TensorData.class, long.class);
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -144,6 +192,8 @@ public final class TensorFactory {
         String base = "it.denzosoft.llmplayer.tensor.";
         boolean cuda = "cuda".equals(gpuBackend);
         if (type == GGMLType.F32) return base + (cuda ? "F32CudaTensor" : "F32GpuTensor");
+        if (type == GGMLType.BF16 && cuda) return base + "BF16CudaTensor";
+        if (type == GGMLType.F16 && cuda) return base + "F16CudaTensor";
         if (type == GGMLType.Q3_K) return base + (cuda ? "Q3_KCudaTensor" : "Q3_KGpuTensor");
         if (type == GGMLType.Q4_K) return base + (cuda ? "Q4_KCudaTensor" : "Q4_KGpuTensor");
         if (type == GGMLType.Q5_K) return base + (cuda ? "Q5_KCudaTensor" : "Q5_KGpuTensor");
@@ -154,6 +204,8 @@ public final class TensorFactory {
         if (type == GGMLType.IQ4_NL && cuda) return base + "IQ4_NLCudaTensor";
         if (type == GGMLType.IQ4_XS && cuda) return base + "IQ4_XSCudaTensor";
         if (type == GGMLType.IQ3_XXS && cuda) return base + "IQ3_XXSCudaTensor";
+        if (type == GGMLType.IQ3_S && cuda) return base + "IQ3_SCudaTensor";
+        if (type == GGMLType.IQ2_S && cuda) return base + "IQ2_SCudaTensor";
         return null; // No GPU version for this type
     }
 }

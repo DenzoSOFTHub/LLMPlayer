@@ -149,6 +149,10 @@ public final class CudaBindings {
     private static final MethodHandle cuMemcpyHtoDAsync_v2 = findCudaIfAvailable("cuMemcpyHtoDAsync_v2",
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
 
+    // CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream)
+    private static final MethodHandle cuMemcpyDtoDAsync_v2 = findCudaIfAvailable("cuMemcpyDtoDAsync_v2",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
     // CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N)
     private static final MethodHandle cuMemsetD32_v2 = findCudaIfAvailable("cuMemsetD32_v2",
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
@@ -359,6 +363,11 @@ public final class CudaBindings {
     public static int memcpyHtoDAsync(long dstDevice, MemorySegment srcHost, long byteCount, MemorySegment stream) {
         try { return (int) cuMemcpyHtoDAsync_v2.invokeExact(dstDevice, srcHost, byteCount, stream); }
         catch (Throwable t) { throw new RuntimeException("cuMemcpyHtoDAsync failed", t); }
+    }
+
+    public static int memcpyDtoDAsync(long dstDevice, long srcDevice, long byteCount, MemorySegment stream) {
+        try { return (int) cuMemcpyDtoDAsync_v2.invokeExact(dstDevice, srcDevice, byteCount, stream); }
+        catch (Throwable t) { throw new RuntimeException("cuMemcpyDtoDAsync failed", t); }
     }
 
     public static int memsetD32(long dstDevice, int ui, long n) {

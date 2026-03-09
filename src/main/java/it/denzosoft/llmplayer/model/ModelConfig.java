@@ -44,6 +44,13 @@ public final class ModelConfig {
     // e.g., 4 means every 4th layer (layer % 4 == 3) is a NoPE layer
     private final int noRopeLayerInterval;
 
+    // GLM-4.7-Flash / DeepSeek-V3: Q-LoRA rank (0 means no Q-LoRA, use direct wq)
+    private final int qLoraRank;
+    // MoE gating function: 0=softmax (DeepSeek V2), 2=sigmoid (GLM-4.7-Flash)
+    private final int expertGatingFunc;
+    // MoE expert weight scale (applied after optional L2 normalization)
+    private final float expertWeightsScale;
+
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
                        float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
@@ -58,7 +65,7 @@ public final class ModelConfig {
              ropeDimensionCount, keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
              expertCount, expertUsedCount, expertSharedCount, expertFfnLength, ropeScalingFactor,
              ropeOrigContextLength, yarnLogMultiplier, finalLogitSoftCap, attnLogitSoftCap, logitScale,
-             slidingWindow, 0, 0, 0, 0, 0, 0, 0);
+             slidingWindow, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f);
     }
 
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
@@ -72,7 +79,8 @@ public final class ModelConfig {
                        int slidingWindow,
                        int ssmConvKernel, int ssmStateSize, int ssmGroupCount,
                        int ssmTimeStepRank, int ssmInnerSize, int fullAttentionInterval,
-                       int noRopeLayerInterval) {
+                       int noRopeLayerInterval,
+                       int qLoraRank, int expertGatingFunc, float expertWeightsScale) {
         this.architecture = architecture;
         this.name = name;
         this.embeddingLength = embeddingLength;
@@ -110,6 +118,9 @@ public final class ModelConfig {
         this.ssmInnerSize = ssmInnerSize;
         this.fullAttentionInterval = fullAttentionInterval;
         this.noRopeLayerInterval = noRopeLayerInterval;
+        this.qLoraRank = qLoraRank;
+        this.expertGatingFunc = expertGatingFunc;
+        this.expertWeightsScale = expertWeightsScale;
     }
 
     public ModelArchitecture architecture() { return architecture; }
@@ -149,6 +160,9 @@ public final class ModelConfig {
     public int ssmInnerSize() { return ssmInnerSize; }
     public int fullAttentionInterval() { return fullAttentionInterval; }
     public int noRopeLayerInterval() { return noRopeLayerInterval; }
+    public int qLoraRank() { return qLoraRank; }
+    public int expertGatingFunc() { return expertGatingFunc; }
+    public float expertWeightsScale() { return expertWeightsScale; }
 
     public static ModelConfig fromMetadata(it.denzosoft.llmplayer.gguf.GGUFMetadata metadata) {
         String archName = metadata.getString("general.architecture", "llama");
@@ -197,6 +211,16 @@ public final class ModelConfig {
         int keyLength = metadata.getInt(prefix + "attention.key_length", headSize);
         int valueLength = metadata.getInt(prefix + "attention.value_length", headSize);
         int kvLoraRank = metadata.getInt(prefix + "attention.kv_lora_rank", 0);
+
+        // For DeepSeek2/GLM-4.7-Flash: key_length_mla / value_length_mla are the per-head MLA dims.
+        // key_length=576 is the compressed KV dim, key_length_mla=256 is the actual per-head key dim.
+        // When present, override keyLength/valueLength for MLA attention.
+        if (arch == ModelArchitecture.DEEPSEEK2) {
+            int keyLengthMla = metadata.getInt(prefix + "attention.key_length_mla", 0);
+            int valueLengthMla = metadata.getInt(prefix + "attention.value_length_mla", 0);
+            if (keyLengthMla > 0) keyLength = keyLengthMla;
+            if (valueLengthMla > 0) valueLength = valueLengthMla;
+        }
 
         // Override headSize when metadata specifies a different key_length
         // (e.g., Mistral3/Devstral: embeddingLength/headCount=160 but keyLength=128,
@@ -257,6 +281,15 @@ public final class ModelConfig {
         // Default 4 for Llama4 (layers where layer % 4 == 3 skip RoPE), 0 for all others
         int noRopeLayerInterval = (arch == ModelArchitecture.LLAMA4) ? 4 : 0;
 
+        // Q-LoRA rank (GLM-4.7-Flash / DeepSeek-V3: decompose Q into Q_A * Q_B)
+        int qLoraRank = metadata.getInt(prefix + "attention.q_lora_rank", 0);
+
+        // MoE gating function: 0=softmax (default/DeepSeek V2), 2=sigmoid (GLM-4.7-Flash)
+        int expertGatingFunc = metadata.getInt(prefix + "expert_gating_func", 0);
+
+        // MoE expert weight scale (applied after optional L2 normalization)
+        float expertWeightsScale = metadata.getFloat(prefix + "expert_weights_scale", 1.0f);
+
         return new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
             contextLength, vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim,
             ropeType, ropeDimensionCount,
@@ -265,7 +298,8 @@ public final class ModelConfig {
             ropeScalingFactor, ropeOrigContextLength, yarnLogMultiplier,
             finalLogitSoftCap, attnLogitSoftCap, logitScale, slidingWindow,
             ssmConvKernel, ssmStateSize, ssmGroupCount, ssmTimeStepRank, ssmInnerSize,
-            fullAttentionInterval, noRopeLayerInterval);
+            fullAttentionInterval, noRopeLayerInterval,
+            qLoraRank, expertGatingFunc, expertWeightsScale);
     }
 
     @Override

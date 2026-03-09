@@ -82,6 +82,7 @@ public class CudaForwardPass implements AutoCloseable {
     // Per-layer post-attention/FFN norm weight buffers (null if no post-norm, Gemma2/3)
     private final long[] gpuPostAttnNormWeights;
     private final long[] gpuPostFfnNormWeights;
+    private final boolean hasPreNorm;
     private final boolean hasPostNorm;
     private final ParamBuffer postNormPB; // null if no post-norm
 
@@ -225,6 +226,13 @@ public class CudaForwardPass implements AutoCloseable {
     // Output projection launch descriptor
     private final MatmulLaunch outputMatmul; // null if output not on GPU
 
+    // Packed FFN support (Phi-3/4): wGate is null, wUp outputs 2*ffnDim, split into gate+up
+    private final boolean hasPackedFFN;
+    private final long gpuHbPacked;          // GPU buffer for packed gate+up output (0 if not packed)
+    private final MemorySegment splitGateUpFunc; // null if not packed
+    private final ParamBuffer splitGateUpPB;     // null if not packed
+    private final int splitGateUpGridDim;
+
     // Pre-computed auxiliary kernel grid sizes
     private final int normNumWarps;
     private final int normSharedMem;
@@ -295,11 +303,14 @@ public class CudaForwardPass implements AutoCloseable {
         gpuCosTable = uploadFloatArray(cosTable);
         gpuSinTable = uploadFloatArray(sinTable);
 
-        // Allocate GPU KV cache (per-layer)
-        gpuKeyCache = new long[blockCount];
-        gpuValueCache = new long[blockCount];
+        // Determine how many layers are on GPU (partial offload support)
+        this.gpuLayerCount = countGpuLayers(weights);
+
+        // Allocate GPU KV cache (only for GPU layers)
+        gpuKeyCache = new long[gpuLayerCount];
+        gpuValueCache = new long[gpuLayerCount];
         long kvLayerBytes = (long) maxSeqLen * kvDim * fb;
-        for (int i = 0; i < blockCount; i++) {
+        for (int i = 0; i < gpuLayerCount; i++) {
             gpuKeyCache[i] = bufferManager.createBuffer(kvLayerBytes);
             gpuValueCache[i] = bufferManager.createBuffer(kvLayerBytes);
             cudaContext.fillBufferZero(gpuKeyCache[i], kvLayerBytes);
@@ -310,6 +321,7 @@ public class CudaForwardPass implements AutoCloseable {
         TransformerLayerWeights firstLayer = weights.layers()[0];
         hasBias = firstLayer.qBias() != null;
         hasQKNorm = firstLayer.qNorm() != null;
+        hasPreNorm = firstLayer.attnNorm() != null;
         hasPostNorm = firstLayer.postAttnNorm() != null;
         hasMergedQKV = firstLayer.wqkv() != null;
 
@@ -320,6 +332,15 @@ public class CudaForwardPass implements AutoCloseable {
         } else {
             this.qkvDim = 0;
             gpuQKV = 0;
+        }
+
+        // Detect and allocate packed FFN (Phi-3/4): wGate is null, wUp outputs 2*ffnDim
+        hasPackedFFN = firstLayer.wGate() == null;
+        if (hasPackedFFN) {
+            gpuHbPacked = bufferManager.createBuffer(2L * ffnDim * fb);
+            System.err.println("CUDA: packed FFN detected (Phi-3/4), allocated 2*ffnDim buffer");
+        } else {
+            gpuHbPacked = 0;
         }
 
         // Compile auxiliary CUDA kernels
@@ -339,6 +360,21 @@ public class CudaForwardPass implements AutoCloseable {
             splitQkvFunc = null;
         }
 
+        // Compile split_gate_up kernel (for packed FFN — Phi-3/4)
+        if (hasPackedFFN) {
+            splitGateUpFunc = cudaContext.compileKernel("kernels/cuda/split_gate_up.cu", "split_gate_up");
+            splitGateUpPB = new ParamBuffer(arena, 4);
+            splitGateUpPB.setLong(0, gpuHbPacked);
+            splitGateUpPB.setLong(1, gpuHb);
+            splitGateUpPB.setLong(2, gpuHb2);
+            splitGateUpPB.setInt(3, ffnDim);
+            splitGateUpGridDim = (int) ((ffnDim + blockSize - 1) / blockSize);
+        } else {
+            splitGateUpFunc = null;
+            splitGateUpPB = null;
+            splitGateUpGridDim = 0;
+        }
+
         // Compile per-head norm kernel (for QK-norm)
         if (hasQKNorm) {
             perHeadNormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm_per_head.cu", "rmsnorm_per_head");
@@ -353,10 +389,10 @@ public class CudaForwardPass implements AutoCloseable {
         } catch (Exception ignored) {}
         fusedGateUpFunc = fusedFunc;
 
-        // Upload per-layer norm weights to GPU
-        gpuAttnNormWeights = new long[blockCount];
-        gpuFfnNormWeights = new long[blockCount];
-        for (int i = 0; i < blockCount; i++) {
+        // Upload per-layer norm weights to GPU (only GPU layers)
+        gpuAttnNormWeights = new long[gpuLayerCount];
+        gpuFfnNormWeights = new long[gpuLayerCount];
+        for (int i = 0; i < gpuLayerCount; i++) {
             TransformerLayerWeights layer = weights.layers()[i];
             if (layer.attnNorm() != null) {
                 gpuAttnNormWeights[i] = uploadNormWeights(layer.attnNorm(), dim);
@@ -368,10 +404,10 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Upload per-layer QKV bias tensors to GPU (if present)
         if (hasBias) {
-            gpuQBias = new long[blockCount];
-            gpuKBias = new long[blockCount];
-            gpuVBias = new long[blockCount];
-            for (int i = 0; i < blockCount; i++) {
+            gpuQBias = new long[gpuLayerCount];
+            gpuKBias = new long[gpuLayerCount];
+            gpuVBias = new long[gpuLayerCount];
+            for (int i = 0; i < gpuLayerCount; i++) {
                 TransformerLayerWeights layer = weights.layers()[i];
                 gpuQBias[i] = uploadBiasWeights(layer.qBias(), qDim);
                 gpuKBias[i] = uploadBiasWeights(layer.kBias(), kvDim);
@@ -385,9 +421,9 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Upload per-layer QK-norm weights to GPU (if present, Qwen3/Gemma3)
         if (hasQKNorm) {
-            gpuQNormWeights = new long[blockCount];
-            gpuKNormWeights = new long[blockCount];
-            for (int i = 0; i < blockCount; i++) {
+            gpuQNormWeights = new long[gpuLayerCount];
+            gpuKNormWeights = new long[gpuLayerCount];
+            for (int i = 0; i < gpuLayerCount; i++) {
                 TransformerLayerWeights layer = weights.layers()[i];
                 gpuQNormWeights[i] = uploadNormWeights(layer.qNorm(), headSize);
                 gpuKNormWeights[i] = uploadNormWeights(layer.kNorm(), headSize);
@@ -399,9 +435,9 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Upload per-layer post-attention/FFN norm weights to GPU (if present, Gemma2/3)
         if (hasPostNorm) {
-            gpuPostAttnNormWeights = new long[blockCount];
-            gpuPostFfnNormWeights = new long[blockCount];
-            for (int i = 0; i < blockCount; i++) {
+            gpuPostAttnNormWeights = new long[gpuLayerCount];
+            gpuPostFfnNormWeights = new long[gpuLayerCount];
+            for (int i = 0; i < gpuLayerCount; i++) {
                 TransformerLayerWeights layer = weights.layers()[i];
                 gpuPostAttnNormWeights[i] = uploadNormWeights(layer.postAttnNorm(), dim);
                 gpuPostFfnNormWeights[i] = uploadNormWeights(layer.postFfnNorm(), dim);
@@ -564,12 +600,12 @@ public class CudaForwardPass implements AutoCloseable {
         this.perHeadNormBlockDim = hasQKNorm ? (int) Math.min(Math.max(32, ((headSize + 31) / 32) * 32), blockSize) : 0;
         this.perHeadNormSharedMem = hasQKNorm ? ((perHeadNormBlockDim / 32) + 1) * Float.BYTES : 0;
 
-        // === Pre-compute per-layer matmul launch descriptors ===
-        layerMatmuls = new MatmulLaunch[blockCount][7];
+        // === Pre-compute per-layer matmul launch descriptors (only GPU layers) ===
+        layerMatmuls = new MatmulLaunch[gpuLayerCount][7];
         boolean canFuseGateUp = fusedGateUpFunc != null;
-        long[] fGateWeights = canFuseGateUp ? new long[blockCount] : null;
-        long[] fUpWeights = canFuseGateUp ? new long[blockCount] : null;
-        for (int i = 0; i < blockCount; i++) {
+        long[] fGateWeights = canFuseGateUp ? new long[gpuLayerCount] : null;
+        long[] fUpWeights = canFuseGateUp ? new long[gpuLayerCount] : null;
+        for (int i = 0; i < gpuLayerCount; i++) {
             TransformerLayerWeights layer = weights.layers()[i];
             if (hasMergedQKV) {
                 // Merged QKV: single matmul wqkv → gpuQKV, then split kernel
@@ -585,13 +621,19 @@ public class CudaForwardPass implements AutoCloseable {
             // Pre-norm: Wo/Down accumulate directly to gpuX (addToOutput=1)
             layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) layer.wo(), gpuXb2,
                     hasPostNorm ? gpuXb : gpuX, dim, qDim, hasPostNorm ? 0 : 1);
-            layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0);
-            layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
+            if (hasPackedFFN) {
+                // Packed FFN: no gate weight, wUp outputs 2*ffnDim → gpuHbPacked, then split kernel
+                layerMatmuls[i][4] = null;
+                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHbPacked, ffnDim * 2, dim, 0);
+            } else {
+                layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0);
+                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
+            }
             layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) layer.wDown(), gpuHb,
                     hasPostNorm ? gpuXb : gpuX, dim, ffnDim, hasPostNorm ? 0 : 1);
 
-            // Check if gate and up are both Q4_K for fused kernel
-            if (canFuseGateUp && layer.wGate() instanceof CudaFloatTensor && layer.wUp() instanceof CudaFloatTensor) {
+            // Check if gate and up are both Q4_K for fused kernel (not applicable for packed FFN)
+            if (canFuseGateUp && !hasPackedFFN && layer.wGate() instanceof CudaFloatTensor && layer.wUp() instanceof CudaFloatTensor) {
                 CudaFloatTensor gate = (CudaFloatTensor) layer.wGate();
                 CudaFloatTensor up = (CudaFloatTensor) layer.wUp();
                 if (gate.type() == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K
@@ -615,7 +657,7 @@ public class CudaForwardPass implements AutoCloseable {
             int warpsPerBlock = fusedBlockDimVal / 32;
             fusedGateUpGridDim = (totalRows + warpsPerBlock - 1) / warpsPerBlock;
             fusedGateUpBlockDim = fusedBlockDimVal;
-            System.err.println("CUDA: fused gate+up Q4_K kernel enabled (" + blockCount + " layers)");
+            System.err.println("CUDA: fused gate+up Q4_K kernel enabled (" + gpuLayerCount + " layers)");
         } else {
             fusedGateUpGridDim = 0;
             fusedGateUpBlockDim = 0;
@@ -663,15 +705,18 @@ public class CudaForwardPass implements AutoCloseable {
 
     /**
      * Check if the CUDA forward pass can handle this model configuration.
+     * Returns true if at least the first layer has CudaFloatTensor weights (partial offload OK).
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
         if (config.expertCount() > 0) return false;
 
         TransformerLayerWeights firstLayer = weights.layers()[0];
-        if (firstLayer.attnNorm() == null) return false;
-        if (firstLayer.ffnNorm() == null) return false;
-        if (firstLayer.wGate() == null) return false; // packed FFN (Phi-3/4) not yet supported
-        // All weight tensors must be CudaFloatTensor — merged QKV or separate Q/K/V
+        // Require at least pre-norm or post-norm for attention and FFN
+        boolean hasPreNorm = firstLayer.attnNorm() != null && firstLayer.ffnNorm() != null;
+        boolean hasPostNorm = firstLayer.postAttnNorm() != null && firstLayer.postFfnNorm() != null;
+        if (!hasPreNorm && !hasPostNorm) return false;
+
+        // First layer weight tensors must be CudaFloatTensor — merged QKV or separate Q/K/V
         if (firstLayer.wqkv() != null) {
             if (!(firstLayer.wqkv() instanceof CudaFloatTensor)) return false;
         } else {
@@ -680,12 +725,40 @@ public class CudaForwardPass implements AutoCloseable {
             if (!(firstLayer.wv() instanceof CudaFloatTensor)) return false;
         }
         if (!(firstLayer.wo() instanceof CudaFloatTensor)) return false;
-        if (!(firstLayer.wGate() instanceof CudaFloatTensor)) return false;
+        // Packed FFN (Phi-3/4): wGate is null, wUp produces 2*ffnDim output
+        if (firstLayer.wGate() != null) {
+            if (!(firstLayer.wGate() instanceof CudaFloatTensor)) return false;
+        }
         if (!(firstLayer.wUp() instanceof CudaFloatTensor)) return false;
         if (!(firstLayer.wDown() instanceof CudaFloatTensor)) return false;
 
         return true;
     }
+
+    /**
+     * Count consecutive GPU-offloaded layers starting from layer 0.
+     * Used by InferenceEngine to know which layers to forward on GPU vs CPU.
+     */
+    public static int countGpuLayers(ModelWeights weights) {
+        int count = 0;
+        for (TransformerLayerWeights layer : weights.layers()) {
+            // Check the main weight tensor (wo is always present)
+            if (layer.wo() instanceof CudaFloatTensor) {
+                count++;
+            } else {
+                break; // first-N-layers strategy: contiguous from layer 0
+            }
+        }
+        return count;
+    }
+
+    /** Number of layers handled by this CudaForwardPass instance. */
+    public int getGpuLayerCount() {
+        return gpuLayerCount;
+    }
+
+    // Number of transformer layers on GPU (may be less than blockCount for partial offload)
+    private final int gpuLayerCount;
 
     public void uploadX(float[] x) {
         long t0 = 0;
@@ -788,7 +861,7 @@ public class CudaForwardPass implements AutoCloseable {
                 cudaContext.beginCapture();
                 capturing = true;
 
-                for (int layer = 0; layer < blockCount; layer++) {
+                for (int layer = 0; layer < gpuLayerCount; layer++) {
                     forwardLayerKernels(layer);
                 }
 
@@ -801,7 +874,7 @@ public class CudaForwardPass implements AutoCloseable {
                 graphExec = cudaContext.instantiateGraph(graph);
                 cudaContext.destroyGraph(graph);
 
-                System.err.println("CUDA graph: captured " + blockCount + " layers + output projection");
+                System.err.println("CUDA graph: captured " + gpuLayerCount + " layers + output projection (argmax)");
             } catch (Exception e) {
                 if (capturing) {
                     try { cudaContext.endCapture(); } catch (Exception ignored) {}
@@ -840,7 +913,7 @@ public class CudaForwardPass implements AutoCloseable {
      */
     public void printProfile() {
         if (profTokens == 0) return;
-        System.err.printf("CUDA profile (%d tokens, %d layers):%n", profTokens, blockCount);
+        System.err.printf("CUDA profile (%d tokens, %d GPU layers):%n", profTokens, gpuLayerCount);
         System.err.printf("  attnNorm: %6.2f ms/tok  QKV: %6.2f ms/tok  ropeKv: %6.2f ms/tok%n",
             profAttnNorm / 1e6 / profTokens, profQKV / 1e6 / profTokens, profRopeKv / 1e6 / profTokens);
         System.err.printf("  attn:     %6.2f ms/tok  Wo:  %6.2f ms/tok%n",
@@ -871,9 +944,13 @@ public class CudaForwardPass implements AutoCloseable {
 
         // === Attention Phase ===
 
-        // 1. RMSNorm (attnNorm): gpuX → gpuXb
-        normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        // 1. RMSNorm (attnNorm): gpuX → gpuXb  (or plain copy for post-norm-only models like OLMo2)
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
 
         // 2. Q/K/V projections (write mode)
         if (hasMergedQKV) {
@@ -925,12 +1002,19 @@ public class CudaForwardPass implements AutoCloseable {
             launchBias(gpuX, gpuXb, dim, numWorkGroups);
         }
 
-        // 7. FFN RMSNorm: gpuX → gpuXb
-        normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        // 7. FFN RMSNorm: gpuX → gpuXb  (or plain copy for post-norm-only)
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
 
-        // 8. Gate + Up projections (write mode) — fused or separate
-        if (useFusedGateUp) {
+        // 8. Gate + Up projections (write mode) — packed FFN, fused, or separate
+        if (hasPackedFFN) {
+            launchMatmul(ml[5]);
+            launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useFusedGateUp) {
             launchFusedGateUp(layerIdx);
         } else {
             launchMatmul(ml[4]); // gate
@@ -957,8 +1041,12 @@ public class CudaForwardPass implements AutoCloseable {
         long t0 = System.nanoTime(), t1;
         long tTotal = t0;
 
-        normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
         cudaContext.finish(); t1 = System.nanoTime(); profAttnNorm += t1 - t0; t0 = t1;
 
         if (hasMergedQKV) {
@@ -1001,11 +1089,18 @@ public class CudaForwardPass implements AutoCloseable {
         }
         cudaContext.finish(); t1 = System.nanoTime(); profWo += t1 - t0; t0 = t1;
 
-        normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
         cudaContext.finish(); t1 = System.nanoTime(); profFfnNorm += t1 - t0; t0 = t1;
 
-        if (useFusedGateUp) {
+        if (hasPackedFFN) {
+            launchMatmul(ml[5]);
+            launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useFusedGateUp) {
             launchFusedGateUp(layerIdx);
         } else {
             launchMatmul(ml[4]);
@@ -1057,7 +1152,7 @@ public class CudaForwardPass implements AutoCloseable {
                 cudaContext.beginCapture();
                 capturing = true;
 
-                for (int layer = 0; layer < blockCount; layer++) {
+                for (int layer = 0; layer < gpuLayerCount; layer++) {
                     forwardLayerKernels(layer);
                 }
 
@@ -1071,7 +1166,7 @@ public class CudaForwardPass implements AutoCloseable {
                 graphExec = cudaContext.instantiateGraph(graph);
                 cudaContext.destroyGraph(graph);
 
-                System.err.println("CUDA graph: captured " + blockCount + " layers + output projection");
+                System.err.println("CUDA graph: captured " + gpuLayerCount + " layers + output projection");
             } catch (Exception e) {
                 if (capturing) {
                     try { cudaContext.endCapture(); } catch (Exception ignored) {}
@@ -1099,9 +1194,13 @@ public class CudaForwardPass implements AutoCloseable {
     private void forwardLayerKernels(int layerIdx) {
         MatmulLaunch[] ml = layerMatmuls[layerIdx];
 
-        // Attention norm
-        normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        // Attention norm (or plain copy for post-norm-only)
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
 
         // QKV projections
         if (hasMergedQKV) {
@@ -1158,12 +1257,20 @@ public class CudaForwardPass implements AutoCloseable {
             launchBias(gpuX, gpuXb, dim, numWorkGroups);
         }
 
-        // FFN norm
-        normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-        launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        // FFN norm (or plain copy for post-norm-only)
+        if (hasPreNorm) {
+            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        } else {
+            cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+        }
 
-        // Gate + Up projections — fused or separate
-        if (useFusedGateUp) {
+        // Gate + Up projections — packed FFN, fused, or separate
+        if (hasPackedFFN) {
+            // Single wUp matmul → gpuHbPacked (2*ffnDim), then split into gpuHb + gpuHb2
+            launchMatmul(ml[5]);
+            launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useFusedGateUp) {
             launchFusedGateUp(layerIdx);
         } else {
             launchMatmul(ml[4]);

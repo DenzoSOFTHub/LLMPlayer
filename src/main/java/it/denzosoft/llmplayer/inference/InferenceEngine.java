@@ -42,6 +42,7 @@ public class InferenceEngine {
     private java.lang.reflect.Method cachedForwardFinalLogits;
     private java.lang.reflect.Method cachedForwardFinalArgmax;
     private java.lang.reflect.Method cachedDownloadX;
+    private int gpuLayerCount;  // number of layers on GPU (for partial offload)
 
     public InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen) {
         this(config, weights, maxSeqLen, null);
@@ -105,7 +106,7 @@ public class InferenceEngine {
                 ModelConfig.class, ModelWeights.class);
             boolean supported = (boolean) isSupported.invoke(null, config, weights);
             if (!supported) {
-                System.out.println("GPU chain (" + label + "): model not supported (requires pre-norm dense with separate Q/K/V, full GPU offload)");
+                System.out.println("GPU chain (" + label + "): model not supported (requires pre-norm dense with separate Q/K/V, at least 1 GPU layer)");
                 return false;
             }
             // Try 5-param constructor (with Attention + maxSeqLen for GPU attention)
@@ -117,7 +118,18 @@ public class InferenceEngine {
                 gpuForwardPass = (AutoCloseable) ctors[0]
                     .newInstance(config, weights, bufferManager);
             }
-            System.out.println("GPU chain: enabled — " + label + " GPU-resident forward pass active");
+            // Get GPU layer count for partial offload support
+            try {
+                java.lang.reflect.Method getGpuLayerCount = fpClass.getMethod("getGpuLayerCount");
+                gpuLayerCount = (int) getGpuLayerCount.invoke(gpuForwardPass);
+            } catch (NoSuchMethodException ignored) {
+                gpuLayerCount = config.blockCount(); // fallback: assume full offload
+            }
+            if (gpuLayerCount < config.blockCount()) {
+                System.out.println("GPU chain: enabled — " + label + " partial offload (" + gpuLayerCount + "/" + config.blockCount() + " layers on GPU)");
+            } else {
+                System.out.println("GPU chain: enabled — " + label + " GPU-resident forward pass active");
+            }
             // Cache Method handles for hot path (avoids per-token getMethod overhead)
             cacheGpuMethods(fpClass);
             return true;
@@ -149,8 +161,20 @@ public class InferenceEngine {
      * Returns logits array (part of InferenceState, do not modify externally).
      */
     public float[] forward(InferenceState state, int token, int position) {
+        return forwardInternal(state, token, position, true);
+    }
+
+    /**
+     * Run forward pass through transformer layers only (no output projection).
+     * Used during prefill for all tokens except the last, since logits are only
+     * needed for the final token. Saves vocabSize * dim multiply-adds per token.
+     */
+    public void forwardNoOutput(InferenceState state, int token, int position) {
+        forwardInternal(state, token, position, false);
+    }
+
+    private float[] forwardInternal(InferenceState state, int token, int position, boolean computeLogits) {
         int dim = config.embeddingLength();
-        int vocabSize = config.vocabSize();
 
         // 1. Token embedding lookup
         for (int i = 0; i < dim; i++) {
@@ -173,6 +197,12 @@ public class InferenceEngine {
                 block.forward(state, weights.layers()[layer], layer, position);
             }
         }
+
+        if (!computeLogits) {
+            return null;
+        }
+
+        int vocabSize = config.vocabSize();
 
         if (!logitsDone) {
             // 3. Final RMSNorm
@@ -246,31 +276,38 @@ public class InferenceEngine {
                 }
             }
 
-            // Try CUDA graph mode first (all layers + output in single API call)
-            if (cachedForwardGraph != null) {
+            // Try CUDA graph mode first (all GPU layers + output in single API call)
+            if (cachedForwardGraph != null && gpuLayerCount == config.blockCount()) {
                 boolean done = (boolean) cachedForwardGraph.invoke(gpuForwardPass, state.logits);
                 if (done) return true;
             }
 
-            // Fall back to per-layer mode
-            for (int layer = 0; layer < config.blockCount(); layer++) {
+            // Per-layer mode: run GPU layers via CudaForwardPass
+            for (int layer = 0; layer < gpuLayerCount; layer++) {
                 cachedForwardLayer.invoke(gpuForwardPass, state, weights.layers()[layer], layer, position, attention);
             }
 
-            // Try final RMSNorm + output projection on GPU
-            if (cachedForwardFinalLogits != null) {
+            // If all layers are on GPU, try final RMSNorm + output projection on GPU
+            if (gpuLayerCount == config.blockCount() && cachedForwardFinalLogits != null) {
                 boolean done = (boolean) cachedForwardFinalLogits.invoke(gpuForwardPass, state.logits);
                 if (done) return true;
             }
 
-            // Fall back: download X and let CPU handle final steps
+            // Download X from GPU for CPU layers or final steps
             cachedDownloadX.invoke(gpuForwardPass, state.x);
+
+            // Run remaining CPU layers (partial offload)
+            for (int layer = gpuLayerCount; layer < config.blockCount(); layer++) {
+                block.forward(state, weights.layers()[layer], layer, position);
+            }
+
             return false;
         } catch (Exception e) {
             Throwable cause = e;
             while (cause.getCause() != null) cause = cause.getCause();
-            System.err.println("GPU chain: forward failed, falling back to CPU — " + cause);
+            System.err.println("GPU chain: forward failed, permanently disabling GPU forward pass — " + cause);
             cause.printStackTrace(System.err);
+            gpuForwardPass = null;  // Prevent repeated GPU failures on subsequent tokens
             for (int layer = 0; layer < config.blockCount(); layer++) {
                 block.forward(state, weights.layers()[layer], layer, position);
             }
@@ -280,13 +317,17 @@ public class InferenceEngine {
 
     /**
      * Prefill: process multiple tokens (prompt) and return logits for the last token.
+     * Skips the output projection (final RMSNorm + vocabSize matmul) for all tokens
+     * except the last, since only the last token's logits are needed for generation.
+     * This saves vocabSize * dim multiply-adds per skipped token.
      */
     public float[] prefill(InferenceState state, int[] tokens) {
-        float[] logits = null;
-        for (int i = 0; i < tokens.length; i++) {
-            logits = forward(state, tokens[i], i);
+        // Process all but the last token without computing logits
+        for (int i = 0; i < tokens.length - 1; i++) {
+            forwardNoOutput(state, tokens[i], i);
         }
-        return logits;
+        // Only compute logits for the last token
+        return forward(state, tokens[tokens.length - 1], tokens.length - 1);
     }
 
     /**

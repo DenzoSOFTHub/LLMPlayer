@@ -175,9 +175,26 @@ public class SentencePieceTokenizer implements Tokenizer {
 
     @Override
     public String decode(int[] tokens) {
+        // Accumulate bytes from consecutive <0xHH> tokens and decode as UTF-8 together.
+        // This correctly handles multi-byte UTF-8 characters split across byte tokens
+        // (e.g., 'é' = <0xC3><0xA9> → two tokens that must be decoded jointly).
         StringBuilder sb = new StringBuilder();
+        List<Byte> pendingBytes = new ArrayList<>();
         for (int token : tokens) {
-            sb.append(decode(token));
+            if (token < 0 || token >= vocab.length) continue;
+            String piece = vocab[token];
+            if (isByteToken(piece)) {
+                pendingBytes.add((byte) Integer.parseInt(piece.substring(3, 5), 16));
+            } else {
+                if (!pendingBytes.isEmpty()) {
+                    sb.append(flushBytes(pendingBytes));
+                    pendingBytes.clear();
+                }
+                sb.append(piece.replace(SPACE_REPLACEMENT, ' '));
+            }
+        }
+        if (!pendingBytes.isEmpty()) {
+            sb.append(flushBytes(pendingBytes));
         }
         return sb.toString();
     }
@@ -188,13 +205,27 @@ public class SentencePieceTokenizer implements Tokenizer {
         String piece = vocab[token];
 
         // Handle byte tokens <0xHH>
-        if (piece.startsWith("<0x") && piece.endsWith(">") && piece.length() == 6) {
+        // Single byte decode uses ISO-8859-1 to preserve the byte value.
+        // For multi-byte UTF-8 chars split across tokens, decode(int[]) handles them correctly.
+        if (isByteToken(piece)) {
             int byteVal = Integer.parseInt(piece.substring(3, 5), 16);
-            return new String(new byte[]{(byte) byteVal}, StandardCharsets.UTF_8);
+            return new String(new byte[]{(byte) byteVal}, StandardCharsets.ISO_8859_1);
         }
 
         // Replace ▁ back to space
         return piece.replace(SPACE_REPLACEMENT, ' ');
+    }
+
+    private static boolean isByteToken(String piece) {
+        return piece.length() == 6 && piece.startsWith("<0x") && piece.charAt(5) == '>';
+    }
+
+    private static String flushBytes(List<Byte> bytes) {
+        byte[] arr = new byte[bytes.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = bytes.get(i);
+        }
+        return new String(arr, StandardCharsets.UTF_8);
     }
 
     @Override

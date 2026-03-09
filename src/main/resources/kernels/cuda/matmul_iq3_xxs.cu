@@ -74,6 +74,15 @@ __device__ __constant__ unsigned int IQ3XXS_GRID[256] = {
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04
 };
 
+// Byte-level reads for unaligned access (98 bytes/block is NOT 4-byte aligned)
+__device__ __forceinline__ unsigned short read_u16(const unsigned char* p) {
+    return (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+}
+__device__ __forceinline__ unsigned int read_u32(const unsigned char* p) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+           ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
 extern "C" __global__ void matmul_iq3_xxs(
     const unsigned char* __restrict__ weights,
     const float* __restrict__ input,
@@ -94,7 +103,7 @@ extern "C" __global__ void matmul_iq3_xxs(
 
     for (int sb = lane; sb < numSuperBlocks; sb += 32) {
         int bo = row * rowStride + sb * 98;
-        float d = half2float(*(unsigned short*)(weights + bo));
+        float d = half2float(read_u16(weights + bo));
 
         int qsBase = bo + 2;          // 64 bytes of grid indices
         int sasBase = bo + 2 + 64;    // 32 bytes of scales_and_signs
@@ -103,8 +112,8 @@ extern "C" __global__ void matmul_iq3_xxs(
         // 8 groups of 32 weights
         #pragma unroll
         for (int ib32 = 0; ib32 < 8; ib32++) {
-            // Read uint32 scale_and_signs for this group
-            unsigned int aux32 = *(unsigned int*)(weights + sasBase + 4 * ib32);
+            // Read uint32 scale_and_signs for this group (byte-level for alignment safety)
+            unsigned int aux32 = read_u32(weights + sasBase + 4 * ib32);
             float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
 
             // 4 sub-groups of 8 within each group of 32

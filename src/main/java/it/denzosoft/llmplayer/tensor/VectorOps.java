@@ -22,4 +22,30 @@ public interface VectorOps {
     void silu(float[] x, int size);
 
     void accumulate(float[] y, float[] x, int size);
+
+    /**
+     * In-place scale with weights: x[xOff+i] = x[xOff+i] * scale * w[i] for i in [0, size).
+     * Used for per-head QK-norm scaling phase.
+     */
+    default void scaleWeighted(float[] x, int xOff, float[] w, float scale, int size) {
+        for (int i = 0; i < size; i++) {
+            x[xOff + i] = x[xOff + i] * scale * w[i];
+        }
+    }
+
+    /**
+     * Apply RoPE rotation in NEOX (split-half) mode for one head.
+     * vec[off+i] and vec[off+halfRope+i] are the paired elements.
+     * cos/sin are read from tables at cosOff+i.
+     */
+    default void ropeNeox(float[] vec, int off, float[] cos, float[] sin, int cosOff, int halfRope) {
+        for (int i = 0; i < halfRope; i++) {
+            float c = cos[cosOff + i];
+            float s = sin[cosOff + i];
+            float v0 = vec[off + i];
+            float v1 = vec[off + halfRope + i];
+            vec[off + i] = v0 * c - v1 * s;
+            vec[off + halfRope + i] = v0 * s + v1 * c;
+        }
+    }
 }

@@ -26,6 +26,9 @@ public class DeepSeek2State {
     public final float[] kvDecompressed; // [headCount * (keyNope + valueLen)] - output of wkvB
     public final float[] kRopeTemp;      // [ropeDim] - temporary for k_rope rotation
     public final float[] att;            // [headCount * maxSeqLen]
+    // Q-LoRA buffers (GLM-4.7-Flash / DeepSeek-V3)
+    public final float[] qCompressed;    // [qLoraRank] - output of wqA
+    public final float[] qCompressedNorm;// [qLoraRank] - after RMSNorm
 
     // KV cache: separate key and value dimensions
     public final float[][] keyCache;     // [layers][maxSeqLen * headCount * keyLength]
@@ -83,6 +86,10 @@ public class DeepSeek2State {
         this.kvDecompressed = new float[headCount * (keyNope + valueLength)];
         this.kRopeTemp = new float[ropeDim];
         this.att = new float[headCount * maxSeqLen];
+        // Q-LoRA (GLM-4.7-Flash / DeepSeek-V3)
+        int qLoraRank = config.qLoraRank();
+        this.qCompressed = new float[Math.max(qLoraRank, 1)];
+        this.qCompressedNorm = new float[Math.max(qLoraRank, 1)];
 
         // KV caches
         this.keyCache = new float[blockCount][maxSeqLen * totalKeyDim];

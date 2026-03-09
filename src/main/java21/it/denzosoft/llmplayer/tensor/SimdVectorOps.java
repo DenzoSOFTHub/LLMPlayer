@@ -145,4 +145,43 @@ public final class SimdVectorOps implements VectorOps {
             y[i] += x[i];
         }
     }
+
+    @Override
+    public void scaleWeighted(float[] x, int xOff, float[] w, float scale, int size) {
+        FloatVector vScale = FloatVector.broadcast(SPECIES, scale);
+        int i = 0;
+        int upperBound = SPECIES.loopBound(size);
+        for (; i < upperBound; i += SPECIES_LENGTH) {
+            FloatVector vx = FloatVector.fromArray(SPECIES, x, xOff + i);
+            FloatVector vw = FloatVector.fromArray(SPECIES, w, i);
+            vx.mul(vScale).mul(vw).intoArray(x, xOff + i);
+        }
+        for (; i < size; i++) {
+            x[xOff + i] = x[xOff + i] * scale * w[i];
+        }
+    }
+
+    @Override
+    public void ropeNeox(float[] vec, int off, float[] cos, float[] sin, int cosOff, int halfRope) {
+        int i = 0;
+        int upperBound = SPECIES.loopBound(halfRope);
+        for (; i < upperBound; i += SPECIES_LENGTH) {
+            FloatVector vc = FloatVector.fromArray(SPECIES, cos, cosOff + i);
+            FloatVector vs = FloatVector.fromArray(SPECIES, sin, cosOff + i);
+            FloatVector v0 = FloatVector.fromArray(SPECIES, vec, off + i);
+            FloatVector v1 = FloatVector.fromArray(SPECIES, vec, off + halfRope + i);
+            // vec[off+i]          = v0 * cos - v1 * sin
+            // vec[off+halfRope+i] = v0 * sin + v1 * cos
+            v0.mul(vc).sub(v1.mul(vs)).intoArray(vec, off + i);
+            v0.mul(vs).add(v1.mul(vc)).intoArray(vec, off + halfRope + i);
+        }
+        for (; i < halfRope; i++) {
+            float c = cos[cosOff + i];
+            float s = sin[cosOff + i];
+            float val0 = vec[off + i];
+            float val1 = vec[off + halfRope + i];
+            vec[off + i] = val0 * c - val1 * s;
+            vec[off + halfRope + i] = val0 * s + val1 * c;
+        }
+    }
 }

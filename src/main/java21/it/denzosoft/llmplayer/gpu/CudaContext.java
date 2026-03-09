@@ -273,6 +273,7 @@ public class CudaContext implements AutoCloseable {
             {"kernels/cuda/matmul_q4_k_fused_gate_up.cu", "matmul_q4_k_fused_gate_up"},
             {"kernels/cuda/argmax.cu", "argmax_partial"},
             {"kernels/cuda/argmax.cu", "argmax_final"},
+            {"kernels/cuda/matmul_mxfp4.cu", "matmul_mxfp4"},
         };
         for (String[] kv : kernels) {
             try {
@@ -384,6 +385,13 @@ public class CudaContext implements AutoCloseable {
      */
     public void readBuffer(long dptr, MemorySegment hostData, long size) {
         checkError(CudaBindings.memcpyDtoH(hostData, dptr, size), "cuMemcpyDtoH");
+    }
+
+    /**
+     * Copy device data to device (async on stream).
+     */
+    public void copyBufferDtoD(long dst, long src, long sizeBytes) {
+        checkError(CudaBindings.memcpyDtoDAsync(dst, src, sizeBytes, stream), "cuMemcpyDtoDAsync");
     }
 
     /**
