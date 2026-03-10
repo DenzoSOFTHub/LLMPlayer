@@ -8,7 +8,7 @@
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
 - **Date:** 2026-03-09
 
-**Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. All benchmarks below use this default behavior. Use `--no-gpu` to force CPU-only mode (significantly slower: ~2-3 tok/s for 1B models vs ~50 tok/s with GPU).
+**Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
 ## Results v1.6.0
 
@@ -61,19 +61,54 @@
 
 ★ Sonar-OSS-20B: new MXFP4 CUDA kernel + expert GPU cache (LRU, batched kernel execution with 2 sync points per MoE layer). MoE-optimized placement: attention on GPU (~654 MB VRAM), expert tensors on CPU.
 
+### CPU-only (`--no-gpu`) — SIMD Vector API, 22 cores
+
+| # | Model | Params | Quant | Size | CPU tok/s | GPU tok/s | GPU Speedup |
+|--:|-------|--------|-------|-----:|----------:|----------:|------------:|
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | 771M | 4.1 | **48.8** | **12x** |
+| 2 | Gemma-3-1B-it | 1B | Q4_K_M | 769M | 3.9 | **33.1** | **8x** |
+| 3 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | 738M | 3.5 | **27.8** | **8x** |
+| 4 | OLMo-2-1B-Instruct | 1B | Q4_K_M | 893M | 3.2 | **52.1** | **16x** |
+| 5 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | 1.1G | 2.6 | **40.8** | **16x** |
+| 6 | Gemma-2-2B-it | 2B | IQ4_XS | 1.5G | 1.9 | **8.6** | **5x** |
+| 7 | Llama-3.2-1B-Instruct | 1B | IQ3_XXS | 537M | 1.4 | **22.6** | **16x** |
+| 8 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | 1.9G | 1.3 | **22.6** | **17x** |
+| 9 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | 2.0G | 1.3 | **21.5** | **17x** |
+| 10 | Qwen2.5-3B-Instruct | 3B | Q4_K_M | 2.0G | 1.3 | **21.4** | **16x** |
+| 11 | Phi-3-mini-4k-Instruct | 3.8B | IQ4_NL | 2.1G | 1.3 | **8.8** | **7x** |
+| 12 | DeepSeek-V2-Lite | 16B (2.4B active) | Q4_K_M | 9.7G | 1.3 | **1.6** | 1.2x |
+| 13 | Sonar-OSS-20B | 20B (MoE) | MXFP4+Q8 | 12G | 1.2 | **2.5** | 2.1x |
+| 14 | Llama-3.2-3B-Instruct | 3B | Q3_K_L | 1.7G | 1.1 | **8.2** | **7x** |
+| 15 | Qwen3-4B | 4B | Q4_K_M | 2.4G | 1.1 | **18.3** | **17x** |
+| 16 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | 1.1 | **14.5** | **13x** |
+| 17 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | 0.9 | **7.4** | **8x** |
+| 18 | GLM-4.7-Flash | 17B (MoE) | Q4_K_M | 18G | 0.7 | **0.7** | 1.0x |
+| 19 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | 0.6 | **11.2** | **19x** |
+| 20 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | 0.6 | **10.7** | **18x** |
+| 21 | Aya-23-8B | 8B | Q4_K_M | 4.8G | 0.6 | **1.1** | 1.8x |
+| 22 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | 0.5 | **3.1** | **6x** |
+| 23 | Phi-4 | 14B | Q4_K | 8.5G | 0.3 | **0.7** | 2.3x |
+| 24 | Devstral-24B | 24B | Q4_K_M | 14G | TIMEOUT | **0.3** | — |
+| 25 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | 0.2 | **0.3** | 1.5x |
+| 26 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | TIMEOUT | **6.0** | — |
+
+**Key takeaway:** GPU acceleration provides **5–19x speedup** for models that fit in VRAM with CUDA graph. The benefit is greatest for 3B–8B models (16–19x). MoE models with partial GPU offload see modest 1–2x improvement due to CPU-bound expert computation. CPU-only achieves 1–4 tok/s for 1B models, <1 tok/s for 7B+.
+
 ## Key Observations (v1.6.0)
 
 1. **27 models tested, 25 produce output.** Timeouts for Qwen3-Coder-30B-A3B (18 GB, needs more time).
 
-2. **Major improvements for several models.** OLMo-2 +104% (architecture recognition), Llama-1B IQ3_XXS +17x (complete IQ kernel set), Phi-4-mini +26%, Phi-3-mini +35%, DeepSeek-R1-Qwen3-8B +15%.
+2. **GPU provides 5–19x speedup over CPU-only.** CUDA graph models achieve 8–52 tok/s vs 0.6–4.1 tok/s on CPU. Largest speedup on 3B–8B models (16–19x). CPU-only is viable only for 1B models (~4 tok/s).
 
-3. **Sonar-OSS-20B (GPT-OSS) now supported.** MXFP4 quantization with custom CUDA kernel. Expert GPU cache reduces sync overhead from 12 to 2 per MoE layer via batched kernel execution.
+3. **Major improvements for several models.** OLMo-2 +104% (architecture recognition), Llama-1B IQ3_XXS +17x (complete IQ kernel set), Phi-4-mini +26%, Phi-3-mini +35%, DeepSeek-R1-Qwen3-8B +15%.
 
-4. **CUDA graph remains the key to peak performance.** Models with CUDA graph achieve 8–52 tok/s. Per-tensor fallback achieves 1–7 tok/s.
+4. **Sonar-OSS-20B (GPT-OSS) now supported.** MXFP4 quantization with custom CUDA kernel. Expert GPU cache reduces sync overhead from 12 to 2 per MoE layer via batched kernel execution.
 
-5. **Command-R/Cohere architecture properly recognized.** Aya-23-8B now uses COMMAND_R instead of generic LLAMA. This blocks CUDA forward pass but improves correctness. Adding COMMAND_R support to CudaForwardPass would restore GPU graph speed.
+5. **CUDA graph remains the key to peak performance.** Models with CUDA graph achieve 8–52 tok/s. Per-tensor fallback achieves 1–7 tok/s.
 
-## GPU Strategy Summary
+6. **Command-R/Cohere architecture properly recognized.** Aya-23-8B now uses COMMAND_R instead of generic LLAMA. This blocks CUDA forward pass but improves correctness. Adding COMMAND_R support to CudaForwardPass would restore GPU graph speed.
+
+## Strategy Summary
 
 | Strategy | When Used | VRAM Needed | Typical Speed |
 |----------|-----------|-------------|---------------|
@@ -81,6 +116,7 @@
 | Full offload + per-tensor | Model fits in VRAM but architecture not supported for graph | 770–5000 MB | 1–7 tok/s |
 | MoE-optimized + expert cache | MoE model, attention fits in VRAM | 517–913 MB | 0.7–2.5 tok/s |
 | Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.3–0.7 tok/s |
+| CPU-only (`--no-gpu`) | No GPU or explicit `--no-gpu` flag | 0 | 0.2–4.1 tok/s |
 
 ## Historical Results
 
