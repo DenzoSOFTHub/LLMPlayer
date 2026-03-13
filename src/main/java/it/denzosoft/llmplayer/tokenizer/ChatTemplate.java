@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.tokenizer;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
 
 import java.util.List;
+import java.util.Map;
 
 public class ChatTemplate {
 
@@ -10,6 +11,9 @@ public class ChatTemplate {
     private final String chatTemplate;
     // GLM-4.7-Flash uses DEEPSEEK2 GGUF architecture but needs GLM4 chat format
     private final boolean isGlmVariant;
+    // Thinking/reasoning mode: when true, models with <think> support will reason before answering.
+    // Affects SmolLM3 (/think system msg), Qwen3 (no suppressor), Qwen3.5 (remove suppressor).
+    private boolean thinkingEnabled;
 
     public ChatTemplate(ModelArchitecture architecture, String chatTemplate) {
         this.architecture = architecture;
@@ -20,13 +24,25 @@ public class ChatTemplate {
                 && (chatTemplate.contains("[gMASK]") || chatTemplate.contains("<|user|>"));
     }
 
+    public void setThinkingEnabled(boolean enabled) { this.thinkingEnabled = enabled; }
+    public boolean isThinkingEnabled() { return thinkingEnabled; }
+
+    /**
+     * Returns true if this model architecture supports thinking/reasoning mode.
+     */
+    public boolean supportsThinking() {
+        return architecture == ModelArchitecture.SMOLLM3
+                || architecture == ModelArchitecture.QWEN3
+                || architecture == ModelArchitecture.QWEN35;
+    }
+
     public String formatUserMessage(String userMessage) {
         if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3(userMessage);
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35(userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
             return formatQwen(userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4(userMessage);
@@ -54,7 +70,7 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
             return formatQwenChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Chat(systemMessage, userMessage);
@@ -88,24 +104,52 @@ public class ChatTemplate {
                userMessage + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     }
 
-    // Qwen format
+    /**
+     * Returns the thinking suffix for Qwen-style models.
+     * When thinking is disabled: "<think>\n\n</think>\n\n" (suppresses reasoning).
+     * When thinking is enabled: "" (model reasons freely).
+     */
+    private String thinkingSuffix() {
+        // SmolLM3: uses /think or /no_think in system message, no suffix needed
+        if (architecture == ModelArchitecture.SMOLLM3) return "";
+        // Qwen3.5: suppress thinking by default, enable when flag is set
+        if (architecture == ModelArchitecture.QWEN35) {
+            return thinkingEnabled ? "" : "<think>\n\n</think>\n\n";
+        }
+        // Qwen3: thinking is natural, suppress only when explicitly disabled
+        if (architecture == ModelArchitecture.QWEN3) {
+            return thinkingEnabled ? "" : "<think>\n\n</think>\n\n";
+        }
+        return "";
+    }
+
+    // Qwen format (also used by SmolLM3)
     private String formatQwen(String userMessage) {
-        return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
+        // SmolLM3 with thinking: inject /think system message
+        if (architecture == ModelArchitecture.SMOLLM3 && thinkingEnabled) {
+            return "<|im_start|>system\n/think<|im_end|>\n" +
+                   "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
+        }
+        return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n" + thinkingSuffix();
     }
 
     private String formatQwenChat(String systemMessage, String userMessage) {
+        // SmolLM3 with thinking: prepend /think to system message
+        if (architecture == ModelArchitecture.SMOLLM3 && thinkingEnabled) {
+            systemMessage = "/think\n" + systemMessage;
+        }
         return "<|im_start|>system\n" + systemMessage + "<|im_end|>\n" +
-               "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
+               "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n" + thinkingSuffix();
     }
 
-    // Qwen3.5 format (includes non-thinking <think> block)
+    // Qwen3.5 format (thinking controlled by thinkingSuffix())
     private String formatQwen35(String userMessage) {
-        return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n" + thinkingSuffix();
     }
 
     private String formatQwen35Chat(String systemMessage, String userMessage) {
         return "<|im_start|>system\n" + systemMessage + "<|im_end|>\n" +
-               "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+               "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n" + thinkingSuffix();
     }
 
     // GLM4 format
@@ -157,7 +201,7 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Conversation(messages);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
             return formatQwenConversation(messages);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Conversation(messages);
@@ -191,11 +235,25 @@ public class ChatTemplate {
 
     private String formatQwenConversation(List<String[]> messages) {
         StringBuilder sb = new StringBuilder();
+        // SmolLM3 with thinking: inject /think system message if no system in messages
+        if (architecture == ModelArchitecture.SMOLLM3 && thinkingEnabled) {
+            boolean hasSystem = false;
+            for (String[] msg : messages) {
+                if ("system".equals(msg[0])) { hasSystem = true; break; }
+            }
+            if (!hasSystem) {
+                sb.append("<|im_start|>system\n/think<|im_end|>\n");
+            }
+        }
         for (String[] msg : messages) {
             sb.append("<|im_start|>").append(msg[0]).append("\n");
+            // SmolLM3 with thinking: prepend /think to system message content
+            if (architecture == ModelArchitecture.SMOLLM3 && thinkingEnabled && "system".equals(msg[0])) {
+                sb.append("/think\n");
+            }
             sb.append(msg[1]).append("<|im_end|>\n");
         }
-        sb.append("<|im_start|>assistant\n");
+        sb.append("<|im_start|>assistant\n").append(thinkingSuffix());
         return sb.toString();
     }
 
@@ -205,7 +263,7 @@ public class ChatTemplate {
             sb.append("<|im_start|>").append(msg[0]).append("\n");
             sb.append(msg[1]).append("<|im_end|>\n");
         }
-        sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        sb.append("<|im_start|>assistant\n").append(thinkingSuffix());
         return sb.toString();
     }
 
@@ -377,6 +435,132 @@ public class ChatTemplate {
             sb.append("<|start|>").append(role).append("<|message|>").append(msg[1]).append("<|end|>");
         }
         sb.append(GPT_OSS_GEN_PROMPT);
+        return sb.toString();
+    }
+
+    // --- Tool Calling ---
+
+    /**
+     * Returns true if this model architecture uses native tool calling format
+     * (SmolLM3 Hermes-style xml_tools with &lt;tool_call&gt; tags).
+     */
+    public boolean usesNativeToolFormat() {
+        return architecture == ModelArchitecture.SMOLLM3;
+    }
+
+    /**
+     * Format tool definitions as a system prompt injection.
+     * SmolLM3 uses Hermes-style XML tool definitions.
+     * Other architectures use a generic JSON-based format.
+     *
+     * @param tools list of tool maps with "function" sub-maps containing "name", "description", "parameters"
+     * @param toolNames populated with function names for later matching
+     * @return system prompt text describing available tools
+     */
+    @SuppressWarnings("unchecked")
+    public String formatToolsSystemPrompt(List<?> tools, List<String> toolNames, java.util.function.Function<Object, String> toJson) {
+        if (architecture == ModelArchitecture.SMOLLM3) {
+            return formatSmolLM3Tools(tools, toolNames, toJson);
+        }
+        return formatGenericTools(tools, toolNames, toJson);
+    }
+
+    @SuppressWarnings("unchecked")
+    private String formatSmolLM3Tools(List<?> tools, List<String> toolNames, java.util.function.Function<Object, String> toJson) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. ");
+        sb.append("You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. ");
+        sb.append("Here are the available tools:\n<tools>\n");
+        for (Object toolObj : tools) {
+            Map<String, Object> tool = (Map<String, Object>) toolObj;
+            Map<String, Object> function = (Map<String, Object>) tool.get("function");
+            if (function == null) continue;
+            String name = (String) function.get("name");
+            if (name == null) continue;
+            toolNames.add(name);
+            sb.append("{\"type\": \"function\", \"function\": ");
+            sb.append(toJson.apply(function));
+            sb.append("}\n");
+        }
+        sb.append("</tools>\n\n");
+        sb.append("For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n");
+        sb.append("<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+        return sb.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private String formatGenericTools(List<?> tools, List<String> toolNames, java.util.function.Function<Object, String> toJson) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You have access to the following tools:\n\n");
+        for (Object toolObj : tools) {
+            Map<String, Object> tool = (Map<String, Object>) toolObj;
+            Map<String, Object> function = (Map<String, Object>) tool.get("function");
+            if (function == null) continue;
+            String name = (String) function.get("name");
+            if (name == null) continue;
+            toolNames.add(name);
+            sb.append("Function: ").append(name).append("\n");
+            if (function.containsKey("description")) {
+                sb.append("Description: ").append(function.get("description")).append("\n");
+            }
+            if (function.containsKey("parameters")) {
+                sb.append("Parameters: ").append(toJson.apply(function.get("parameters"))).append("\n");
+            }
+            sb.append("\n");
+        }
+        sb.append("When you need to call a tool, respond ONLY with a JSON object in this exact format:\n");
+        sb.append("{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"value1\"}}\n");
+        sb.append("Do not include any other text when making a tool call.");
+        return sb.toString();
+    }
+
+    /**
+     * Format a tool result message content for the model.
+     * SmolLM3 wraps tool results in &lt;tool_response&gt; tags.
+     */
+    public String formatToolResult(String toolCallId, String content) {
+        if (architecture == ModelArchitecture.SMOLLM3) {
+            return "<tool_response>\n" + content + "\n</tool_response>";
+        }
+        String prefix = toolCallId != null ? "[Tool result for " + toolCallId + "]: " : "[Tool result]: ";
+        return prefix + content;
+    }
+
+    /**
+     * Format an assistant message that contains tool calls, for multi-turn conversations.
+     * SmolLM3 wraps each tool call in &lt;tool_call&gt; tags.
+     */
+    @SuppressWarnings("unchecked")
+    public String formatAssistantToolCalls(String content, List<?> toolCalls) {
+        if (architecture == ModelArchitecture.SMOLLM3) {
+            StringBuilder sb = new StringBuilder();
+            if (content != null && !content.isEmpty()) sb.append(content);
+            for (Object tcObj : toolCalls) {
+                Map<String, Object> tc = (Map<String, Object>) tcObj;
+                Map<String, Object> fn = (Map<String, Object>) tc.get("function");
+                if (fn == null) continue;
+                if (sb.length() > 0) sb.append("\n");
+                sb.append("<tool_call>\n");
+                sb.append("{\"name\": \"").append(fn.get("name")).append("\", \"arguments\": ");
+                Object args = fn.get("arguments");
+                sb.append(args != null ? args : "{}");
+                sb.append("}\n</tool_call>");
+            }
+            return sb.toString();
+        }
+        // Generic format
+        StringBuilder sb = new StringBuilder();
+        if (content != null) sb.append(content);
+        for (Object tcObj : toolCalls) {
+            Map<String, Object> tc = (Map<String, Object>) tcObj;
+            Map<String, Object> fn = (Map<String, Object>) tc.get("function");
+            if (fn != null) {
+                if (sb.length() > 0) sb.append("\n");
+                sb.append("[Called tool: ").append(fn.get("name"));
+                sb.append("(").append(fn.get("arguments") != null ? fn.get("arguments") : "{}");
+                sb.append(")]");
+            }
+        }
         return sb.toString();
     }
 }

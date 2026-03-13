@@ -194,7 +194,7 @@ public final class ModelConfig {
         if (arch == ModelArchitecture.LLAMA || arch == ModelArchitecture.DEEPSEEK2
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
-                || arch == ModelArchitecture.LLAMA4) {
+                || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
                 || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
@@ -277,9 +277,9 @@ public final class ModelConfig {
         int ssmInnerSize = metadata.getInt(prefix + "ssm.inner_size", 0);
         int fullAttentionInterval = metadata.getInt(prefix + "full_attention_interval", 0);
 
-        // Llama4 iRoPE: every Nth layer is a NoPE (no RoPE) layer
-        // Default 4 for Llama4 (layers where layer % 4 == 3 skip RoPE), 0 for all others
-        int noRopeLayerInterval = (arch == ModelArchitecture.LLAMA4) ? 4 : 0;
+        // iRoPE / NoPE: every Nth layer is a NoPE (no RoPE) layer
+        // Default 4 for Llama4 and SmolLM3 (layers where layer % 4 == 3 skip RoPE), 0 for all others
+        int noRopeLayerInterval = (arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3) ? 4 : 0;
 
         // Q-LoRA rank (GLM-4.7-Flash / DeepSeek-V3: decompose Q into Q_A * Q_B)
         int qLoraRank = metadata.getInt(prefix + "attention.q_lora_rank", 0);

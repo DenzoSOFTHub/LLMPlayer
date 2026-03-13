@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.web;
 import com.sun.net.httpserver.HttpExchange;
 import it.denzosoft.llmplayer.api.*;
 import it.denzosoft.llmplayer.sampler.SamplerConfig;
+import it.denzosoft.llmplayer.tokenizer.ChatTemplate;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -79,6 +80,9 @@ public class OpenAIHandler {
             return;
         }
 
+        // Get chat template for architecture-aware formatting
+        ChatTemplate chatTpl = engine.getChatTemplate();
+
         List<String[]> messages = new ArrayList<>();
         for (Object msgObj : messagesRaw) {
             Map<String, Object> msg = (Map<String, Object>) msgObj;
@@ -86,12 +90,14 @@ public class OpenAIHandler {
             if (role == null) continue;
 
             if ("tool".equals(role)) {
-                // Tool result message: convert to user message
+                // Tool result message: format using architecture-specific template
                 Object contentObj = msg.get("content");
                 String content = contentObj != null ? contentObj.toString() : "";
                 String toolCallId = (String) msg.get("tool_call_id");
-                String prefix = toolCallId != null ? "[Tool result for " + toolCallId + "]: " : "[Tool result]: ";
-                messages.add(new String[]{"user", prefix + content});
+                String formatted = chatTpl.formatToolResult(toolCallId, content);
+                // SmolLM3: tool responses go as "tool" role; generic: as "user" role
+                String resultRole = chatTpl.usesNativeToolFormat() ? "tool" : "user";
+                messages.add(new String[]{resultRole, formatted});
                 continue;
             }
 
@@ -100,22 +106,9 @@ public class OpenAIHandler {
 
             // Handle assistant messages with tool_calls
             if ("assistant".equals(role) && msg.containsKey("tool_calls")) {
-                StringBuilder sb = new StringBuilder();
-                if (content != null) sb.append(content);
                 List<?> toolCalls = (List<?>) msg.get("tool_calls");
-                if (toolCalls != null) {
-                    for (Object tcObj : toolCalls) {
-                        Map<String, Object> tc = (Map<String, Object>) tcObj;
-                        Map<String, Object> fn = (Map<String, Object>) tc.get("function");
-                        if (fn != null) {
-                            if (sb.length() > 0) sb.append("\n");
-                            sb.append("[Called tool: ").append(fn.get("name"));
-                            sb.append("(").append(fn.get("arguments") != null ? fn.get("arguments") : "{}");
-                            sb.append(")]");
-                        }
-                    }
-                }
-                messages.add(new String[]{"assistant", sb.toString()});
+                String formatted = chatTpl.formatAssistantToolCalls(content, toolCalls != null ? toolCalls : new ArrayList<>());
+                messages.add(new String[]{"assistant", formatted});
                 continue;
             }
 
@@ -152,7 +145,7 @@ public class OpenAIHandler {
         StringBuilder systemInjection = new StringBuilder();
         List<String> toolNames = new ArrayList<>();
         if (toolsActive) {
-            systemInjection.append(formatToolsSystemPrompt(tools, toolNames));
+            systemInjection.append(chatTpl.formatToolsSystemPrompt(tools, toolNames, ApiHandler::toJson));
         }
         if (responseFormat != null) {
             String formatType = (String) responseFormat.get("type");
@@ -225,8 +218,16 @@ public class OpenAIHandler {
             }
         }
 
+        // Enable thinking/reasoning mode if requested (per-request override)
+        boolean thinkingRequested = body.containsKey("thinking") && Boolean.TRUE.equals(body.get("thinking"));
+        boolean prevThinking = chatTpl.isThinkingEnabled();
+        if (thinkingRequested) chatTpl.setThinkingEnabled(true);
+
         // Build the formatted prompt from messages using chat template
-        String formattedPrompt = engine.getChatTemplate().formatConversation(messages);
+        String formattedPrompt = chatTpl.formatConversation(messages);
+
+        // Restore previous thinking state (thread-safety: best-effort for concurrent requests)
+        if (thinkingRequested) chatTpl.setThinkingEnabled(prevThinking);
 
         // Compute conversation cache key from messages (hash of all messages)
         String cacheKey = computeCacheKey(messages);
@@ -305,7 +306,7 @@ public class OpenAIHandler {
 
             // Determine finish_reason
             String finishReason = (response.tokenCount() >= request.maxTokens()) ? "length" : "stop";
-            if (toolNames != null && tryParseToolCall(accumulated.toString().trim(), toolNames) != null) {
+            if (toolNames != null && tryParseToolCalls(accumulated.toString().trim(), toolNames) != null) {
                 finishReason = "tool_calls";
             }
 
@@ -371,7 +372,7 @@ public class OpenAIHandler {
             }
 
             // Check for tool calls in the output
-            Map<String, Object> toolCall = (toolNames != null) ? tryParseToolCall(text.trim(), toolNames) : null;
+            List<Map<String, Object>> parsedToolCalls = (toolNames != null) ? tryParseToolCalls(text.trim(), toolNames) : null;
 
             // Build response
             Map<String, Object> result = new LinkedHashMap<>();
@@ -383,21 +384,23 @@ public class OpenAIHandler {
             Map<String, Object> message = new LinkedHashMap<>();
             message.put("role", "assistant");
 
-            if (toolCall != null) {
+            if (parsedToolCalls != null) {
                 // Tool call response: content is null, tool_calls array present
                 message.put("content", null);
-                String callId = "call_" + UUID.randomUUID().toString().replace("-", "").substring(0, 24);
-                Map<String, Object> tc = new LinkedHashMap<>();
-                tc.put("id", callId);
-                tc.put("type", "function");
-                Map<String, Object> fn = new LinkedHashMap<>();
-                fn.put("name", toolCall.get("name"));
-                Object args = toolCall.get("arguments");
-                fn.put("arguments", args instanceof String ? args : ApiHandler.toJson(args));
-                tc.put("function", fn);
-                List<Object> toolCalls = new ArrayList<>();
-                toolCalls.add(tc);
-                message.put("tool_calls", toolCalls);
+                List<Object> toolCallsList = new ArrayList<>();
+                for (Map<String, Object> toolCall : parsedToolCalls) {
+                    String callId = "call_" + UUID.randomUUID().toString().replace("-", "").substring(0, 24);
+                    Map<String, Object> tc = new LinkedHashMap<>();
+                    tc.put("id", callId);
+                    tc.put("type", "function");
+                    Map<String, Object> fn = new LinkedHashMap<>();
+                    fn.put("name", toolCall.get("name"));
+                    Object args = toolCall.get("arguments");
+                    fn.put("arguments", args instanceof String ? args : ApiHandler.toJson(args));
+                    tc.put("function", fn);
+                    toolCallsList.add(tc);
+                }
+                message.put("tool_calls", toolCallsList);
                 finishReason = "tool_calls";
             } else {
                 message.put("content", text);
@@ -530,43 +533,43 @@ public class OpenAIHandler {
     // --- Tool Calling Helpers ---
 
     /**
-     * Format tool definitions into a system prompt injection.
-     * Populates toolNames with the function names for later matching.
+     * Try to parse the model output as a tool call.
+     * Supports both SmolLM3/Hermes &lt;tool_call&gt; XML tags and generic JSON format.
+     * Returns a list of maps with "name" and "arguments", or null if no tool calls found.
      */
     @SuppressWarnings("unchecked")
-    private String formatToolsSystemPrompt(List<?> tools, List<String> toolNames) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("You have access to the following tools:\n\n");
-        for (Object toolObj : tools) {
-            Map<String, Object> tool = (Map<String, Object>) toolObj;
-            Map<String, Object> function = (Map<String, Object>) tool.get("function");
-            if (function == null) continue;
-            String name = (String) function.get("name");
-            if (name == null) continue;
-            toolNames.add(name);
-            sb.append("Function: ").append(name).append("\n");
-            if (function.containsKey("description")) {
-                sb.append("Description: ").append(function.get("description")).append("\n");
-            }
-            if (function.containsKey("parameters")) {
-                sb.append("Parameters: ").append(ApiHandler.toJson(function.get("parameters"))).append("\n");
-            }
-            sb.append("\n");
+    private List<Map<String, Object>> tryParseToolCalls(String text, List<String> toolNames) {
+        if (text.isEmpty()) return null;
+
+        // First, try <tool_call> XML tag format (SmolLM3/Hermes)
+        List<Map<String, Object>> results = new ArrayList<>();
+        String remaining = text;
+        while (true) {
+            int tagStart = remaining.indexOf("<tool_call>");
+            if (tagStart < 0) break;
+            int tagEnd = remaining.indexOf("</tool_call>", tagStart);
+            if (tagEnd < 0) break;
+            String inner = remaining.substring(tagStart + "<tool_call>".length(), tagEnd).trim();
+            remaining = remaining.substring(tagEnd + "</tool_call>".length());
+            Map<String, Object> parsed = tryParseToolJson(inner, toolNames);
+            if (parsed != null) results.add(parsed);
         }
-        sb.append("When you need to call a tool, respond ONLY with a JSON object in this exact format:\n");
-        sb.append("{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"value1\"}}\n");
-        sb.append("Do not include any other text when making a tool call.");
-        return sb.toString();
+        if (!results.isEmpty()) return results;
+
+        // Fallback: try bare JSON format
+        Map<String, Object> single = tryParseToolJson(text, toolNames);
+        if (single != null) {
+            results.add(single);
+            return results;
+        }
+        return null;
     }
 
     /**
-     * Try to parse the model output as a tool call JSON.
-     * Returns a map with "name" and "arguments" if valid, null otherwise.
+     * Try to parse a JSON string as a tool call with "name" and "arguments".
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> tryParseToolCall(String text, List<String> toolNames) {
-        if (text.isEmpty()) return null;
-        // Find JSON object boundaries
+    private Map<String, Object> tryParseToolJson(String text, List<String> toolNames) {
         int start = text.indexOf('{');
         int end = text.lastIndexOf('}');
         if (start < 0 || end <= start) return null;
@@ -582,9 +585,7 @@ public class OpenAIHandler {
                 result.put("arguments", args != null ? args : Collections.emptyMap());
                 return result;
             }
-        } catch (Exception ignored) {
-            // Not valid JSON or doesn't match tool pattern
-        }
+        } catch (Exception ignored) {}
         return null;
     }
 

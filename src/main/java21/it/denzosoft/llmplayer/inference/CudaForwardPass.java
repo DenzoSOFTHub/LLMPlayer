@@ -118,6 +118,7 @@ public class CudaForwardPass implements AutoCloseable {
     private final int numWorkGroups;
     private final int maxSeqLen;
     private final int blockCount;
+    private final int noRopeLayerInterval; // SmolLM3/Llama4 NoPE: 0=all layers use RoPE
 
     // Host-side staging buffers (only for uploadX/downloadX)
     private final MemorySegment hostX;
@@ -264,6 +265,7 @@ public class CudaForwardPass implements AutoCloseable {
         this.headSize = config.headSize();
         this.normEps = config.normEps();
         this.blockCount = config.blockCount();
+        this.noRopeLayerInterval = config.noRopeLayerInterval();
 
         RoPE rope = attention.getRope();
         this.halfRope = rope.getRopeDimCount() / 2;
@@ -969,15 +971,17 @@ public class CudaForwardPass implements AutoCloseable {
             launchBias(gpuV, gpuVBias[layerIdx], kvDim, biasKVGridDim);
         }
 
-        // 3. RoPE on Q (position read from gpuTokenParams[0] by kernel)
-        ropePB.setLong(0, gpuQ);
-        ropePB.setInt(3, headCount);
-        launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
+        // 3. RoPE on Q and K (skip for NoPE layers in SmolLM3/Llama4 iRoPE)
+        if (noRopeLayerInterval == 0 || (layerIdx % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
+            ropePB.setLong(0, gpuQ);
+            ropePB.setInt(3, headCount);
+            launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
 
-        // 3b. RoPE on K
-        ropePB.setLong(0, gpuK);
-        ropePB.setInt(3, headCountKV);
-        launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
+            // 3b. RoPE on K
+            ropePB.setLong(0, gpuK);
+            ropePB.setInt(3, headCountKV);
+            launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
+        }
 
         // 4. KV cache update (position read from gpuTokenParams[0] by kernel)
         kvPB.setLong(0, gpuKeyCache[layerIdx]);
@@ -1229,13 +1233,15 @@ public class CudaForwardPass implements AutoCloseable {
             launchKernel(perHeadNormFunc, headCountKV, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
         }
 
-        // RoPE on Q and K
-        ropePB.setLong(0, gpuQ);
-        ropePB.setInt(3, headCount);
-        launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
-        ropePB.setLong(0, gpuK);
-        ropePB.setInt(3, headCountKV);
-        launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
+        // RoPE on Q and K (skip for NoPE layers in SmolLM3/Llama4 iRoPE)
+        if (noRopeLayerInterval == 0 || (layerIdx % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
+            ropePB.setLong(0, gpuQ);
+            ropePB.setInt(3, headCount);
+            launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
+            ropePB.setLong(0, gpuK);
+            ropePB.setInt(3, headCountKV);
+            launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
+        }
 
         // KV cache update
         kvPB.setLong(0, gpuKeyCache[layerIdx]);

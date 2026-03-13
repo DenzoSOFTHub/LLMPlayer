@@ -1,6 +1,6 @@
-# LLMPlayer v1.6.0
+# LLMPlayer v1.7.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
 ## Requirements
 
@@ -124,6 +124,22 @@ Output is printed as a token-by-token stream. Statistics (tokens generated, spee
 ```
 
 Type your messages and press Enter. Special commands: `quit` or `exit` to leave, `info` for model details.
+
+### CLI — Thinking/reasoning mode
+
+```bash
+./run.sh --model SmolLM3-Q4_K_M.gguf --thinking --prompt "What is 25 * 37?" --max-tokens 512
+```
+
+Enables extended reasoning for supported models. The model "thinks" step-by-step before answering:
+
+| Model | Mechanism | How it works |
+|-------|-----------|-------------|
+| SmolLM3 | `/think` system message | Injects `/think` into the system prompt |
+| Qwen3 | `<think>` suppressor removal | By default thinking is suppressed; `--thinking` removes the suppressor |
+| Qwen3.5 | `<think>` suppressor removal | Same as Qwen3 |
+
+Via the OpenAI API, pass `"thinking": true` in the request body.
 
 ### Web UI
 
@@ -252,6 +268,7 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 | `--web` | `-w` | Flag | false | Start the web server |
 | `--port` | — | Integer | 8080 | Web server port |
 | `--gguf-dir` | — | String | `gguf` | GGUF file directory |
+| `--thinking` | — | Flag | false | Enable thinking/reasoning mode (SmolLM3, Qwen3, Qwen3.5) |
 | `--force` | `-y` | Flag | false | Skip confirmation prompts (e.g., RAM warning) |
 | `--help` | `-h` | Flag | false | Show help |
 
@@ -319,7 +336,7 @@ When started with `--web`, the server exposes the following APIs. Full documenta
 | `/v1/embeddings` | POST | Text embeddings (L2-normalized vectors) |
 | `/v1/models` | GET | List available/loaded models |
 
-Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.). The `Authorization: Bearer <token>` header is accepted and ignored.
+Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.). The `Authorization: Bearer <token>` header is accepted and ignored. Supports architecture-aware tool calling (SmolLM3 uses Hermes-style `<tool_call>` XML tags; other models use generic JSON format), JSON mode, and thinking/reasoning mode. See [TOOL-CALLING.md](TOOL-CALLING.md) for full tool calling documentation with examples.
 
 ### Anthropic Messages API (`/v1/messages`)
 
@@ -405,6 +422,7 @@ engine.close();
 | Qwen3 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3 MoE | `qwen3moe` | BPE (gpt2) | `<\|im_start\|>user` |
 | Qwen3.5 | `qwen3` | BPE (gpt2) | `<\|im_start\|>user` |
+| SmolLM3 | `smollm3` | BPE (gpt2) | `<\|im_start\|>user` |
 | DeepSeek2 | `deepseek2` | BPE (gpt2) | `User: ... Assistant:` |
 | GLM-4.7-Flash | `deepseek2` | SentencePiece | `[gMASK]<sop><\|user\|>` (auto-detected) |
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
@@ -422,7 +440,7 @@ The architecture is automatically detected from the `general.architecture` field
 
 Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s), Java 25, SimdVectorOps.
 
-**27 models tested, 25 produce output** across 14 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS).
+**28 models tested, 26 produce output** across 15 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS).
 
 ### Top results — CUDA GPU (ranked by tok/s)
 
@@ -433,11 +451,12 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 | 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 40.8 |
 | 4 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 33.1 |
 | 5 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 27.8 |
-| 6 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
-| 7 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
-| 8 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
-| 9 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
-| 10 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
+| 6 | SmolLM3-3B | 3B | Q4_K_M | CUDA graph | 22.9 |
+| 7 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
+| 8 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
+| 9 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
+| 10 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
+| 11 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
 
 Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 
