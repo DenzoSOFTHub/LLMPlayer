@@ -15,7 +15,8 @@ public enum ModelArchitecture {
     GEMMA3("gemma3"),
     LLAMA4("llama4"),
     GPT_OSS("gpt-oss"),
-    QWEN35("qwen35");
+    QWEN35("qwen35"),
+    SMOLLM3("smollm3");
 
     private final String ggufName;
 

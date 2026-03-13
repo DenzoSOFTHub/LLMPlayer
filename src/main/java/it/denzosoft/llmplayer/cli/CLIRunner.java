@@ -90,6 +90,10 @@ public class CLIRunner {
 
         try (LLMEngine engine = LLMEngine.load(modelPath, options.getContextLength(), gpuConfig,
                 options.isGpuChainEnabled())) {
+            // Enable thinking/reasoning mode if requested
+            if (options.isThinking()) {
+                engine.getChatTemplate().setThinkingEnabled(true);
+            }
             if (options.isShowInfo()) {
                 ModelInfoPrinter.print(engine.getModelInfo());
                 return;

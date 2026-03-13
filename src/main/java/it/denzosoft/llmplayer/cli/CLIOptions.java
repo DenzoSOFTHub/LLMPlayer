@@ -50,6 +50,7 @@ public class CLIOptions {
     private String trainDataset;
 
     private boolean force;         // Skip confirmation prompts (e.g., RAM warning)
+    private boolean thinking;      // Enable thinking/reasoning mode (SmolLM3, Qwen3, Qwen3.5)
 
     // Download options
     private String downloadSpec;   // HuggingFace repo: "owner/repo" or "owner/repo/file.gguf"
@@ -145,6 +146,8 @@ public class CLIOptions {
                 opts.datasetOnly = true;
             } else if ("--train-dataset".equals(arg)) {
                 opts.trainDataset = args[++i];
+            } else if ("--thinking".equals(arg)) {
+                opts.thinking = true;
             } else if ("--force".equals(arg) || "-y".equals(arg)) {
                 opts.force = true;
             } else if ("--download".equals(arg)) {
@@ -212,6 +215,7 @@ public class CLIOptions {
     public String getTrainDataset() { return trainDataset; }
 
     public boolean isForce() { return force; }
+    public boolean isThinking() { return thinking; }
 
     // Download getters
     public String getDownloadSpec() { return downloadSpec; }
@@ -245,6 +249,7 @@ public class CLIOptions {
         System.out.println("  --no-gpu-chain           Disable GPU kernel chaining");
         System.out.println("  --gpu-backend <backend>  GPU backend: auto, cuda, opencl (default: auto)");
         System.out.println("  --gpu-memory <mode>      GPU memory: device, managed, host-mapped (default: device)");
+        System.out.println("  --thinking               Enable extended thinking/reasoning (SmolLM3, Qwen3, Qwen3.5)");
         System.out.println();
         System.out.println("Fine-tuning:");
         System.out.println("  --fine-tune              Enable fine-tuning mode");

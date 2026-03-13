@@ -29,6 +29,8 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --ena
   -cp target/classes it.denzosoft.llmplayer.LLMPlayer [options]
 ```
 
+**Build environment note:** If the system JDK is not Java 25, set `JAVA_HOME` before running Maven (e.g. `export JAVA_HOME=/usr/lib/jvm/jdk-25.0.2+10 && export PATH=$JAVA_HOME/bin:$PATH`).
+
 Unit test directory exists but is empty. Integration tests for the OpenAI-compatible API are in `test-openai-api.sh` (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures (llama, qwen2, qwen3, phi3, deepseek2, mistral3) with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
 
 `run.sh` (Linux/macOS) and `run.bat` (Windows) are pre-configured launcher scripts with all required JVM flags for Java 25.
@@ -137,7 +139,7 @@ Follows the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-r
 Implemented in `OpenAIHandler.java`. Uses `ChatTemplate.formatConversation()` for multi-turn message formatting. Supports `messages` array with `system`/`user`/`assistant` roles, `stream`, `temperature`, `max_tokens`, `top_p`, `top_k`, `stop`, `frequency_penalty`, `repetition_penalty`. The `model` field is accepted but ignored (uses the currently loaded model). Streaming sends SSE chunks in OpenAI format (`chat.completion.chunk`) ending with `data: [DONE]`. Non-streaming returns a full `chat.completion` JSON with `choices` and `usage`.
 
 Additional OpenAI-compatible features:
-- **Tool calling**: `tools` array in request → `tool_calls` in response with `finish_reason: "tool_calls"`
+- **Tool calling**: `tools` array in request → `tool_calls` in response with `finish_reason: "tool_calls"`. Architecture-aware: SmolLM3 uses Hermes-style XML format (`<tool_call>` tags, `<tool_response>` for results); other models use generic JSON prompt injection. Multi-tool-call parsing supported. Tool format logic lives in `ChatTemplate.formatToolsSystemPrompt()`, `formatToolResult()`, `formatAssistantToolCalls()`. Response parsing in `OpenAIHandler.tryParseToolCalls()`.
 - **JSON mode**: `response_format: {type: "json_object"}` injects a system prompt instructing the model to produce JSON
 - **Embeddings**: `/v1/embeddings` returns L2-normalized vectors with dimension = embeddingLength
 
@@ -251,23 +253,13 @@ For MoE architectures (Qwen3MoE, DeepSeek2) with `--gpu-layers -1` (auto-detect)
 
 Two modes for keeping activations on GPU between transformer layers, reducing CPU↔GPU sync points:
 
-1. **Per-layer mode** (`CudaForwardPass.forwardLayer()`): each layer runs entirely on GPU (RMSNorm → QKV → RoPE → KV cache → attention → Wo → FFN norm → gate/up → SiLU → down). Syncs only at `uploadX`/`downloadX` boundaries. Falls back to CPU for final RMSNorm + output projection if output tensor isn't on GPU.
+1. **Per-layer mode** (`CudaForwardPass.forwardLayer()`): each layer runs entirely on GPU (RMSNorm → QKV → RoPE → KV cache → attention → Wo → FFN norm → gate/up → SiLU → down). Syncs only at `uploadX`/`downloadX` boundaries.
 
-2. **CUDA graph mode** (`CudaForwardPass.forwardGraph()`): captures ALL kernel launches (all layers + output projection) into a CUDA graph on the first token, then replays with a single `cuGraphLaunch` API call on subsequent tokens. Dynamic values (position, seqLen) are read from GPU-resident `tokenParams` buffer updated via `updateTokenParams()` before each replay. Enabled by default; disable with `-Dcuda.nograph=true`. Requires shared memory ≤ 48 KB (limits maxSeqLen to ~12256 for graph mode).
+2. **CUDA graph mode** (`CudaForwardPass.forwardGraph()`): captures ALL kernel launches into a CUDA graph on the first token, then replays with a single `cuGraphLaunch` on subsequent tokens. Dynamic values (position, seqLen) are read from GPU-resident `tokenParams` buffer. Enabled by default; disable with `-Dcuda.nograph=true`.
 
-The `CudaForwardPass` uses **zero-allocation hot paths**: all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
+Key design: **zero-allocation hot paths** — all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-**v1.5.0 optimizations:**
-- **Combined upload** (`uploadXAndUpdateParams()`): embedding vector + token params uploaded in a single `cuMemcpyHtoD` via contiguous GPU buffer (`gpuCombined`). Saves one Panama FFM call per token.
-- **Fused gate+up kernel** (`matmul_q4_k_fused_gate_up.cu`): single kernel launch for both gate and up projections when both are Q4_K. Reads input vector once, halves kernel launch count for FFN phase. Auto-detected per-layer.
-- **GPU-side argmax** (`argmax.cu`): two-phase parallel argmax (partial → final) on GPU logits. `forwardFinalArgmax()` and `forwardGraphArgmax()` return the token ID directly, downloading 4 bytes instead of 512 KB. Usable for greedy sampling without repetition penalty.
-
-**v1.6.0 optimizations:**
-- **Packed FFN** (`split_gate_up.cu`): Phi-3/4 models with `wGate==null` now supported. Single wUp matmul (2×ffnDim output) + split kernel replaces two separate matmuls.
-- **New CUDA kernels**: IQ2_S (10-bit grid, 1024-entry codebook), IQ3_S (9-bit grid, 512-entry codebook), BF16 (bit-shift conversion), F16 (half2float). All warp-per-row with `__ldg`.
-- **CPU-side**: Prefill skip (skip output projection for non-last tokens), SIMD attention, SIMD fused dequant+dot tensors (Q6_K, Q5_0, Q5_K, Q3_K), SIMD QK-norm, SIMD RoPE (NEOX mode), tiled matmul (`-Dmatmul.tiled=true`), CPU profiling (`-Dcpu.profile=true`).
-
-Supported for dense models: Llama, Qwen2, Qwen3, Mistral3 (standard), Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) is supported via `rmsnorm_per_head.cu` kernel. Not supported for: MoE or hybrid architectures (Qwen3.5 DeltaNet).
+**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE or hybrid architectures (Qwen3.5 DeltaNet).
 
 ### GPU-virtual thread interaction
 
@@ -297,57 +289,14 @@ When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backe
 
 ## Benchmarks
 
-### CUDA kernel optimizations (2026-03)
+See `BENCHMARKS.md` for full results (27 models tested) and `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling.
 
-Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s peak bandwidth), Java 25, SimdVectorOps.
+Current best: Llama-3.2-1B Q4_K_M at **53-56 tok/s** (CUDA graph mode, RTX 4050 Laptop GPU).
 
-| Model | Quant | tok/s (before) | tok/s (after) | Improvement |
-|-------|-------|-----------------|---------------|-------------|
-| Llama-3.2-1B-Instruct | Q4_K_M | 34.0 | 53-56 | +56-65% |
-| Llama-3.2-3B-Instruct | Q3_K_L | 15.9 | 8.4 | (regression, investigating) |
+### CUDA kernel design patterns
 
-Test: `--prompt "Write a Java hello world" --max-tokens 200 --context-length 256 --gpu --gpu-backend cuda`.
+All CUDA matmul kernels use 1 warp (32 threads) per output row with `__shfl_down_sync` reduction. Grid: `ceil(rows / (blockSize/32))` blocks.
 
-Current best for Llama-3.2-1B Q4_K_M: **53-56 tok/s** (CUDA graph mode, 200 tokens). Profiled GPU compute: ~15 ms/tok at 31% of 192 GB/s peak bandwidth. Full performance analysis with per-section breakdown in `PERFORMANCE-ANALYSIS.md`.
+**CUDA alignment constraints**: `__ldg((const unsigned int*)ptr)` requires 4-byte aligned `ptr`. Block sizes NOT divisible by 4: Q8_0 (34B), Q4_0 (18B), Q6_K (210B), Q3_K (110B) — these kernels use byte-level `__ldg` only. Q4_K (144B) and Q5_K (176B) are safe for uint32 `__ldg`.
 
-**Key optimizations applied:**
-
-1. **Coalesced Q6_K kernel** (`matmul_q6_k.cu`): Restructured from half-striped to position-parallel. All 32 warp threads process the same half-block with consecutive byte addresses → perfectly coalesced memory transactions. Output matmul dropped from 8.3 ms/tok to 2.7 ms/tok (3× improvement). This was the single biggest optimization.
-
-2. **Warp-per-row kernels**: All CUDA matmul kernels use 1 warp (32 threads) per output row with `__shfl_down_sync` reduction. Grid: `ceil(rows / (blockSize/32))` blocks.
-
-3. **Q4_K vectorized loads** (`matmul_q4_k.cu`): `__restrict__` + `__ldg` for read-only cache, `uint32` vectorized weight loads (safe: 144 bytes/block is 4-byte aligned), `float4` input loads. Group-level striping ensures full warp utilization.
-
-4. **Q3_K efficient scale decode** (`matmul_q3_k.cu`): Only the 2 needed scales are decoded per sub-block (not all 16). Uses `__ldg` for texture cache.
-
-5. **Q5_K with __ldg** (`matmul_q5_k.cu`): Added `__ldg` for all reads through texture cache.
-
-6. **Cached kernel functions**: `CudaFloatTensor` caches compiled CUfunction to avoid hashmap lookup per matmul.
-
-7. **Removed redundant finish()**: `cuMemcpyDtoH` is synchronous — explicit `cudaContext.finish()` before `readBuffer` was redundant.
-
-**GPU profiling** (enabled via `-Dcuda.profile=true`): Per-section timing with `cudaContext.finish()` barriers. Steady-state breakdown for 1B Q4_K_M:
-- Output Q6_K: 2.7 ms (was 8.3) | FFN Q4_K (GateUp+siluDown): 9.0 ms | Attn+norms: 5.1 ms
-- Total profiled GPU: ~15.5 ms/tok | Wall time: ~21 ms/tok | Gap (~5.5 ms) is Panama FFM per-launch overhead
-
-**CUDA alignment constraints**: `__ldg((const unsigned int*)ptr)` requires 4-byte aligned `ptr`. Block sizes NOT divisible by 4: Q8_0 (34B), Q4_0 (18B), Q6_K (210B), Q3_K (110B). These kernels use byte-level `__ldg` only. Q4_K (144B) and Q5_K (176B) are safe for uint32 `__ldg`.
-
-**Approaches tested and rejected:**
-- Shared memory cooperative loading: __syncthreads overhead outweighed coalescing benefit for small per-row data
-- Concurrent CUDA streams (Gate+Up, K+V): recordEvent+streamWaitEvent sync overhead negated the concurrency gain
-- Per-token Arena reuse: No measurable benefit (Arena.ofConfined allocation is already fast)
-- Q4_K coalesced kernel (`matmul_q4_k_coalesced.cu`): All 32 threads process the same group with single byte/float reads instead of striping across groups with uint32/float4 vectorized reads. Result: 47.1 tok/s vs 51.0 tok/s original (−8%). Q4_K blocks are 144B (4-byte aligned), so vectorized loads are already optimal — coalescing with smaller reads loses instruction-level parallelism without improving bandwidth. Kernel kept as opt-in (`-Dcuda.q4k.coalesced=true`), default is original kernel.
-
-### MoE-optimized GPU placement (2025-02-15)
-
-Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM), Java 25, SimdVectorOps.
-
-| Model | Type | GPU Strategy | Layers on GPU | VRAM Used | tok/s | Quality |
-|-------|------|--------------|---------------|-----------|-------|---------|
-| Qwen3-Coder-30B-A3B Q4_K_M | MoE (128 experts, top-8) | MoE-optimized | 48/48 attn | 540 MB | 1.7 | Perplexity 0.98, Coherence 0.99 |
-| DeepSeek-Coder-V2-Lite Q4_K_M | MoE (64 experts, top-6+2shared) | MoE-optimized | 27/27 attn | 517 MB | 2.1 | Perplexity 0.85, Coherence 1.00 |
-| Llama-3.2-3B Q3_K_L | Dense | Full offload | 28/28 all | 1731 MB | 5.9 | Perplexity 0.96, Coherence 0.95 |
-
-Test: `--prompt "Write a Java class that calculates factorial" --max-tokens 40 --context-length 256 --gpu --gpu-device 1`.
-
-Key takeaway: MoE-optimized placement puts 100% of attention on GPU using only ~540 MB VRAM for a 17.3 GB model. With standard first-N-layers, only ~2/48 layers would fit in 6 GB VRAM for Qwen3-Coder-30B.
+**GPU profiling**: enable via `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. **CPU profiling**: `-Dcpu.profile=true`.
