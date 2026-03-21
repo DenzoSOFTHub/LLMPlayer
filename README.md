@@ -1,4 +1,4 @@
-# LLMPlayer v1.8.0
+# LLMPlayer v1.9.0
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 16 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3, Phi-3/4, Mistral3/Devstral, and **Nemotron-H** (hybrid Mamba-2 + Transformer). Quantized formats: Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32. Includes CUDA GPU acceleration with graph mode (up to 48 tok/s on RTX 4050), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
@@ -480,12 +480,14 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 | 7 | SmolLM3-3B | 3B | Q4_K_M | CUDA graph | 22.9 |
 | 8 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
 | 9 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
-| 10 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
+| 10 | Gemma-3-4B-it | 4B | Q4_K_M | CUDA graph | 16.3 |
+| 11 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
 | 11 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
 | 12 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | CUDA graph (Qwen35) | 13.7 |
-| 13 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
-| 14 | NVIDIA-Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | Per-layer (NemotronH) | 9.9 |
-| 15 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | CUDA graph (Qwen35) | 7.9 |
+| 13 | Mistral-7B-Instruct-v0.3 | 7B | Q4_K_M | CUDA graph | 11.8 |
+| 14 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
+| 15 | NVIDIA-Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | Per-layer (NemotronH) | 9.9 |
+| 16 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | CUDA graph (Qwen35) | 7.9 |
 
 Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 

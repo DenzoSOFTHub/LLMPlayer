@@ -126,7 +126,9 @@ public class Attention {
         System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
 
         // Attention computation - parallel over heads
-        float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
+        float scaleFactor = config.attentionScale() > 0f
+            ? config.attentionScale()
+            : (float) (1.0 / Math.sqrt(headSize));
 
         // Sliding window: local layers attend only to last slidingWindow positions
         // Gemma 3: every 6th layer is global (layer % 6 == 5), rest are local
@@ -246,7 +248,9 @@ public class Attention {
         System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
 
         // Attention computation - parallel over heads
-        float scaleFactor = (float) (1.0 / Math.sqrt(headSize));
+        float scaleFactor = config.attentionScale() > 0f
+            ? config.attentionScale()
+            : (float) (1.0 / Math.sqrt(headSize));
 
         int startPos = 0;
         if (slidingWindow > 0 && !isGlobalLayer(layer)) {

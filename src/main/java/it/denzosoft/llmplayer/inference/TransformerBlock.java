@@ -21,6 +21,8 @@ public class TransformerBlock {
     private final float[][] cachedPostAttnNorm; // null entries if not used
     private final float[][] cachedPostFfnNorm;  // null entries if not used
 
+    private final float residualScale; // Granite: 0.22 (scale before residual add)
+
     // CPU profiling (enabled via -Dcpu.profile=true)
     private final boolean cpuProfile;
     private long profileAttnNormNs, profileAttnNs, profileFfnNormNs, profileFfnNs;
@@ -32,6 +34,7 @@ public class TransformerBlock {
         this.config = config;
         this.attention = attention;
         this.ffn = ffn;
+        this.residualScale = config.residualScale();
         this.cpuProfile = "true".equals(System.getProperty("cpu.profile"));
 
         int dim = config.embeddingLength();
@@ -87,6 +90,11 @@ public class TransformerBlock {
             if (cpuProfile) { t1 = System.nanoTime(); profilePostAttnNormNs += t1 - t0; t0 = t1; }
         }
 
+        // Granite residual scaling: output *= residualScale before adding to residual stream
+        if (residualScale > 0f) {
+            for (int i = 0; i < dim; i++) state.xb[i] *= residualScale;
+        }
+
         // Residual connection: x += attention_output
         VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
         if (cpuProfile) { t1 = System.nanoTime(); profileResidualNs += t1 - t0; t0 = t1; }
@@ -112,6 +120,11 @@ public class TransformerBlock {
         if (cachedPostFfnNorm[layer] != null) {
             RMSNorm.apply(state.xb, state.xb, cachedPostFfnNorm[layer], dim, config.normEps());
             if (cpuProfile) { t1 = System.nanoTime(); profilePostFfnNormNs += t1 - t0; t0 = t1; }
+        }
+
+        // Granite residual scaling for FFN output
+        if (residualScale > 0f) {
+            for (int i = 0; i < dim; i++) state.xb[i] *= residualScale;
         }
 
         // Residual connection: x += ffn_output
