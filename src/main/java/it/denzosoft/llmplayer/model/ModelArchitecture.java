@@ -17,7 +17,8 @@ public enum ModelArchitecture {
     GPT_OSS("gpt-oss"),
     QWEN35("qwen35"),
     SMOLLM3("smollm3"),
-    NEMOTRON_H("nemotron_h");
+    NEMOTRON_H("nemotron_h"),
+    GRANITE("granite");
 
     private final String ggufName;
 
@@ -39,6 +40,9 @@ public enum ModelArchitecture {
         }
         if ("gemma".equals(name)) {
             return GEMMA2; // Gemma1 uses same forward pass
+        }
+        if ("granite".equals(name)) {
+            return GRANITE; // Standard transformer, own chat template + NEOX RoPE
         }
         throw new IllegalArgumentException("Unknown architecture: " + name);
     }

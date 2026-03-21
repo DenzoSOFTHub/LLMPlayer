@@ -232,6 +232,14 @@ public class CudaForwardPass implements AutoCloseable {
     private boolean cublasUseFP16;
     private MemorySegment cublasConvertF16Func;
 
+    // Granite scaling support
+    private final float graniteResidualScale;   // 0 = not used
+    private final float graniteAttentionScale;  // 0 = use standard 1/sqrt(headSize)
+    private final float graniteLogitScale;      // 0 = not used, >0 = divide logits
+    private final MemorySegment scaleFunc;      // scale_inplace kernel
+    private final ParamBuffer scalePB;          // 3 args: x, scale, size
+    private final int scaleDimGridDim;
+
     // Output projection launch descriptor
     private final MatmulLaunch outputMatmul; // null if output not on GPU
 
@@ -362,6 +370,24 @@ public class CudaForwardPass implements AutoCloseable {
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         argmaxPartialFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_partial");
         argmaxFinalFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_final");
+
+        // Granite scaling
+        graniteResidualScale = config.residualScale();
+        graniteAttentionScale = config.attentionScale();
+        graniteLogitScale = config.logitScale() > 0 && config.architecture() == it.denzosoft.llmplayer.model.ModelArchitecture.GRANITE
+            ? (1.0f / config.logitScale()) : 0;
+        if (graniteResidualScale > 0 || graniteLogitScale > 0) {
+            MemorySegment sf = cudaContext.compileKernel("kernels/cuda/scale_inplace.cu", "scale_inplace");
+            scaleFunc = sf;
+            scalePB = new ParamBuffer(arena, 3);
+            scaleDimGridDim = (int) ((dim + blockSize - 1) / blockSize);
+            System.err.println("CUDA: Granite scaling enabled (resScale=" + graniteResidualScale
+                + ", attnScale=" + graniteAttentionScale + ", logitScale=" + graniteLogitScale + ")");
+        } else {
+            scaleFunc = null;
+            scalePB = null;
+            scaleDimGridDim = 0;
+        }
 
         // Compile split_qkv kernel (for merged QKV — Phi3/4)
         if (hasMergedQKV) {
@@ -627,10 +653,12 @@ public class CudaForwardPass implements AutoCloseable {
                 layerMatmuls[i][1] = new MatmulLaunch((CudaFloatTensor) layer.wk(), gpuXb, gpuK, kvDim, dim, 0);
                 layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) layer.wv(), gpuXb, gpuV, kvDim, dim, 0);
             }
-            // Post-norm: Wo/Down write to gpuXb (not accumulate to gpuX), post-norm then accumulate
+            // Post-norm: Wo/Down write to gpuXb, post-norm then accumulate
+            // Granite residual: Wo/Down write to gpuXb, scale, then accumulate (saxpy)
             // Pre-norm: Wo/Down accumulate directly to gpuX (addToOutput=1)
+            boolean woWriteMode = hasPostNorm || graniteResidualScale > 0;
             layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) layer.wo(), gpuXb2,
-                    hasPostNorm ? gpuXb : gpuX, dim, qDim, hasPostNorm ? 0 : 1);
+                    woWriteMode ? gpuXb : gpuX, dim, qDim, woWriteMode ? 0 : 1);
             if (hasPackedFFN) {
                 // Packed FFN: no gate weight, wUp outputs 2*ffnDim → gpuHbPacked, then split kernel
                 layerMatmuls[i][4] = null;
@@ -639,8 +667,9 @@ public class CudaForwardPass implements AutoCloseable {
                 layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0);
                 layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
             }
+            boolean downWriteMode = hasPostNorm || graniteResidualScale > 0;
             layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) layer.wDown(), gpuHb,
-                    hasPostNorm ? gpuXb : gpuX, dim, ffnDim, hasPostNorm ? 0 : 1);
+                    downWriteMode ? gpuXb : gpuX, dim, ffnDim, downWriteMode ? 0 : 1);
 
             // Check if gate and up are both Q4_K for fused kernel (not applicable for packed FFN)
             if (canFuseGateUp && !hasPackedFFN && layer.wGate() instanceof CudaFloatTensor && layer.wUp() instanceof CudaFloatTensor) {
@@ -798,6 +827,9 @@ public class CudaForwardPass implements AutoCloseable {
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
         if (config.expertCount() > 0) return false;
+        // Granite residual/attention/logit scaling is complex — needs dedicated GPU forward pass
+        // TODO: implement GraniteCudaForwardPass with proper scaling kernels
+        if (config.residualScale() > 0) return false;
 
         TransformerLayerWeights firstLayer = weights.layers()[0];
         // Require at least pre-norm or post-norm for attention and FFN
@@ -905,6 +937,15 @@ public class CudaForwardPass implements AutoCloseable {
             }
         } else {
             launchMatmul(outputMatmul);
+        }
+
+        // Granite logit scaling: divide logits by logitScale (on GPU)
+        if (graniteLogitScale != 0) {
+            scalePB.setLong(0, gpuLogits);
+            scalePB.setFloat(1, graniteLogitScale);
+            scalePB.setInt(2, vocabSize);
+            int logitsGridDim = (int) ((vocabSize + blockSize - 1) / blockSize);
+            launchKernel(scaleFunc, logitsGridDim, (int) blockSize, 0, scalePB.ptrs);
         }
 
         // Download logits (cuMemcpyDtoH is synchronous)
@@ -1067,6 +1108,17 @@ public class CudaForwardPass implements AutoCloseable {
             launchBias(gpuV, gpuVBias[layerIdx], kvDim, biasKVGridDim);
         }
 
+        // 2c. Granite attention scale correction: scale Q so that attention kernel's 1/sqrt(headSize)
+        // produces the correct custom scale. Q *= attentionScale * sqrt(headSize)
+        if (graniteAttentionScale > 0) {
+            float correction = graniteAttentionScale * (float) Math.sqrt(headSize);
+            scalePB.setLong(0, gpuQ);
+            scalePB.setFloat(1, correction);
+            scalePB.setInt(2, qDim);
+            int qGridDim = (int) ((qDim + blockSize - 1) / blockSize);
+            launchKernel(scaleFunc, qGridDim, (int) blockSize, 0, scalePB.ptrs);
+        }
+
         // 3. RoPE on Q and K (skip for NoPE layers in SmolLM3/Llama4 iRoPE)
         if (noRopeLayerInterval == 0 || (layerIdx % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
             ropePB.setLong(0, gpuQ);
@@ -1095,7 +1147,12 @@ public class CudaForwardPass implements AutoCloseable {
         // 6. Wo matmul
         launchMatmulCublas(ml[3], layerIdx, 3); // wo
 
-        // 6b. Post-attention norm + accumulate (Gemma2/3)
+        // 6b. Granite residual scaling: gpuX += residualScale * gpuXb (saxpy)
+        if (graniteResidualScale > 0) {
+            launchSaxpy(gpuX, gpuXb, graniteResidualScale, dim);
+        }
+
+        // 6c. Post-attention norm + accumulate (Gemma2/3)
         if (hasPostNorm) {
             postNormPB.setLong(2, gpuPostAttnNormWeights[layerIdx]);
             launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
@@ -1127,7 +1184,12 @@ public class CudaForwardPass implements AutoCloseable {
         // 10. Down projection
         launchMatmulCublas(ml[6], layerIdx, 6); // down
 
-        // 10b. Post-FFN norm + accumulate (Gemma2/3)
+        // 10b. Granite residual scaling for FFN
+        if (graniteResidualScale > 0) {
+            launchSaxpy(gpuX, gpuXb, graniteResidualScale, dim);
+        }
+
+        // 10c. Post-FFN norm + accumulate (Gemma2/3)
         if (hasPostNorm) {
             postNormPB.setLong(2, gpuPostFfnNormWeights[layerIdx]);
             launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
@@ -1280,6 +1342,15 @@ public class CudaForwardPass implements AutoCloseable {
         // Launch graph (replays all captured kernels in one API call)
         cudaContext.launchGraph(graphExec);
 
+        // Granite logit scaling (not in graph — applied after graph launch)
+        if (graniteLogitScale != 0) {
+            scalePB.setLong(0, gpuLogits);
+            scalePB.setFloat(1, graniteLogitScale);
+            scalePB.setInt(2, vocabSize);
+            int logitsGridDim = (int) ((vocabSize + blockSize - 1) / blockSize);
+            launchKernel(scaleFunc, logitsGridDim, (int) blockSize, 0, scalePB.ptrs);
+        }
+
         // Download logits (cuMemcpyDtoH is synchronous — waits for graph to complete)
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
@@ -1329,6 +1400,16 @@ public class CudaForwardPass implements AutoCloseable {
             launchKernel(perHeadNormFunc, headCountKV, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
         }
 
+        // Granite attention scale correction
+        if (graniteAttentionScale > 0) {
+            float correction = graniteAttentionScale * (float) Math.sqrt(headSize);
+            scalePB.setLong(0, gpuQ);
+            scalePB.setFloat(1, correction);
+            scalePB.setInt(2, qDim);
+            int qGridDim = (int) ((qDim + blockSize - 1) / blockSize);
+            launchKernel(scaleFunc, qGridDim, (int) blockSize, 0, scalePB.ptrs);
+        }
+
         // RoPE on Q and K (skip for NoPE layers in SmolLM3/Llama4 iRoPE)
         if (noRopeLayerInterval == 0 || (layerIdx % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
             ropePB.setLong(0, gpuQ);
@@ -1351,6 +1432,11 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Wo projection
         launchMatmul(ml[3]);
+
+        // Granite residual scaling for attention output
+        if (graniteResidualScale > 0) {
+            launchSaxpy(gpuX, gpuXb, graniteResidualScale, dim);
+        }
 
         // Post-attention norm + accumulate (Gemma2/3): rmsnorm(gpuXb) in-place, then gpuX += gpuXb
         if (hasPostNorm) {
@@ -1384,6 +1470,11 @@ public class CudaForwardPass implements AutoCloseable {
 
         // Down projection
         launchMatmul(ml[6]);
+
+        // Granite residual scaling for FFN output
+        if (graniteResidualScale > 0) {
+            launchSaxpy(gpuX, gpuXb, graniteResidualScale, dim);
+        }
 
         // Post-FFN norm + accumulate (Gemma2/3): rmsnorm(gpuXb) in-place, then gpuX += gpuXb
         if (hasPostNorm) {
@@ -1435,6 +1526,16 @@ public class CudaForwardPass implements AutoCloseable {
         } else {
             launchMatmul(ml);
         }
+    }
+
+    /** Launch saxpy: y[i] += a * x[i] */
+    private void launchSaxpy(long y, long x, float a, int size) {
+        scalePB.setLong(0, x);
+        scalePB.setFloat(1, a);
+        scalePB.setInt(2, size);
+        // Use scale_inplace to compute x *= a in-place, then accumulate y += x
+        launchKernel(scaleFunc, (int) ((size + blockSize - 1) / blockSize), (int) blockSize, 0, scalePB.ptrs);
+        launchBias(y, x, size, (int) ((size + blockSize - 1) / blockSize));
     }
 
     private static FloatTensor getLayerTensor(TransformerLayerWeights layer, int idx) {

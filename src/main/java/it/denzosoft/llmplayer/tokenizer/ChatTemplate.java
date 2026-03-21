@@ -62,6 +62,8 @@ public class ChatTemplate {
             return formatGemma(userMessage);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOss(userMessage);
+        } else if (architecture == ModelArchitecture.GRANITE) {
+            return formatGranite(userMessage);
         }
         return formatLlama3(userMessage); // default fallback
     }
@@ -91,6 +93,8 @@ public class ChatTemplate {
             return formatGemmaChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOssChat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.GRANITE) {
+            return formatGraniteChat(systemMessage, userMessage);
         }
         return formatLlama3Chat(systemMessage, userMessage); // default fallback
     }
@@ -223,6 +227,8 @@ public class ChatTemplate {
             return formatGemmaConversation(messages);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOssConversation(messages);
+        } else if (architecture == ModelArchitecture.GRANITE) {
+            return formatGraniteConversation(messages);
         }
         return formatLlama3Conversation(messages);
     }
@@ -565,6 +571,41 @@ public class ChatTemplate {
                 sb.append(")]");
             }
         }
+        return sb.toString();
+    }
+
+    // Granite 3.x multi-turn conversation
+    private String formatGraniteConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            String role = msg[0];
+            String content = msg[1];
+            sb.append("<|start_of_role|>").append(role).append("<|end_of_role|>");
+            sb.append(content);
+            if (!"assistant".equals(role) || messages.indexOf(msg) < messages.size() - 1) {
+                sb.append("<|end_of_text|>\n");
+            }
+        }
+        // If last message is not assistant, add assistant header
+        if (messages.isEmpty() || !"assistant".equals(messages.get(messages.size() - 1)[0])) {
+            sb.append("<|start_of_role|>assistant<|end_of_role|>\n");
+        }
+        return sb.toString();
+    }
+
+    // Granite 3.x: <|start_of_role|>user<|end_of_role|>...<|end_of_text|>
+    private String formatGranite(String userMessage) {
+        return "<|start_of_role|>user<|end_of_role|>" + userMessage + "<|end_of_text|>\n"
+             + "<|start_of_role|>assistant<|end_of_role|>\n";
+    }
+
+    private String formatGraniteChat(String systemMessage, String userMessage) {
+        StringBuilder sb = new StringBuilder();
+        if (systemMessage != null && !systemMessage.isEmpty()) {
+            sb.append("<|start_of_role|>system<|end_of_role|>").append(systemMessage).append("<|end_of_text|>\n");
+        }
+        sb.append("<|start_of_role|>user<|end_of_role|>").append(userMessage).append("<|end_of_text|>\n");
+        sb.append("<|start_of_role|>assistant<|end_of_role|>\n");
         return sb.toString();
     }
 }

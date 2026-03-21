@@ -30,6 +30,14 @@ public final class ModelConfig {
     private final float finalLogitSoftCap;
     private final float attnLogitSoftCap;
     private final float logitScale;
+
+    // Granite-specific scaling factors (mutable — set after construction from metadata)
+    private float embeddingScale;  // multiply embeddings after lookup (Granite: 12.0, Gemma: sqrt(dim))
+    private float attentionScale;  // replace 1/sqrt(headSize) if non-zero (Granite: 1/128)
+    private float residualScale;   // multiply output before residual add (Granite: 0.22)
+    public void setEmbeddingScale(float v) { this.embeddingScale = v; }
+    public void setAttentionScale(float v) { this.attentionScale = v; }
+    public void setResidualScale(float v) { this.residualScale = v; }
     private final int slidingWindow;
 
     // Qwen3.5 SSM (Gated DeltaNet) parameters
@@ -114,6 +122,9 @@ public final class ModelConfig {
         this.finalLogitSoftCap = finalLogitSoftCap;
         this.attnLogitSoftCap = attnLogitSoftCap;
         this.logitScale = logitScale;
+        this.embeddingScale = 0;
+        this.attentionScale = 0;
+        this.residualScale = 0;
         this.slidingWindow = slidingWindow;
         this.ssmConvKernel = ssmConvKernel;
         this.ssmStateSize = ssmStateSize;
@@ -167,6 +178,9 @@ public final class ModelConfig {
     public int qLoraRank() { return qLoraRank; }
     public int expertGatingFunc() { return expertGatingFunc; }
     public float expertWeightsScale() { return expertWeightsScale; }
+    public float embeddingScale() { return embeddingScale; }
+    public float attentionScale() { return attentionScale; }
+    public float residualScale() { return residualScale; }
 
     // Nemotron-H per-layer support
     public int[] perLayerKvHeads() { return perLayerKvHeads; }
@@ -239,7 +253,8 @@ public final class ModelConfig {
         if (arch == ModelArchitecture.LLAMA || arch == ModelArchitecture.DEEPSEEK2
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
-                || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3) {
+                || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
+                || arch == ModelArchitecture.GRANITE) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
                 || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
@@ -309,7 +324,13 @@ public final class ModelConfig {
         float attnLogitSoftCap = metadata.getFloat(prefix + "attn_logit_softcapping", 0f);
 
         // Command-R logit scale (multiplied to output logits)
+        // Granite: logit_scale is DIVIDED (not multiplied) — handled in InferenceEngine
         float logitScale = metadata.getFloat(prefix + "logit_scale", 0f);
+
+        // Granite-specific scaling factors
+        float embeddingScale = metadata.getFloat(prefix + "embedding_scale", 0f);
+        float attentionScale = metadata.getFloat(prefix + "attention.scale", 0f);
+        float residualScale = metadata.getFloat(prefix + "residual_scale", 0f);
 
         // ISWA sliding window (GPT-OSS: 128 tokens for alternating layers)
         int slidingWindow = metadata.getInt(prefix + "attention.sliding_window", 0);
@@ -355,6 +376,11 @@ public final class ModelConfig {
         if (perLayerKvHeads != null) config.perLayerKvHeads = perLayerKvHeads;
         if (perLayerFfnLength != null) config.perLayerFfnLength = perLayerFfnLength;
 
+        // Set Granite scaling factors (must be mutable fields since constructor has too many params)
+        if (embeddingScale != 0) config.setEmbeddingScale(embeddingScale);
+        if (attentionScale != 0) config.setAttentionScale(attentionScale);
+        if (residualScale != 0) config.setResidualScale(residualScale);
+
         return config;
     }
 
@@ -375,6 +401,11 @@ public final class ModelConfig {
         if (slidingWindow > 0) {
             sb.append(String.format(", slidingWindow=%d", slidingWindow));
         }
+        if (embeddingScale > 0 || attentionScale > 0 || residualScale > 0) {
+            sb.append(String.format(", embScale=%.1f, attnScale=%.7f, resScale=%.2f",
+                embeddingScale, attentionScale, residualScale));
+        }
+        if (logitScale > 0) sb.append(String.format(", logitScale=%.1f", logitScale));
         sb.append('}');
         return sb.toString();
     }

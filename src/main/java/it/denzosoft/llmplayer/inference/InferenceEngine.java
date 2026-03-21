@@ -71,8 +71,10 @@ public class InferenceEngine {
         this.finalLogitSoftCap = config.finalLogitSoftCap();
         this.logitScale = config.logitScale();
 
-        // Gemma models scale embeddings by sqrt(dim)
-        if (arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3) {
+        // Embedding scaling: Gemma uses sqrt(dim), Granite uses explicit metadata value
+        if (config.embeddingScale() > 0f) {
+            this.embeddingScale = config.embeddingScale(); // Granite: 12.0
+        } else if (arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3) {
             this.embeddingScale = (float) Math.sqrt(config.embeddingLength());
         } else {
             this.embeddingScale = 0f;
@@ -213,10 +215,14 @@ public class InferenceEngine {
             weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
         }
 
-        // 5. Logit scaling (Command-R): logits *= logitScale
+        // 5. Logit scaling
+        // Command-R: multiply by logitScale
+        // Granite: DIVIDE by logitScale (llama.cpp: 1.0f / f_logit_scale)
         if (logitScale > 0f) {
+            float scale = (config.architecture() == ModelArchitecture.GRANITE)
+                ? (1.0f / logitScale) : logitScale;
             for (int i = 0; i < vocabSize; i++) {
-                state.logits[i] *= logitScale;
+                state.logits[i] *= scale;
             }
         }
 

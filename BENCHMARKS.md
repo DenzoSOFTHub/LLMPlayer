@@ -32,16 +32,18 @@ Benchmarked 2026-03-21 with v1.8.0 (embedding on CPU, improved VRAM budget, Qwen
 | 6 | SmolLM3-3B | 3B | Q4_K_M | 1.8G | **21.4** | 22.9 | CUDA graph (36/36) |
 | 7 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | 1.9G | **21.3** | 22.6 | CUDA graph (28/28) |
 | 8 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | 2.0G | **19.9** | 21.5 | CUDA graph (36/36) |
-| 9 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **18.5** | 18.3 | CUDA graph (36/36) |
+| 9 | Gemma-3-4B-it | 4B | Q4_K_M | 2.3G | **16.3** | — | CUDA graph (34/34) ★ |
+| 10 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **18.5** | 18.3 | CUDA graph (36/36) |
 | 10 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **13.7** | 14.5 | CUDA graph (32/32) |
 | 11 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | 2.5G | **12.3** | 8.7† | **+41%** | CUDA graph (32/32) ★ |
 | 12 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | **11.3** | 7.4† | **+53%** | CUDA graph (32/32) ★ |
 | 13 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **10.8** | 11.2 | CUDA graph (28/28) |
 | 14 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | **10.2** | 10.7 | CUDA graph (36/36) |
-| 15 | Llama-3.1-8B-Instruct | 8B | Q4_K_M | 4.6G | **10.0** | — | CUDA graph (32/32) ★ |
-| 16 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **9.2** | 6.0† | **+53%** | CUDA graph (48/48) ★ |
-| 17 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | 5.2G | **7.0** | 4.5† | **+56%** | CUDA graph (32/32) ★ |
-| 18 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **6.5** | 3.1† | **+110%** | CUDA graph (32/32) ★ |
+| 15 | Mistral-7B-Instruct-v0.3 | 7B | Q4_K_M | 4.1G | **11.8** | — | CUDA graph (32/32) ★ |
+| 16 | Llama-3.1-8B-Instruct | 8B | Q4_K_M | 4.6G | **10.0** | — | CUDA graph (32/32) ★ |
+| 17 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **9.2** | 6.0† | **+53%** | CUDA graph (48/48) ★ |
+| 18 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | 5.2G | **7.0** | 4.5† | **+56%** | CUDA graph (32/32) ★ |
+| 19 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **6.5** | 3.1† | **+110%** | CUDA graph (32/32) ★ |
 
 ### GPU-resident forward pass — per-layer (no CUDA graph)
 
@@ -66,6 +68,9 @@ Key changes vs v1.6.0:
 |--:|-------|--------|-------|-----:|------:|-------:|------|
 | 1 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **6.0** | — | New model |
 | 2 | Aya-23-8B | 8B | Q4_K_M | 4.8G | **1.1** | 7.0 | Command-R arch, no GPU forward pass† |
+| 3 | Granite-3.3-8B-Instruct | 8B | Q4_K_M | 4.6G | **1.0** | — | Granite arch, per-tensor GPU (no chain yet) ★ |
+
+★ Granite 3.3 uses 4 unique scaling factors (embedding_scale=12, attention_scale=1/128, residual_scale=0.22, logit_scale=1/16). Output quality verified. CudaForwardPass GPU chain not yet compatible — needs dedicated GraniteCudaForwardPass with scaling kernels integrated.
 
 † Aya-23-8B: in v1.5.1, detected as LLAMA → CUDA graph. Now correctly detected as COMMAND_R → per-tensor only. Adding COMMAND_R to CudaForwardPass would restore GPU graph speed.
 
