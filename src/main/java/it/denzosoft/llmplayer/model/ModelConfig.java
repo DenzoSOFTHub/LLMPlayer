@@ -51,6 +51,10 @@ public final class ModelConfig {
     // MoE expert weight scale (applied after optional L2 normalization)
     private final float expertWeightsScale;
 
+    // Nemotron-H: per-layer arrays (null for other architectures)
+    private int[] perLayerKvHeads;    // 0=Mamba/FFN, >0=attention
+    private int[] perLayerFfnLength;  // 0=Mamba/attention, >0=FFN
+
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
                        float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
@@ -164,6 +168,27 @@ public final class ModelConfig {
     public int expertGatingFunc() { return expertGatingFunc; }
     public float expertWeightsScale() { return expertWeightsScale; }
 
+    // Nemotron-H per-layer support
+    public int[] perLayerKvHeads() { return perLayerKvHeads; }
+    public int[] perLayerFfnLength() { return perLayerFfnLength; }
+
+    /** Nemotron-H layer type: 0=Mamba-2, 1=Attention, 2=FFN */
+    public int nemotronLayerType(int layer) {
+        if (perLayerKvHeads == null || perLayerFfnLength == null) return -1;
+        if (layer >= perLayerKvHeads.length) return -1;
+        if (perLayerKvHeads[layer] > 0) return 1;  // Attention
+        if (perLayerFfnLength[layer] > 0) return 2; // FFN
+        return 0; // Mamba-2
+    }
+
+    public int nemotronLayerKvHeads(int layer) {
+        return (perLayerKvHeads != null && layer < perLayerKvHeads.length) ? perLayerKvHeads[layer] : headCountKV;
+    }
+
+    public int nemotronLayerFfnLength(int layer) {
+        return (perLayerFfnLength != null && layer < perLayerFfnLength.length) ? perLayerFfnLength[layer] : intermediateSize;
+    }
+
     public static ModelConfig fromMetadata(it.denzosoft.llmplayer.gguf.GGUFMetadata metadata) {
         String archName = metadata.getString("general.architecture", "llama");
         ModelArchitecture arch = ModelArchitecture.fromGgufName(archName);
@@ -173,9 +198,29 @@ public final class ModelConfig {
         int embeddingLength = metadata.getInt(prefix + "embedding_length");
         int blockCount = metadata.getInt(prefix + "block_count");
         int headCount = metadata.getInt(prefix + "attention.head_count");
-        int headCountKV = metadata.getInt(prefix + "attention.head_count_kv", headCount);
+        // head_count_kv and feed_forward_length may be per-layer arrays (Nemotron-H)
+        int headCountKV;
+        int[] perLayerKvHeads = metadata.getIntArray(prefix + "attention.head_count_kv");
+        if (perLayerKvHeads != null) {
+            // Per-layer array (Nemotron-H): use max non-zero value
+            headCountKV = 0;
+            for (int v : perLayerKvHeads) if (v > headCountKV) headCountKV = v;
+            if (headCountKV == 0) headCountKV = headCount;
+        } else {
+            headCountKV = metadata.getInt(prefix + "attention.head_count_kv", headCount);
+            perLayerKvHeads = null;
+        }
         int contextLength = metadata.getInt(prefix + "context_length", 2048);
-        int intermediateSize = metadata.getInt(prefix + "feed_forward_length", embeddingLength * 4);
+        int intermediateSize;
+        int[] perLayerFfnLength = metadata.getIntArray(prefix + "feed_forward_length");
+        if (perLayerFfnLength != null) {
+            intermediateSize = 0;
+            for (int v : perLayerFfnLength) if (v > intermediateSize) intermediateSize = v;
+            if (intermediateSize == 0) intermediateSize = embeddingLength * 4;
+        } else {
+            intermediateSize = metadata.getInt(prefix + "feed_forward_length", embeddingLength * 4);
+            perLayerFfnLength = null;
+        }
 
         // Vocab size from tokenizer
         String[] tokens = metadata.getStringArray("tokenizer.ggml.tokens");
@@ -290,7 +335,12 @@ public final class ModelConfig {
         // MoE expert weight scale (applied after optional L2 normalization)
         float expertWeightsScale = metadata.getFloat(prefix + "expert_weights_scale", 1.0f);
 
-        return new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
+        // Nemotron-H: use ROPE_TYPE_NORMAL for attention layers
+        if (arch == ModelArchitecture.NEMOTRON_H) {
+            ropeType = 0; // ROPE_TYPE_NORMAL
+        }
+
+        ModelConfig config = new ModelConfig(arch, name, embeddingLength, blockCount, headCount, headCountKV,
             contextLength, vocabSize, intermediateSize, ropeFreqBase, normEps, headSize, kvDim,
             ropeType, ropeDimensionCount,
             keyLength, valueLength, kvLoraRank, leadingDenseBlockCount,
@@ -300,6 +350,12 @@ public final class ModelConfig {
             ssmConvKernel, ssmStateSize, ssmGroupCount, ssmTimeStepRank, ssmInnerSize,
             fullAttentionInterval, noRopeLayerInterval,
             qLoraRank, expertGatingFunc, expertWeightsScale);
+
+        // Set per-layer arrays for Nemotron-H
+        if (perLayerKvHeads != null) config.perLayerKvHeads = perLayerKvHeads;
+        if (perLayerFfnLength != null) config.perLayerFfnLength = perLayerFfnLength;
+
+        return config;
     }
 
     @Override

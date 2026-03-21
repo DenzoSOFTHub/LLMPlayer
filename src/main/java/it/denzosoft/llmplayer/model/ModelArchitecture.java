@@ -16,7 +16,8 @@ public enum ModelArchitecture {
     LLAMA4("llama4"),
     GPT_OSS("gpt-oss"),
     QWEN35("qwen35"),
-    SMOLLM3("smollm3");
+    SMOLLM3("smollm3"),
+    NEMOTRON_H("nemotron_h");
 
     private final String ggufName;
 

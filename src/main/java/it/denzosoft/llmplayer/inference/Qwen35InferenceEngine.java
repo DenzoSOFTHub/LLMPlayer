@@ -5,6 +5,7 @@ import it.denzosoft.llmplayer.model.Qwen35LayerWeights;
 import it.denzosoft.llmplayer.model.Qwen35Weights;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.stream.IntStream;
 
@@ -56,6 +57,17 @@ public class Qwen35InferenceEngine {
     // Pre-cached per-layer norm weights for attention layers
     private final float[][] qNormCache;
     private final float[][] kNormCache;
+
+    // GPU forward pass (loaded via reflection from java21/, null if unavailable)
+    private AutoCloseable gpuForwardPass;
+    private int gpuLayerCount;
+    private Method gpuUploadXAndUpdateParams;
+    private Method gpuForwardLayer;
+    private Method gpuForwardGraph;
+    private Method gpuForwardGraphArgmax;
+    private Method gpuForwardFinalLogits;
+    private Method gpuForwardFinalArgmax;
+    private Method gpuDownloadX;
 
     public Qwen35InferenceEngine(ModelConfig config, Qwen35Weights weights, int maxSeqLen,
                                   float[] ropeFreqFactors) {
@@ -114,6 +126,47 @@ public class Qwen35InferenceEngine {
         return cache;
     }
 
+    /**
+     * Try to initialize GPU forward pass via reflection (java21/ Qwen35CudaForwardPass).
+     * Call after construction with the CudaBufferManager from LLMEngine.
+     */
+    public void tryInitGpuForwardPass(Object bufferManager) {
+        try {
+            Class<?> fwdClass = Class.forName("it.denzosoft.llmplayer.inference.Qwen35CudaForwardPass");
+
+            // Check isSupported
+            Method isSup = fwdClass.getMethod("isSupported", ModelConfig.class, Qwen35Weights.class);
+            Boolean supported = (Boolean) isSup.invoke(null, config, weights);
+            if (!supported) {
+                System.err.println("Qwen35 CUDA forward pass: not supported (weights not on GPU)");
+                return;
+            }
+
+            // Construct
+            Object fwd = fwdClass.getConstructor(ModelConfig.class, Qwen35Weights.class,
+                    bufferManager.getClass(), int.class)
+                .newInstance(config, weights, bufferManager, maxSeqLen);
+
+            // Cache methods
+            gpuUploadXAndUpdateParams = fwdClass.getMethod("uploadXAndUpdateParams", float[].class, int.class);
+            gpuForwardLayer = fwdClass.getMethod("forwardLayer", int.class, int.class);
+            gpuForwardGraph = fwdClass.getMethod("forwardGraph", float[].class);
+            gpuForwardGraphArgmax = fwdClass.getMethod("forwardGraphArgmax");
+            gpuForwardFinalLogits = fwdClass.getMethod("forwardFinalLogits", float[].class);
+            gpuForwardFinalArgmax = fwdClass.getMethod("forwardFinalArgmax");
+            gpuDownloadX = fwdClass.getMethod("downloadX", float[].class);
+
+            Method getGpuLayers = fwdClass.getMethod("getGpuLayerCount");
+            gpuLayerCount = (Integer) getGpuLayers.invoke(fwd);
+            gpuForwardPass = (AutoCloseable) fwd;
+
+            System.err.println("Qwen35 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
+        } catch (Throwable e) {
+            System.err.println("Qwen35 CUDA forward pass: unavailable — " + e.getMessage());
+            gpuForwardPass = null;
+        }
+    }
+
     public Qwen35State createState(int maxSeqLen) {
         return new Qwen35State(config, maxSeqLen);
     }
@@ -132,7 +185,17 @@ public class Qwen35InferenceEngine {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
 
-        // 2. Forward through all layers
+        // 2. Try GPU forward pass
+        if (gpuForwardPass != null) {
+            try {
+                return forwardGpu(state, position, computeLogits);
+            } catch (Exception e) {
+                System.err.println("Qwen35 GPU forward failed, falling back to CPU: " + e.getMessage());
+                gpuForwardPass = null;
+            }
+        }
+
+        // 3. CPU forward through all layers
         for (int layer = 0; layer < blockCount; layer++) {
             Qwen35LayerWeights lw = weights.layers()[layer];
             if (lw.isDeltaNet()) {
@@ -144,13 +207,60 @@ public class Qwen35InferenceEngine {
 
         if (!computeLogits) return null;
 
-        // 3. Final RMSNorm
+        // 4. Final RMSNorm
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
 
-        // 4. Output projection
+        // 5. Output projection
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
 
+        return state.logits;
+    }
+
+    private float[] forwardGpu(Qwen35State state, int position, boolean computeLogits) throws Exception {
+        // Upload embedding + token params
+        gpuUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
+
+        // Try CUDA graph (all layers + output in single launch)
+        if (computeLogits && gpuLayerCount == blockCount) {
+            Boolean graphOk = (Boolean) gpuForwardGraph.invoke(gpuForwardPass, state.logits);
+            if (graphOk) return state.logits;
+        }
+
+        // Per-layer GPU forward
+        for (int layer = 0; layer < gpuLayerCount; layer++) {
+            gpuForwardLayer.invoke(gpuForwardPass, layer, position);
+        }
+
+        // If not all layers on GPU, download X and continue on CPU
+        if (gpuLayerCount < blockCount) {
+            gpuDownloadX.invoke(gpuForwardPass, state.x);
+            for (int layer = gpuLayerCount; layer < blockCount; layer++) {
+                Qwen35LayerWeights lw = weights.layers()[layer];
+                if (lw.isDeltaNet()) {
+                    forwardDeltaNet(state, lw, layer);
+                } else {
+                    forwardAttention(state, lw, layer, position);
+                }
+            }
+            if (!computeLogits) return null;
+            VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
+            Arrays.fill(state.logits, 0);
+            weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+            return state.logits;
+        }
+
+        if (!computeLogits) return null;
+
+        // All layers on GPU — try GPU output projection
+        Boolean logitsOk = (Boolean) gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
+        if (logitsOk) return state.logits;
+
+        // Fallback: download X and compute output on CPU
+        gpuDownloadX.invoke(gpuForwardPass, state.x);
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
+        Arrays.fill(state.logits, 0);
+        weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
         return state.logits;
     }
 

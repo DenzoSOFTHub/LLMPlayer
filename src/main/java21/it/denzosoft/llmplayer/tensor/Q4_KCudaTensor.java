@@ -18,6 +18,8 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     private static final boolean USE_COALESCED =
         "true".equals(System.getProperty("cuda.q4k.coalesced", "false"));
+    private static final boolean USE_SMEM =
+        "true".equals(System.getProperty("cuda.q4k.smem", "false"));
 
     public Q4_KCudaTensor(TensorData data, long size, CudaBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -28,11 +30,13 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     protected String kernelResourcePath() {
+        if (USE_SMEM) return "kernels/cuda/matmul_q4_k_smem.cu";
         return USE_COALESCED ? "kernels/cuda/matmul_q4_k_coalesced.cu" : "kernels/cuda/matmul_q4_k.cu";
     }
 
     @Override
     protected String kernelName() {
+        if (USE_SMEM) return "matmul_q4_k_smem";
         return USE_COALESCED ? "matmul_q4_k_coalesced" : "matmul_q4_k";
     }
 
@@ -41,6 +45,12 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     protected int blockSize() { return BLOCK_SIZE; }
+
+    @Override
+    protected int computeSharedMemBytes(int cols, long cudaBlockSize) {
+        // smem kernel needs 256 floats (1024 bytes) for input tile
+        return USE_SMEM ? 256 * 4 : 0;
+    }
 
     @Override
     public float getFloat(long index) {

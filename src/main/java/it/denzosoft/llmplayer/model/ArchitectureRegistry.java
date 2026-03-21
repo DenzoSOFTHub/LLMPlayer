@@ -89,4 +89,9 @@ public final class ArchitectureRegistry {
     public static String ssmNorm(int layer) { return "blk." + layer + ".ssm_norm.weight"; }
     public static String ssmOut(int layer) { return "blk." + layer + ".ssm_out.weight"; }
     public static String postAttnNormWeight(int layer) { return "blk." + layer + ".post_attention_norm.weight"; }
+
+    // Nemotron-H specific tensors
+    public static String ssmIn(int layer) { return "blk." + layer + ".ssm_in.weight"; }
+    public static String ssmD(int layer) { return "blk." + layer + ".ssm_d"; }
+    public static String ssmConv1dBias(int layer) { return "blk." + layer + ".ssm_conv1d.bias"; }
 }
