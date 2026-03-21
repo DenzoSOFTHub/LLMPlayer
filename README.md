@@ -1,6 +1,16 @@
-# LLMPlayer v1.7.0
+# LLMPlayer v1.8.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes GPU acceleration via CUDA and OpenCL (Panama FFM, zero native dependencies), CUDA graph mode for up to 55 tok/s on RTX 4050, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 16 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3, Phi-3/4, Mistral3/Devstral, and **Nemotron-H** (hybrid Mamba-2 + Transformer). Quantized formats: Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32. Includes CUDA GPU acceleration with graph mode (up to 48 tok/s on RTX 4050), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.8.0
+
+- **Nemotron-H architecture**: hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. GPU-resident forward pass with dedicated CUDA kernels (`mamba2_scan.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). 9.9 tok/s for 4B model on RTX 4050.
+- **Qwen3.5 CUDA graph**: new `Qwen35CudaForwardPass` with fused DeltaNet recurrence kernel, transposed S matrix, fused conv1d+SiLU. Qwen3.5-4B: 12 tok/s (+53%), Qwen3.5-9B: 7 tok/s (+110%).
+- **Embedding on CPU** for all architectures: frees ~500 MB VRAM for more GPU layers. Qwen3.5-9B now fits entirely in 6 GB VRAM (was 29/32 layers, now 32/32).
+- **cuBLAS support** (opt-in via `-Dcuda.cublas=true`): pre-dequantizes Q4_K to FP16, uses `cublasGemmEx` for mixed-precision gemv. Bindings via Panama FFM (zero native dependencies). Best for GPUs with >500 GB/s bandwidth.
+- **dp4a integer dot product** (opt-in via `-Dcuda.dp4a=true`): `__dp4a` int8 dot product for Q4_K×Q8_1. Marginal gain on consumer GPUs, more impactful on A100/H100.
+- **Improved VRAM budget**: subtracts non-layer tensor sizes, uses 90% of device memory. More accurate layer offloading for models near the VRAM limit.
+- 8 new CUDA kernels, 5 new models benchmarked (Qwen3.5-2B/9B-Claude-4.6, Llama-3.1-8B, Nemotron-3-Nano-4B).
 
 ## Requirements
 
@@ -308,6 +318,20 @@ LLMPlayer **auto-detects** NVIDIA GPUs and enables CUDA when available. These fl
 
 **Disable CUDA graph at runtime:** Use the JVM property `-Dcuda.nograph=true` to disable CUDA graph capture (useful for debugging or when shared memory is insufficient).
 
+### CUDA JVM Tuning Properties
+
+Advanced performance tuning via JVM system properties (`-Dproperty=value`). These do not require recompilation.
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `-Dcuda.nograph=true` | `false` | Disable CUDA graph; use per-layer kernel launches |
+| `-Dcuda.cublas=true` | `false` | Enable cuBLAS for matmul (dequantizes Q4_K to FP16, uses `libcublas.so`). Useful on high-bandwidth GPUs (A100, H100). On RTX 4050, custom Q4_K kernels + CUDA graph are faster |
+| `-Dcuda.cublas.fp32=true` | `false` | Use FP32 instead of FP16 for cuBLAS (requires 7x VRAM vs Q4_K) |
+| `-Dcuda.dp4a=true` | `false` | Enable `__dp4a` int8 dot product for Qwen3.5 matmul (~2% gain on consumer GPUs, more on datacenter GPUs with dedicated INT8 units) |
+| `-Dcuda.q4k.coalesced=true` | `false` | Alternative coalesced Q4_K kernel (all threads process same group) |
+| `-Dcuda.q4k.smem=true` | `false` | Q4_K kernel with shared-memory input tiling |
+| `-Dcuda.profile=true` | `false` | Per-section GPU timing (adds sync barriers, ~15-25% overhead) |
+
 ### HuggingFace Download
 
 | Option | Type | Default | Description |
@@ -433,6 +457,7 @@ engine.close();
 | Command-R/Cohere (Aya-23) | `command-r` | SentencePiece | `<\|START_OF_TURN_TOKEN\|><\|USER_TOKEN\|>` |
 | OLMo2 | `olmo2` | BPE (gpt2) | `<\|user\|>` |
 | GPT-OSS (Sonar) | `llama` (MoE) | BPE (gpt2) | `<\|start_header_id\|>user<\|end_header_id\|>` |
+| Nemotron-H (Mamba-2 hybrid) | `nemotron_h` | BPE (gpt2) | `<\|im_start\|>user` |
 
 The architecture is automatically detected from the `general.architecture` field in GGUF metadata.
 
@@ -440,7 +465,7 @@ The architecture is automatically detected from the `general.architecture` field
 
 Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s), Java 25, SimdVectorOps.
 
-**28 models tested, 26 produce output** across 15 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS).
+**32+ models tested** across 16 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS, Nemotron-H).
 
 ### Top results — CUDA GPU (ranked by tok/s)
 
@@ -450,13 +475,17 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 | 2 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 48.8 |
 | 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 40.8 |
 | 4 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 33.1 |
-| 5 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 27.8 |
-| 6 | SmolLM3-3B | 3B | Q4_K_M | CUDA graph | 22.9 |
-| 7 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
-| 8 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
-| 9 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
-| 10 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
-| 11 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
+| 5 | Qwen3.5-2B-Claude-4.6 | 2B | Q4_K_M | CUDA graph (Qwen35) | 28.2 |
+| 6 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 27.8 |
+| 7 | SmolLM3-3B | 3B | Q4_K_M | CUDA graph | 22.9 |
+| 8 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
+| 9 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
+| 10 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
+| 11 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
+| 12 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | CUDA graph (Qwen35) | 13.7 |
+| 13 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
+| 14 | NVIDIA-Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | Per-layer (NemotronH) | 9.9 |
+| 15 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | CUDA graph (Qwen35) | 7.9 |
 
 Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
 
@@ -465,6 +494,8 @@ Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). 
 | Strategy | When Used | VRAM Needed | Typical Speed |
 |----------|-----------|-------------|---------------|
 | Full offload + CUDA graph | Dense model fits in VRAM, supported architecture | 770–4794 MB | 8–52 tok/s |
+| Full offload + CUDA graph (Qwen3.5) | Qwen3.5 hybrid DeltaNet+attention fits in VRAM | 1211–5417 MB | 7–28 tok/s |
+| Full offload + per-layer (Nemotron-H) | Nemotron-H hybrid Mamba-2+attention+FFN | 2765 MB | ~10 tok/s |
 | Full offload + per-tensor | Model fits in VRAM, architecture not supported for graph | 770–5000 MB | 1–7 tok/s |
 | MoE-optimized + expert cache | MoE model, attention fits in VRAM | 517–913 MB | 0.7–2.5 tok/s |
 | Partial offload | Dense/hybrid model, first-N layers on GPU | 4615–4909 MB | 0.3–0.7 tok/s |

@@ -7,6 +7,8 @@ import it.denzosoft.llmplayer.inference.InferenceEngine;
 import it.denzosoft.llmplayer.inference.InferenceState;
 import it.denzosoft.llmplayer.inference.Qwen3MoEInferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen3MoEState;
+import it.denzosoft.llmplayer.inference.NemotronHInferenceEngine;
+import it.denzosoft.llmplayer.inference.NemotronHState;
 import it.denzosoft.llmplayer.inference.Qwen35InferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen35State;
 import it.denzosoft.llmplayer.gguf.GGUFTensorInfo;
@@ -42,6 +44,7 @@ public class LLMEngine implements AutoCloseable {
     private final DeepSeek2InferenceEngine ds2Engine;     // DeepSeek2 only
     private final Qwen3MoEInferenceEngine q3moeEngine;   // Qwen3 MoE only
     private final Qwen35InferenceEngine q35Engine;        // Qwen3.5 only
+    private final NemotronHInferenceEngine nemHEngine;   // Nemotron-H only
     private final Tokenizer tokenizer;
     private final ChatTemplate chatTemplate;
     private final SpecialTokens specialTokens;
@@ -81,10 +84,19 @@ public class LLMEngine implements AutoCloseable {
         this.moeOptimizedGpu = moeOptimizedGpu;
 
         ModelArchitecture arch = loadedModel.config().architecture();
-        if (arch == ModelArchitecture.QWEN35) {
+        if (arch == ModelArchitecture.NEMOTRON_H) {
             this.engine = null;
             this.ds2Engine = null;
             this.q3moeEngine = null;
+            this.q35Engine = null;
+            this.nemHEngine = new NemotronHInferenceEngine(
+                loadedModel.config(), loadedModel.nemotronHWeights(), maxContextLength,
+                loadedModel.nemotronHWeights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.QWEN35) {
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = null;
+            this.nemHEngine = null;
             this.q35Engine = new Qwen35InferenceEngine(
                 loadedModel.config(), loadedModel.qwen35Weights(), maxContextLength,
                 loadedModel.qwen35Weights().ropeFreqFactors());
@@ -95,10 +107,12 @@ public class LLMEngine implements AutoCloseable {
                 loadedModel.deepSeek2Weights().ropeFreqFactors());
             this.q3moeEngine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
         } else if (arch == ModelArchitecture.QWEN3MOE) {
             this.engine = null;
             this.ds2Engine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -106,6 +120,7 @@ public class LLMEngine implements AutoCloseable {
             this.engine = null;
             this.ds2Engine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -113,6 +128,7 @@ public class LLMEngine implements AutoCloseable {
             this.engine = null;
             this.ds2Engine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -120,6 +136,7 @@ public class LLMEngine implements AutoCloseable {
             this.engine = null;
             this.ds2Engine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -127,6 +144,7 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q3moeEngine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
             this.engine = new InferenceEngine(loadedModel.config(), loadedModel.weights(), maxContextLength,
                 loadedModel.weights().ropeFreqFactors());
         }
@@ -137,6 +155,22 @@ public class LLMEngine implements AutoCloseable {
             Object bufMgr = TensorFactory.getGpuBufferManager();
             if (bufMgr != null) {
                 this.engine.tryInitGpuForwardPass(bufMgr);
+            }
+        }
+
+        // Try to initialize Qwen3.5 GPU-resident forward pass
+        if (this.q35Engine != null && gpuChainEnabled && gpuResources != null) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.q35Engine.tryInitGpuForwardPass(bufMgr);
+            }
+        }
+
+        // Try to initialize Nemotron-H GPU-resident forward pass
+        if (this.nemHEngine != null && gpuChainEnabled && gpuResources != null) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.nemHEngine.tryInitGpuForwardPass(bufMgr);
             }
         }
 
@@ -225,11 +259,16 @@ public class LLMEngine implements AutoCloseable {
                         }
                     } else if (vram > 0) {
                         // Dense model: standard first-N-layers offload
-                        long bytesPerLayer = modelFileSize / blockCount;
-                        long usableVram = (long) (vram * 0.80);
+                        // Subtract estimated non-layer tensor sizes (output projection, norms)
+                        // to avoid over-attributing their cost to per-layer budget.
+                        // Embedding is loaded on CPU for Qwen3.5 (lookup only), but output goes on GPU.
+                        long nonLayerBytes = estimateNonLayerBytes(quickParse, quickConfig);
+                        long usableVram = (long) (vram * 0.90) - nonLayerBytes;
+                        long layerBytes = Math.max(1, modelFileSize - nonLayerBytes);
+                        long bytesPerLayer = layerBytes / blockCount;
                         int fittableLayers = (int) (usableVram / bytesPerLayer);
-                        gpuLayersUsed = Math.min(fittableLayers, blockCount);
-                        long vramUsedMB = (long) gpuLayersUsed * bytesPerLayer / (1024 * 1024);
+                        gpuLayersUsed = Math.min(Math.max(0, fittableLayers), blockCount);
+                        long vramUsedMB = ((long) gpuLayersUsed * bytesPerLayer + nonLayerBytes) / (1024 * 1024);
                         System.out.println("GPU: offloading " + gpuLayersUsed + "/" + blockCount +
                             " layers to GPU (" + vramUsedMB + " MB VRAM used, " +
                             (vram / 1024 / 1024) + " MB available)");
@@ -332,7 +371,13 @@ public class LLMEngine implements AutoCloseable {
         // Dispatch to appropriate engine
         GenerationResponse response;
         Object stateForCache;
-        if (q35Engine != null) {
+        if (nemHEngine != null) {
+            NemotronHState state = (cached != null)
+                ? (NemotronHState) cached.state
+                : nemHEngine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateNemotronH(nemHEngine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (q35Engine != null) {
             Qwen35State state = (cached != null)
                 ? (Qwen35State) cached.state
                 : q35Engine.createState(maxContextLength);
@@ -379,6 +424,26 @@ public class LLMEngine implements AutoCloseable {
         }
         long genStartTime = System.nanoTime();
 
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override
+                public float[] forward(int token, int position) {
+                    return eng.forward(state, token, position);
+                }
+            });
+    }
+
+    private GenerationResponse generateNemotronH(NemotronHInferenceEngine eng, CompositeSampler sampler,
+                                                  int[] promptTokens, GenerationRequest request,
+                                                  StreamingCallback callback,
+                                                  NemotronHState state, int prefillStart) {
+        int promptLen = promptTokens.length;
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(state, promptTokens[i], i);
+        }
+        long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
             new ForwardFunction() {
                 @Override
@@ -543,6 +608,10 @@ public class LLMEngine implements AutoCloseable {
             Qwen35State state = q35Engine.createState(maxContextLength);
             q35Engine.prefill(state, tokens);
             return l2Normalize(state.xb, dim);
+        } else if (nemHEngine != null) {
+            NemotronHState state = nemHEngine.createState(maxContextLength);
+            nemHEngine.prefill(state, tokens);
+            return l2Normalize(state.xb, dim);
         }
         throw new IllegalStateException("No inference engine available");
     }
@@ -693,6 +762,15 @@ public class LLMEngine implements AutoCloseable {
                 trainingState = state;
             }
             return q35Engine.forward(state, token, position);
+        } else if (nemHEngine != null) {
+            NemotronHState state;
+            if (trainingState instanceof NemotronHState) {
+                state = (NemotronHState) trainingState;
+            } else {
+                state = nemHEngine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return nemHEngine.forward(state, token, position);
         }
         throw new IllegalStateException("No inference engine available for training");
     }
@@ -1231,6 +1309,21 @@ public class LLMEngine implements AutoCloseable {
     private static long tensorByteSize(it.denzosoft.llmplayer.gguf.GGUFFile gguf, String name) {
         GGUFTensorInfo info = gguf.findTensor(name);
         return info != null ? info.byteSize() : 0;
+    }
+
+    /**
+     * Estimate byte size of non-layer tensors (token embedding, output projection, output norm).
+     * Used to improve VRAM budget accuracy for dense models.
+     * Note: embedding is loaded on CPU for Qwen3.5, so we only count output + norm.
+     */
+    private static long estimateNonLayerBytes(it.denzosoft.llmplayer.gguf.GGUFFile gguf, ModelConfig config) {
+        long total = 0;
+        // Output projection (goes on GPU if available)
+        total += tensorByteSize(gguf, ArchitectureRegistry.OUTPUT);
+        // Output norm (tiny but include for accuracy)
+        total += tensorByteSize(gguf, ArchitectureRegistry.OUTPUT_NORM);
+        // Token embedding is loaded on CPU for all architectures (only used for lookup)
+        return total;
     }
 
     /**

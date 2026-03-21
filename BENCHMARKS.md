@@ -6,9 +6,13 @@
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
 - **Prompt:** `"Write a Java class that calculates factorial recursively"` — `--max-tokens 60 --context-length 512`
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
-- **Date:** 2026-03-09
+- **Date:** 2026-03-21 (updated)
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## Results v1.8.0
+
+**New in this version:** Qwen3.5 CUDA graph forward pass (`Qwen35CudaForwardPass`), fused DeltaNet recurrence kernel (`deltanet_fused.cu`), embedding on CPU for all architectures (frees ~500+ MB VRAM), improved VRAM budget estimation, cuBLAS support (opt-in via `-Dcuda.cublas=true`), dp4a integer dot product (opt-in via `-Dcuda.dp4a=true`).
 
 ## Results v1.6.0
 
@@ -16,36 +20,52 @@
 
 ### Full GPU offload — CUDA graph (model fits in 6 GB VRAM)
 
-| # | Model | Params | Quant | Size | tok/s | v1.5.1 | Change | GPU Mode |
-|--:|-------|--------|-------|-----:|------:|-------:|-------:|----------|
-| 1 | OLMo-2-1B-Instruct | 1B | Q4_K_M | 893M | **52.1** | 25.5 | **+104%** | CUDA graph (16/16) ★ |
-| 2 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | 771M | **48.8** | 54.7 | -11% | CUDA graph (16/16) |
-| 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | 1.1G | **40.8** | 41.5 | -2% | CUDA graph (28/28) |
-| 4 | Gemma-3-1B-it | 1B | Q4_K_M | 769M | **33.1** | 35.7 | -7% | CUDA graph (26/26) |
-| 5 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | 738M | **27.8** | 28.7 | -3% | CUDA graph (16/16) |
-| 6 | SmolLM3-3B | 3B | Q4_K_M | 1.8G | **22.9** | — | New | CUDA graph (36/36) ★ |
-| 7 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | 1.9G | **22.6** | 23.8 | -5% | CUDA graph (28/28) |
-| 8 | Llama-3.2-1B-Instruct | 1B | IQ3_XXS | 537M | **22.6** | 1.3 | **+17x** | CUDA graph (16/16) ★ |
-| 9 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | 2.0G | **21.5** | 21.8 | -1% | CUDA graph (36/36) |
-| 10 | Qwen2.5-3B-Instruct | 3B | Q4_K_M | 2.0G | **21.4** | 21.7 | -1% | CUDA graph (36/36) |
-| 11 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **18.3** | 19.0 | -4% | CUDA graph (36/36) |
-| 12 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **14.5** | 11.5 | **+26%** | CUDA graph (32/32) ★ |
-| 13 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **11.2** | 11.3 | = | CUDA graph (28/28) |
-| 14 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | **10.7** | 9.3 | **+15%** | CUDA graph (36/36) ★ |
-| 15 | Phi-3-mini-4k-Instruct | 3.8B | IQ4_NL | 2.1G | **8.8** | 6.5 | **+35%** | CUDA graph ★ |
-| 16 | Gemma-2-2B-it | 2B | IQ4_XS | 1.5G | **8.6** | 9.0 | -4% | CUDA graph (26/26) |
-| 17 | Llama-3.2-3B-Instruct | 3B | Q3_K_L | 1.7G | **8.2** | 8.3 | = | CUDA graph (28/28) |
+Benchmarked 2026-03-21 with v1.8.0 (embedding on CPU, improved VRAM budget, Qwen35CudaForwardPass).
 
-★ Major improvement: OLMo-2 (+104%, architecture now recognized), SmolLM3-3B (new architecture, 22.9 tok/s with NoPE support), Llama-1B IQ3_XXS (+17x, IQ kernels now complete), Phi-4-mini (+26%, CUDA graph now supported), DeepSeek-R1-Qwen3-8B (+15%), Phi-3-mini (+35%).
+| # | Model | Params | Quant | Size | tok/s | v1.6.0 | GPU Mode |
+|--:|-------|--------|-------|-----:|------:|-------:|----------|
+| 1 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | 771M | **47.7** | 48.8 | CUDA graph (16/16) |
+| 2 | OLMo-2-1B-Instruct | 1B | Q4_K_M | 893M | **46.8** | 52.1 | CUDA graph (16/16) |
+| 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | 1.1G | **37.3** | 40.8 | CUDA graph (28/28) |
+| 4 | Gemma-3-1B-it | 1B | Q4_K_M | 769M | **31.6** | 33.1 | CUDA graph (26/26) |
+| 5 | Qwen3.5-2B-Claude-4.6 | 2B | Q4_K_M | 1.2G | **26.2** | — | CUDA graph (24/24) ★ |
+| 6 | SmolLM3-3B | 3B | Q4_K_M | 1.8G | **21.4** | 22.9 | CUDA graph (36/36) |
+| 7 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | 1.9G | **21.3** | 22.6 | CUDA graph (28/28) |
+| 8 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | 2.0G | **19.9** | 21.5 | CUDA graph (36/36) |
+| 9 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **18.5** | 18.3 | CUDA graph (36/36) |
+| 10 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **13.7** | 14.5 | CUDA graph (32/32) |
+| 11 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | 2.5G | **12.3** | 8.7† | **+41%** | CUDA graph (32/32) ★ |
+| 12 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | **11.3** | 7.4† | **+53%** | CUDA graph (32/32) ★ |
+| 13 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **10.8** | 11.2 | CUDA graph (28/28) |
+| 14 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | **10.2** | 10.7 | CUDA graph (36/36) |
+| 15 | Llama-3.1-8B-Instruct | 8B | Q4_K_M | 4.6G | **10.0** | — | CUDA graph (32/32) ★ |
+| 16 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **9.2** | 6.0† | **+53%** | CUDA graph (48/48) ★ |
+| 17 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | 5.2G | **7.0** | 4.5† | **+56%** | CUDA graph (32/32) ★ |
+| 18 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **6.5** | 3.1† | **+110%** | CUDA graph (32/32) ★ |
+
+### GPU-resident forward pass — per-layer (no CUDA graph)
+
+| # | Model | Params | Quant | Size | tok/s | GPU Mode |
+|--:|-------|--------|-------|-----:|------:|----------|
+| 1 | NVIDIA-Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | 2.7G | **9.9** | Per-layer (42/42) ★ |
+
+★ New architecture: Nemotron-H hybrid Mamba-2 + Attention + squared-ReLU FFN. GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated Mamba-2 scan kernel. CUDA graph not yet supported (DtoD copies in Mamba layers).
+
+★ New models or major improvements. † Previously per-tensor only (no CUDA graph / partial GPU offload).
+
+Key changes vs v1.6.0:
+- **Qwen3.5 CUDA graph**: new `Qwen35CudaForwardPass` with fused DeltaNet recurrence kernel. Qwen3.5-4B: +41-53%, Qwen3.5-9B: +56-110%.
+- **Qwen3.5-9B now fits in 6 GB VRAM**: embedding on CPU frees ~500 MB, enabling 32/32 layer offload (was 29/32).
+- **Yi-Coder-9B +53%**: same VRAM optimization moved from 29→48/48 layers + graph.
+- **Llama-3.1-8B-Instruct**: new model, 10.0 tok/s with full GPU offload.
+- Small regressions (1-8%) on some models due to VRAM budget recalculation changing memory allocation patterns.
 
 ### Per-tensor CUDA matmul (no CUDA graph)
 
 | # | Model | Params | Quant | Size | tok/s | v1.5.1 | Note |
 |--:|-------|--------|-------|-----:|------:|-------:|------|
-| 1 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | **7.4** | 8.0 | Hybrid DeltaNet — no GPU forward pass |
-| 2 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **6.0** | — | New model |
-| 3 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **3.1** | — | Hybrid DeltaNet |
-| 4 | Aya-23-8B | 8B | Q4_K_M | 4.8G | **1.1** | 7.0 | Command-R arch, no GPU forward pass† |
+| 1 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **6.0** | — | New model |
+| 2 | Aya-23-8B | 8B | Q4_K_M | 4.8G | **1.1** | 7.0 | Command-R arch, no GPU forward pass† |
 
 † Aya-23-8B: in v1.5.1, detected as LLAMA → CUDA graph. Now correctly detected as COMMAND_R → per-tensor only. Adding COMMAND_R to CudaForwardPass would restore GPU graph speed.
 
@@ -53,12 +73,14 @@
 
 | # | Model | Params | Quant | Size | tok/s | v1.5.1 | Strategy |
 |--:|-------|--------|-------|-----:|------:|-------:|----------|
-| 1 | Sonar-OSS-20B | 20B (MoE) | MXFP4+Q8 | 12G | **2.5** | — | MoE-optimized + expert GPU cache ★ |
-| 2 | DeepSeek-V2-Lite | 16B (2.4B active) | Q4_K_M | 9.7G | **1.6** | 1.5 | MoE-optimized |
-| 3 | Phi-4 | 14B | Q4_K | 8.5G | **0.7** | 0.7 | First-N-layers (22/40) |
-| 4 | GLM-4.7-Flash | 17B (MoE) | Q4_K_M | 18G | **0.7** | — | MoE-optimized |
-| 5 | Devstral-24B | 24B | Q4_K_M | 14G | **0.3** | — | Partial offload |
-| 6 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | **0.3** | 0.2 | Mixed (no IQ2_S/IQ3_S kernel) |
+| 1 | Qwen3.5-9B-Claude-4.6-Opus-Reasoning | 9B | Q4_K_M | 5.2G | **7.9** | 4.5† | **+76%** | CUDA graph (32/32) ★ |
+| 2 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **3.1** | — | — | Hybrid DeltaNet (per-tensor, pre-graph) |
+| 3 | Sonar-OSS-20B | 20B (MoE) | MXFP4+Q8 | 12G | **2.5** | — | MoE-optimized + expert GPU cache ★ |
+| 4 | DeepSeek-V2-Lite | 16B (2.4B active) | Q4_K_M | 9.7G | **1.6** | 1.5 | MoE-optimized |
+| 5 | Phi-4 | 14B | Q4_K | 8.5G | **0.7** | 0.7 | First-N-layers (22/40) |
+| 6 | GLM-4.7-Flash | 17B (MoE) | Q4_K_M | 18G | **0.7** | — | MoE-optimized |
+| 7 | Devstral-24B | 24B | Q4_K_M | 14G | **0.3** | — | Partial offload |
+| 8 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | **0.3** | 0.2 | Mixed (no IQ2_S/IQ3_S kernel) |
 
 ★ Sonar-OSS-20B: new MXFP4 CUDA kernel + expert GPU cache (LRU, batched kernel execution with 2 sync points per MoE layer). MoE-optimized placement: attention on GPU (~654 MB VRAM), expert tensors on CPU.
 
@@ -83,22 +105,24 @@
 | 15 | Llama-3.2-3B-Instruct | 3B | Q3_K_L | 1.7G | 1.1 | **8.2** | **7x** |
 | 16 | Qwen3-4B | 4B | Q4_K_M | 2.4G | 1.1 | **18.3** | **17x** |
 | 17 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | 1.1 | **14.5** | **13x** |
-| 18 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | 0.9 | **7.4** | **8x** |
-| 19 | GLM-4.7-Flash | 17B (MoE) | Q4_K_M | 18G | 0.7 | **0.7** | 1.0x |
-| 20 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | 0.6 | **11.2** | **19x** |
-| 21 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | 0.6 | **10.7** | **18x** |
-| 22 | Aya-23-8B | 8B | Q4_K_M | 4.8G | 0.6 | **1.1** | 1.8x |
-| 23 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | 0.5 | **3.1** | **6x** |
-| 24 | Phi-4 | 14B | Q4_K | 8.5G | 0.3 | **0.7** | 2.3x |
-| 25 | Devstral-24B | 24B | Q4_K_M | 14G | TIMEOUT | **0.3** | — |
-| 26 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | 0.2 | **0.3** | 1.5x |
-| 27 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | TIMEOUT | **6.0** | — |
+| 18 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | 0.9 | **12.8** | **14x** |
+| 19 | Qwen3.5-4B-Claude-4.6-Opus-Reasoning | 4B | Q4_K_M | 2.5G | 0.9 | **13.8** | **15x** |
+| 20 | GLM-4.7-Flash | 17B (MoE) | Q4_K_M | 18G | 0.7 | **0.7** | 1.0x |
+| 21 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | 0.6 | **11.2** | **19x** |
+| 22 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | 0.6 | **10.7** | **18x** |
+| 23 | Aya-23-8B | 8B | Q4_K_M | 4.8G | 0.6 | **1.1** | 1.8x |
+| 24 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | 0.5 | **3.1** | **6x** |
+| 25 | Qwen3.5-9B-Claude-4.6-Opus-Reasoning | 9B | Q4_K_M | 5.2G | 0.6 | **4.5** | **8x** |
+| 26 | Phi-4 | 14B | Q4_K | 8.5G | 0.3 | **0.7** | 2.3x |
+| 27 | Devstral-24B | 24B | Q4_K_M | 14G | TIMEOUT | **0.3** | — |
+| 28 | Aya-23-8B | 8B | IQ3_XXS | 3.2G | 0.2 | **0.3** | 1.5x |
+| 29 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | TIMEOUT | **6.0** | — |
 
 **Key takeaway:** GPU acceleration provides **5–19x speedup** for models that fit in VRAM with CUDA graph. The benefit is greatest for 3B–8B models (16–19x). MoE models with partial GPU offload see modest 1–2x improvement due to CPU-bound expert computation. CPU-only achieves 1–4 tok/s for 1B models, <1 tok/s for 7B+.
 
 ## Key Observations (v1.6.0)
 
-1. **28 models tested, 26 produce output.** Timeouts for Qwen3-Coder-30B-A3B (18 GB, needs more time).
+1. **32+ models tested across 16 architectures** including Nemotron-H (Mamba-2 hybrid).
 
 2. **GPU provides 5–19x speedup over CPU-only.** CUDA graph models achieve 8–52 tok/s vs 0.6–4.1 tok/s on CPU. Largest speedup on 3B–8B models (16–19x). CPU-only is viable only for 1B models (~4 tok/s).
 

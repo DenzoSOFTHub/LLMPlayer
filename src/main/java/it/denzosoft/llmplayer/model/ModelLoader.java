@@ -21,17 +21,20 @@ public class ModelLoader {
         private final DeepSeek2Weights deepSeek2Weights;
         private final Qwen3MoEWeights qwen3MoEWeights;
         private final Qwen35Weights qwen35Weights;
+        private final NemotronHWeights nemotronHWeights;
         private final Tokenizer tokenizer;
 
         public LoadedModel(GGUFFile ggufFile, ModelConfig config, ModelWeights weights,
                            DeepSeek2Weights deepSeek2Weights, Qwen3MoEWeights qwen3MoEWeights,
-                           Qwen35Weights qwen35Weights, Tokenizer tokenizer) {
+                           Qwen35Weights qwen35Weights, NemotronHWeights nemotronHWeights,
+                           Tokenizer tokenizer) {
             this.ggufFile = ggufFile;
             this.config = config;
             this.weights = weights;
             this.deepSeek2Weights = deepSeek2Weights;
             this.qwen3MoEWeights = qwen3MoEWeights;
             this.qwen35Weights = qwen35Weights;
+            this.nemotronHWeights = nemotronHWeights;
             this.tokenizer = tokenizer;
         }
 
@@ -41,6 +44,7 @@ public class ModelLoader {
         public DeepSeek2Weights deepSeek2Weights() { return deepSeek2Weights; }
         public Qwen3MoEWeights qwen3MoEWeights() { return qwen3MoEWeights; }
         public Qwen35Weights qwen35Weights() { return qwen35Weights; }
+        public NemotronHWeights nemotronHWeights() { return nemotronHWeights; }
         public Tokenizer tokenizer() { return tokenizer; }
 
         @Override
@@ -87,10 +91,13 @@ public class ModelLoader {
         DeepSeek2Weights ds2Weights = null;
         Qwen3MoEWeights q3moeWeights = null;
         Qwen35Weights q35Weights = null;
+        NemotronHWeights nemHWeights = null;
 
         ModelArchitecture arch = config.architecture();
         boolean isMoEArch = config.expertCount() > 0;
-        if (arch == ModelArchitecture.QWEN35) {
+        if (arch == ModelArchitecture.NEMOTRON_H) {
+            nemHWeights = loadNemotronHWeights(gguf, config, gpuLayers);
+        } else if (arch == ModelArchitecture.QWEN35) {
             q35Weights = loadQwen35Weights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.DEEPSEEK2) {
             ds2Weights = loadDeepSeek2Weights(gguf, config, gpuLayers, moeOptimizedGpu);
@@ -111,19 +118,28 @@ public class ModelLoader {
         long elapsed = System.currentTimeMillis() - startTime;
         System.out.println("  Model loaded in " + elapsed + "ms");
 
-        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, q35Weights, tokenizer);
+        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, q35Weights, nemHWeights, tokenizer);
     }
 
     private static Qwen35Weights loadQwen35Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        // Load embedding with GPU disabled — it's only used for 1-element lookup per token
+        // Keeping it on CPU frees ~500+ MB of VRAM for more layers
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
         FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
         FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
 
         FloatTensor output;
         GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
         if (outputInfo != null) {
+            // Separate output tensor: load with GPU enabled (used for matmul every token)
             output = createTensor(gguf, outputInfo);
         } else {
-            output = tokenEmbedding;
+            // Weight tying: output shares data with embedding.
+            // Reload the same tensor data with GPU enabled for the output projection.
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
         }
 
         boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
@@ -176,16 +192,23 @@ public class ModelLoader {
     }
 
     private static ModelWeights loadWeights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        // Load embedding with GPU disabled — only used for 1-element lookup per token.
+        // Frees ~500+ MB of VRAM for more layers on GPU.
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
         FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
         FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
 
-        // Output weight may be tied to token embedding
+        // Output weight: loaded with GPU enabled (used for matmul every token)
         FloatTensor output;
         GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
         if (outputInfo != null) {
             output = createTensor(gguf, outputInfo);
         } else {
-            output = tokenEmbedding; // weight tying
+            // Weight tying: reload on GPU for the output projection matmul
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
         }
 
         // For partial GPU offloading: if gpuLayers >= 0, only load first N layers on GPU
@@ -246,7 +269,12 @@ public class ModelLoader {
 
     private static DeepSeek2Weights loadDeepSeek2Weights(GGUFFile gguf, ModelConfig config,
                                                           int gpuLayers, boolean moeOptimizedGpu) {
+        // Embedding on CPU (lookup only, saves VRAM)
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
         FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
         FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
 
         FloatTensor output;
@@ -254,7 +282,7 @@ public class ModelLoader {
         if (outputInfo != null) {
             output = createTensor(gguf, outputInfo);
         } else {
-            output = tokenEmbedding;
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
         }
 
         int blockCount = config.blockCount();
@@ -394,7 +422,12 @@ public class ModelLoader {
 
     private static Qwen3MoEWeights loadQwen3MoEWeights(GGUFFile gguf, ModelConfig config,
                                                         int gpuLayers, boolean moeOptimizedGpu) {
+        // Embedding on CPU (lookup only, saves VRAM)
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
         FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
         FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
 
         FloatTensor output;
@@ -402,7 +435,7 @@ public class ModelLoader {
         if (outputInfo != null) {
             output = createTensor(gguf, outputInfo);
         } else {
-            output = tokenEmbedding;
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
         }
 
         int blockCount = config.blockCount();
@@ -538,6 +571,63 @@ public class ModelLoader {
         if (t != null) return t;
         throw new IllegalStateException("Required tensor not found: " + ArchitectureRegistry.ffnNorm(layer)
             + " (also tried " + ArchitectureRegistry.postAttnNorm(layer) + ")");
+    }
+
+    private static NemotronHWeights loadNemotronHWeights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        // Embedding on CPU
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
+        FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
+        FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
+        FloatTensor output;
+        GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
+        if (outputInfo != null) {
+            output = createTensor(gguf, outputInfo);
+        } else {
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        }
+
+        boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
+        Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
+
+        NemotronHLayerWeights[] layers = new NemotronHLayerWeights[config.blockCount()];
+        for (int i = 0; i < config.blockCount(); i++) {
+            if (partialOffload && i >= gpuLayers) {
+                TensorFactory.setGpuBufferManager(null);
+            }
+
+            FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
+            int type = config.nemotronLayerType(i);
+
+            if (type == 0) { // Mamba-2
+                layers[i] = new NemotronHLayerWeights(attnNorm,
+                    loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ssmOut(i)));
+            } else if (type == 1) { // Attention
+                layers[i] = new NemotronHLayerWeights(attnNorm,
+                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnOutput(i)));
+            } else { // FFN
+                layers[i] = new NemotronHLayerWeights(attnNorm,
+                    loadTensor(gguf, ArchitectureRegistry.ffnUp(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ffnDown(i)));
+            }
+        }
+
+        if (partialOffload) TensorFactory.setGpuBufferManager(savedGpuManager);
+
+        float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
+        return new NemotronHWeights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
     }
 
     private static float[] loadRopeFreqFactors(GGUFFile gguf, ModelConfig config) {

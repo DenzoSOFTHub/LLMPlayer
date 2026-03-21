@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, DeepSeek2, GLM4, Gemma 2, Gemma 3, Phi-3/4, and Mistral3/Devstral architectures with quantized formats (Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS/Sonar, and Nemotron-H (hybrid Mamba-2) architectures with quantized formats (Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -33,7 +33,7 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --ena
 
 Unit test directory exists but is empty. Integration tests for the OpenAI-compatible API are in `test-openai-api.sh` (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures (llama, qwen2, qwen3, phi3, deepseek2, mistral3) with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
 
-`run.sh` (Linux/macOS) and `run.bat` (Windows) are pre-configured launcher scripts with all required JVM flags for Java 25.
+`run.sh` (Linux/macOS) and `run.bat` (Windows) are launcher scripts with all required JVM flags for Java 25, but they are **not checked into the repo** (excluded via `.gitignore`). Create them locally — see README.md for the script contents.
 
 **Note:** The `java21` Maven profile still uses `<release>25</release>` — it requires a Java 25 compiler but excludes the `java25/` source root and `--enable-preview`. Only the `java8` profile actually targets an older compiler release.
 
@@ -54,6 +54,8 @@ The project compiles from three source roots under the default `java25` profile:
 - `src/main/java/` — core code, Java 8 compatible
 - `src/main/java21/` — Java 21-only code (SIMD tensor ops, SIMD-optimized quantized tensors, OpenCL GPU bindings, CUDA GPU bindings, GPU forward pass)
 - `src/main/java25/` — Java 25-only code (StructuredTaskScope batch generation, virtual thread matmul, matmul benchmark)
+
+**Token embedding optimization**: across all architectures, the token embedding tensor is loaded on CPU (not GPU). It is only used for a single-element lookup per token (~16 KB), making GPU residency wasteful (~500+ MB of VRAM). When output weights are tied to embedding weights, the output tensor is reloaded separately on GPU for the matmul projection.
 
 Classes in `java21/` and `java25/` are **never imported directly** from base code. They are loaded via `Class.forName()` reflection with try/catch fallbacks, allowing graceful degradation on older JVMs. There are six reflection loading sites:
 
@@ -81,7 +83,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 | `evaluator` | Response quality metrics (perplexity, coherence, length) |
 | `gguf` | GGUF file format parser — memory-mapped with parallel preload |
 | `gpu` | GPU config (base); CUDA and OpenCL bindings and buffer management (java21) |
-| `inference` | Transformer forward pass — `InferenceEngine` (standard), `DeepSeek2InferenceEngine` (MLA + MoE), `Qwen35InferenceEngine` (hybrid DeltaNet + attention) |
+| `inference` | Transformer forward pass — `InferenceEngine` (standard), `DeepSeek2InferenceEngine` (MLA + MoE), `Qwen3MoEInferenceEngine` (GQA + MoE), `Qwen35InferenceEngine` (hybrid DeltaNet + attention), `NemotronHInferenceEngine` (hybrid Mamba-2 + attention + FFN) |
 | `model` | Model loading, config extraction from GGUF metadata, weight structures |
 | `sampler` | Token sampling (temperature, top-k, top-p, repetition penalty) |
 | `tensor` | Tensor operations and quantization/dequantization; GPU variants in java21 |
@@ -100,7 +102,8 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 
 ### Inference engine dispatch (four paths)
 
-1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3. Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias, sliding window, dual RoPE) + `SwiGLUFFN` (with GeGLU for Gemma). Gemma 2/3 use pre+post attention/FFN norms and embedding scaling.
+1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3, Command-R, OLMo2, GPT-OSS.
+5. **Nemotron-H** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias, sliding window, dual RoPE) + `SwiGLUFFN` (with GeGLU for Gemma). Gemma 2/3 use pre+post attention/FFN norms and embedding scaling.
 2. **DeepSeek2** (`DeepSeek2InferenceEngine`): DeepSeek2 and GLM-4.7-Flash (also uses `deepseek2` GGUF arch). Uses MLA (Multi-Head Latent Attention) + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 3. **Qwen3 MoE** (`Qwen3MoEInferenceEngine`): Qwen3-Coder-30B-A3B and similar. Standard GQA attention with QK-norm + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 4. **Qwen3.5** (`Qwen35InferenceEngine`): Hybrid DeltaNet + full attention architecture. Alternates Gated DeltaNet (linear attention/SSM) and standard GQA layers in a 3:1 ratio (`full_attention_interval=4`). DeltaNet layers use recurrent state `S` with update rule `S_new = alpha*S + beta*outer(k, v - alpha*S^T@k)`, output `o = S^T_new @ q`. Full attention layers use a packed Q+gate projection where `wq` outputs interleaved `[Q_h0, gate_h0, Q_h1, gate_h1, ...]` — these must be deinterleaved into separate Q and gate arrays before use. Gate is applied as `sigmoid(gate) * attn_output`. Both layer types include short conv1d (width 4) on Q/K and use QK-norm. State is maintained per-layer in `Qwen35State`.
@@ -206,18 +209,34 @@ Three data scenarios auto-detected from CLI flags: `--source` (code), `--documen
 
 `LLMEngine.forwardSingleToken(token, position)` is the training-specific API: runs a single forward pass returning logits, with a lazily-created persistent inference state. Works with all three inference engine types (standard, DeepSeek2, Qwen3MoE).
 
+### Thinking/reasoning mode
+
+Enabled via `--thinking` CLI flag or `"thinking": true` in OpenAI API requests. Architecture-specific:
+- **SmolLM3**: injects `/think` into the system prompt
+- **Qwen3/Qwen3.5**: by default, thinking is suppressed (system prompt instructs no `<think>` blocks); `--thinking` removes the suppressor
+
+### Tool calling
+
+Architecture-aware tool calling via the OpenAI API (`tools` array in request). Two formats:
+- **SmolLM3**: Hermes-style XML (`<tool_call>` tags, `<tool_response>` for results) — implemented in `ChatTemplate.formatToolsSystemPrompt()`, `formatToolResult()`, `formatAssistantToolCalls()`
+- **Other models**: generic JSON prompt injection
+
+Response parsing in `OpenAIHandler.tryParseToolCalls()`. Multi-tool-call parsing supported. Full documentation in `TOOL-CALLING.md`.
+
 ### Adding a new model architecture
 
 1. Add enum value to `ModelArchitecture` with its GGUF `general.architecture` string
 2. Add any architecture-specific tensor name patterns to `ArchitectureRegistry` (standard names like `blk.{n}.attn_q.weight` are shared across most architectures)
 3. Update `ModelConfig.fromMetadata()` if the architecture uses non-standard metadata keys for hyperparameters
 4. Add a chat template branch in `ChatTemplate.formatUserMessage()` and `ChatTemplate.formatConversation()`
-5. If the architecture's forward pass differs from standard transformer attention+FFN, create a dedicated inference engine class (see `DeepSeek2InferenceEngine` as reference)
+5. If the architecture's forward pass differs from standard transformer attention+FFN, create a dedicated inference engine class (see `DeepSeek2InferenceEngine` for MLA+MoE, `Qwen35InferenceEngine` for DeltaNet+attention, `NemotronHInferenceEngine` for Mamba-2+attention+FFN)
+6. If the architecture supports tool calling, add format methods in `ChatTemplate` (see SmolLM3's Hermes-style implementation as reference)
+7. If the architecture supports thinking/reasoning, add handling in `ChatTemplate` and `CLIOptions`
 
 ### Resources
 
 - `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/kernels/cuda/` — 31 CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
+- `src/main/resources/kernels/cuda/` — CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
 - `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
 - `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
@@ -259,7 +278,40 @@ Two modes for keeping activations on GPU between transformer layers, reducing CP
 
 Key design: **zero-allocation hot paths** — all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE or hybrid architectures (Qwen3.5 DeltaNet).
+**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE architectures.
+
+#### Qwen3.5 CUDA forward pass (`Qwen35CudaForwardPass`)
+
+Dedicated GPU-resident forward pass for the hybrid DeltaNet+attention architecture. Handles both DeltaNet layers (3/4) and full GQA attention layers (1/4) with CUDA graph support.
+
+**DeltaNet-specific CUDA kernels:**
+- `deltanet_fused.cu` — mega-kernel: recurrence + per-head RMSNorm + SiLU(gate) + gate multiply, with transposed S matrix `[dV][dQK]` for coalesced access and parallel L2 norm via warp-shuffle reduction
+- `conv1d_silu.cu` — fused causal conv1d + SiLU activation
+- `alpha_beta_gates.cu` — compute alpha (exp decay) and beta (sigmoid) gates from projections
+- `deinterleave_q_gate.cu` — split packed Q+gate projection for attention layers
+- `sigmoid_elementwise_mul.cu` — attention output gating: `xb2 *= sigmoid(gate)`
+
+**Optimizations:**
+- Fused FFN gate+up Q4_K kernel (reuses `matmul_q4_k_fused_gate_up.cu`)
+- GPU-side argmax (`forwardGraphArgmax()`, `forwardFinalArgmax()`) — downloads 4 bytes instead of full logits
+- Embedding loaded on CPU (frees ~500 MB VRAM, only used for 1-element lookup per token)
+- VRAM budget corrected: subtracts non-layer tensor sizes before per-layer estimation, uses 90% of VRAM
+
+#### cuBLAS acceleration (opt-in)
+
+Optional path using NVIDIA cuBLAS library for matmul operations. Enabled via `-Dcuda.cublas=true`. Pre-dequantizes Q4_K weights to FP16 (default) or FP32 at load time, then uses `cublasSgemv`/`cublasGemmEx` for matrix-vector multiply.
+
+**Bindings**: `CublasBindings.java` (Panama FFM for `libcublas.so`), `CublasMatmul.java` (handle management + dequant + gemv). Dequant kernels: `dequant_q4_k_f16.cu`, `dequant_q4_k_f32.cu`, `convert_f32_to_f16.cu`.
+
+**Tradeoff**: cuBLAS achieves higher bandwidth utilization (~55-80%) than custom Q4_K kernels (~22%), but FP16 weights are 3.5x larger than Q4_K. On bandwidth-limited GPUs (RTX 4050: 192 GB/s), custom Q4_K + CUDA graph is faster. cuBLAS becomes competitive on GPUs with >500 GB/s bandwidth (A100, H100) or when weights are already FP16.
+
+#### Nemotron-H CUDA forward pass (`NemotronHCudaForwardPass`)
+
+GPU-resident forward pass for the Mamba-2 + Attention + FFN hybrid architecture. Handles all three layer types on GPU.
+
+**Mamba-2 kernels:** `mamba2_scan.cu` (SSM state update per head, `[nheads][headDim][stateSize]`), `mamba2_dt_softplus.cu` (discretize timestep), `mamba2_gate_norm.cu` (fused gate+grouped RMSNorm, norm_before_gate=False), `sqrelu.cu` (squared ReLU for FFN layers). Reuses `conv1d_short.cu`, `silu.cu`, `rmsnorm.cu`, `rope.cu`, `attention.cu` for shared operations.
+
+**CUDA graph**: not yet supported for Nemotron-H (DtoD buffer copies in Mamba layers complicate graph capture). Per-layer mode achieves 9.9 tok/s for the 4B model.
 
 ### GPU-virtual thread interaction
 
@@ -299,4 +351,20 @@ All CUDA matmul kernels use 1 warp (32 threads) per output row with `__shfl_down
 
 **CUDA alignment constraints**: `__ldg((const unsigned int*)ptr)` requires 4-byte aligned `ptr`. Block sizes NOT divisible by 4: Q8_0 (34B), Q4_0 (18B), Q6_K (210B), Q3_K (110B) — these kernels use byte-level `__ldg` only. Q4_K (144B) and Q5_K (176B) are safe for uint32 `__ldg`.
 
-**GPU profiling**: enable via `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. **CPU profiling**: `-Dcpu.profile=true`.
+### JVM tuning properties
+
+All properties are set via `-Dproperty=value` on the Java command line.
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `cuda.nograph` | `false` | Disable CUDA graph capture; use per-layer kernel launches instead |
+| `cuda.cublas` | `false` | Enable cuBLAS for Q4_K matmul (pre-dequantizes to FP16; requires `libcublas.so`) |
+| `cuda.cublas.fp32` | `false` | Use FP32 instead of FP16 for cuBLAS dequantization (more VRAM, slower) |
+| `cuda.dp4a` | `false` | Enable `__dp4a` integer dot product for Qwen3.5 (opt-in; ~2% gain on RTX 4050, more on A100/H100) |
+| `cuda.q4k.coalesced` | `false` | Use coalesced Q4_K kernel variant (all threads process same group) |
+| `cuda.q4k.smem` | `false` | Use shared-memory input tiling Q4_K kernel variant |
+| `cuda.profile` | `false` | Enable CUDA per-section timing (adds `finish()` barriers; ~15-25% overhead) |
+| `cpu.profile` | `false` | Enable CPU per-layer timing (standard InferenceEngine only) |
+| `matmul.tiled` | `false` | Enable cache-friendly tiled matmul on CPU (Java 21+) |
+
+**GPU profiling**: `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. Note: only instrumented in `CudaForwardPass` (standard architectures), not `Qwen35CudaForwardPass`. **CPU profiling**: `-Dcpu.profile=true` (standard `TransformerBlock` only).

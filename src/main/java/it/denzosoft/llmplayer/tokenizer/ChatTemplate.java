@@ -33,7 +33,8 @@ public class ChatTemplate {
     public boolean supportsThinking() {
         return architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN35;
+                || architecture == ModelArchitecture.QWEN35
+                || architecture == ModelArchitecture.NEMOTRON_H;
     }
 
     public String formatUserMessage(String userMessage) {
@@ -42,7 +43,8 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35(userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
+                || architecture == ModelArchitecture.NEMOTRON_H) {
             return formatQwen(userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4(userMessage);
@@ -70,7 +72,8 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
+                || architecture == ModelArchitecture.NEMOTRON_H) {
             return formatQwenChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Chat(systemMessage, userMessage);
@@ -201,7 +204,8 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Conversation(messages);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
-                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3) {
+                || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
+                || architecture == ModelArchitecture.NEMOTRON_H) {
             return formatQwenConversation(messages);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Conversation(messages);

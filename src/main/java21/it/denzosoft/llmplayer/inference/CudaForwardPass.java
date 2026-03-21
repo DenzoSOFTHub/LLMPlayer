@@ -224,6 +224,14 @@ public class CudaForwardPass implements AutoCloseable {
     private final int fusedGateUpBlockDim;
     private final boolean useFusedGateUp;
 
+    // cuBLAS acceleration: pre-dequantized FP32 weight buffers (opt-in via -Dcuda.cublas=true)
+    private it.denzosoft.llmplayer.gpu.CublasMatmul cublasMatmul; // null if disabled
+    private long[][] cublasF32Weights;  // [layer][7] FP32 device pointers (0 if not dequantized)
+    private long cublasF32Output;       // FP32 output projection weights (0 if not dequantized)
+    private boolean useCublas;
+    private boolean cublasUseFP16;
+    private MemorySegment cublasConvertF16Func;
+
     // Output projection launch descriptor
     private final MatmulLaunch outputMatmul; // null if output not on GPU
 
@@ -665,10 +673,89 @@ public class CudaForwardPass implements AutoCloseable {
             fusedGateUpBlockDim = 0;
         }
 
+        // === cuBLAS initialization (opt-in via -Dcuda.cublas=true) ===
+        boolean cublasEnabled = Boolean.getBoolean("cuda.cublas")
+                && it.denzosoft.llmplayer.gpu.CublasBindings.isAvailable();
+        if (cublasEnabled) {
+            try {
+                it.denzosoft.llmplayer.gpu.CublasMatmul cm = new it.denzosoft.llmplayer.gpu.CublasMatmul(cudaContext);
+                boolean useFP16 = !Boolean.getBoolean("cuda.cublas.fp32");
+                MemorySegment dequantFunc;
+                int bytesPerElement;
+                if (useFP16) {
+                    dequantFunc = cudaContext.compileKernel("kernels/cuda/dequant_q4_k_f16.cu", "dequant_q4_k_f16");
+                    bytesPerElement = 2;
+                    // Compile FP32→FP16 conversion kernel for input vector
+                    MemorySegment convertFunc = cudaContext.compileKernel("kernels/cuda/convert_f32_to_f16.cu", "convert_f32_to_f16");
+                    cm.ensureInputF16(dim, bufferManager);
+                    // Store the convert function for use in gemmExF16
+                    this.cublasConvertF16Func = convertFunc;
+                } else {
+                    dequantFunc = cudaContext.compileKernel("kernels/cuda/dequant_q4_k_f32.cu", "dequant_q4_k_f32");
+                    bytesPerElement = 4;
+                    this.cublasConvertF16Func = null;
+                }
+                this.cublasUseFP16 = useFP16;
+
+                long[][] f32w = new long[gpuLayerCount][7];
+                long totalBytes = 0;
+                for (int i = 0; i < gpuLayerCount; i++) {
+                    for (int j = 0; j < 7; j++) {
+                        MatmulLaunch ml = layerMatmuls[i][j];
+                        if (ml != null) {
+                            TransformerLayerWeights layer = weights.layers()[i];
+                            FloatTensor t = getLayerTensor(layer, j);
+                            if (t instanceof CudaFloatTensor && ((CudaFloatTensor) t).type() == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) {
+                                long ptr;
+                                if (useFP16) {
+                                    ptr = cm.dequantizeToF16((CudaFloatTensor) t, ml.rows, ml.cols, bufferManager, dequantFunc);
+                                } else {
+                                    ptr = cm.dequantizeToF32((CudaFloatTensor) t, ml.rows, ml.cols, bufferManager, dequantFunc);
+                                }
+                                f32w[i][j] = ptr;
+                                totalBytes += (long) ml.rows * ml.cols * bytesPerElement;
+                            }
+                        }
+                    }
+                }
+
+                // Dequantize output projection
+                long f32Out = 0;
+                if (outputMatmul != null && outputTensor instanceof CudaFloatTensor
+                        && ((CudaFloatTensor) outputTensor).type() == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) {
+                    if (useFP16) {
+                        f32Out = cm.dequantizeToF16((CudaFloatTensor) outputTensor, vocabSize, dim, bufferManager, dequantFunc);
+                    } else {
+                        f32Out = cm.dequantizeToF32((CudaFloatTensor) outputTensor, vocabSize, dim, bufferManager, dequantFunc);
+                    }
+                    totalBytes += (long) vocabSize * dim * bytesPerElement;
+                }
+
+                cublasMatmul = cm;
+                cublasF32Weights = f32w;
+                cublasF32Output = f32Out;
+                useCublas = true;
+                System.err.println("cuBLAS: dequantized " + (totalBytes / 1024 / 1024)
+                    + " MB of Q4_K weights to " + (useFP16 ? "FP16" : "FP32"));
+            } catch (Exception e) {
+                System.err.println("cuBLAS: initialization failed — " + e.getMessage());
+                cublasMatmul = null;
+                cublasF32Weights = null;
+                cublasF32Output = 0;
+                useCublas = false;
+            }
+        } else {
+            cublasMatmul = null;
+            cublasF32Weights = null;
+            cublasF32Output = 0;
+            useCublas = false;
+        }
+
         // CUDA graph: pre-compute fixed attention shared mem (max seqLen)
         // 48 KB per SM limit → max seqLen ~12256 for graph mode
         this.graphAttnSharedMem = (maxSeqLen + 32) * Float.BYTES;
         this.graphAvailable = !Boolean.getBoolean("cuda.nograph")
+                && !useCublas  // cuBLAS manages its own state, incompatible with graph capture
                 && cudaContext.isGraphApiAvailable()
                 && outputMatmul != null
                 && graphAttnSharedMem <= 48 * 1024;
@@ -809,7 +896,16 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
         // Output projection (write mode)
-        launchMatmul(outputMatmul);
+        if (useCublas && cublasF32Output != 0) {
+            if (cublasUseFP16) {
+                cublasMatmul.gemmExF16(cublasF32Output, gpuXb, gpuLogits, vocabSize, dim, false,
+                    cublasConvertF16Func, cudaContext);
+            } else {
+                cublasMatmul.sgemv(cublasF32Output, gpuXb, gpuLogits, vocabSize, dim, false);
+            }
+        } else {
+            launchMatmul(outputMatmul);
+        }
 
         // Download logits (cuMemcpyDtoH is synchronous)
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
@@ -956,12 +1052,12 @@ public class CudaForwardPass implements AutoCloseable {
 
         // 2. Q/K/V projections (write mode)
         if (hasMergedQKV) {
-            launchMatmul(ml[0]); // wqkv → gpuQKV
+            launchMatmulCublas(ml[0], layerIdx, 0); // wqkv → gpuQKV
             launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
         } else {
-            launchMatmul(ml[0]); // wq
-            launchMatmul(ml[1]); // wk
-            launchMatmul(ml[2]); // wv
+            launchMatmulCublas(ml[0], layerIdx, 0); // wq
+            launchMatmulCublas(ml[1], layerIdx, 1); // wk
+            launchMatmulCublas(ml[2], layerIdx, 2); // wv
         }
 
         // 2b. Add QKV bias if present (Qwen2)
@@ -997,7 +1093,7 @@ public class CudaForwardPass implements AutoCloseable {
         // === FFN Phase ===
 
         // 6. Wo matmul
-        launchMatmul(ml[3]); // wo
+        launchMatmulCublas(ml[3], layerIdx, 3); // wo
 
         // 6b. Post-attention norm + accumulate (Gemma2/3)
         if (hasPostNorm) {
@@ -1016,20 +1112,20 @@ public class CudaForwardPass implements AutoCloseable {
 
         // 8. Gate + Up projections (write mode) — packed FFN, fused, or separate
         if (hasPackedFFN) {
-            launchMatmul(ml[5]);
+            launchMatmulCublas(ml[5], layerIdx, 5);
             launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
-        } else if (useFusedGateUp) {
+        } else if (useFusedGateUp && !useCublas) {
             launchFusedGateUp(layerIdx);
         } else {
-            launchMatmul(ml[4]); // gate
-            launchMatmul(ml[5]); // up
+            launchMatmulCublas(ml[4], layerIdx, 4); // gate
+            launchMatmulCublas(ml[5], layerIdx, 5); // up
         }
 
         // 9. Fused SiLU + element-wise multiply (fully fixed params)
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
 
         // 10. Down projection
-        launchMatmul(ml[6]); // down
+        launchMatmulCublas(ml[6], layerIdx, 6); // down
 
         // 10b. Post-FFN norm + accumulate (Gemma2/3)
         if (hasPostNorm) {
@@ -1310,7 +1406,7 @@ public class CudaForwardPass implements AutoCloseable {
     }
 
     /**
-     * Launch a matmul kernel using pre-computed descriptor. Updates shared matmulPB in-place.
+     * Launch a matmul: cuBLAS sgemv if available for this tensor, otherwise custom kernel.
      */
     private void launchMatmul(MatmulLaunch ml) {
         matmulPB.setLong(0, ml.weightPtr);
@@ -1320,6 +1416,38 @@ public class CudaForwardPass implements AutoCloseable {
         matmulPB.setInt(4, ml.cols);
         matmulPB.setInt(5, ml.addToOutput);
         launchKernel(ml.function, ml.gridDim, ml.blockDim, ml.sharedMem, matmulPB.ptrs);
+    }
+
+    /**
+     * Launch matmul with cuBLAS override for a specific layer and matmul index.
+     * Falls back to custom kernel if cuBLAS is not available for this tensor.
+     */
+    private void launchMatmulCublas(MatmulLaunch ml, int layerIdx, int matmulIdx) {
+        if (useCublas && cublasF32Weights[layerIdx][matmulIdx] != 0) {
+            if (cublasUseFP16) {
+                cublasMatmul.gemmExF16(cublasF32Weights[layerIdx][matmulIdx],
+                    ml.inputPtr, ml.outputPtr, ml.rows, ml.cols, ml.addToOutput == 1,
+                    cublasConvertF16Func, cudaContext);
+            } else {
+                cublasMatmul.sgemv(cublasF32Weights[layerIdx][matmulIdx],
+                    ml.inputPtr, ml.outputPtr, ml.rows, ml.cols, ml.addToOutput == 1);
+            }
+        } else {
+            launchMatmul(ml);
+        }
+    }
+
+    private static FloatTensor getLayerTensor(TransformerLayerWeights layer, int idx) {
+        switch (idx) {
+            case 0: return layer.wqkv() != null ? layer.wqkv() : layer.wq();
+            case 1: return layer.wk();
+            case 2: return layer.wv();
+            case 3: return layer.wo();
+            case 4: return layer.wGate();
+            case 5: return layer.wUp();
+            case 6: return layer.wDown();
+            default: return null;
+        }
     }
 
     /**
