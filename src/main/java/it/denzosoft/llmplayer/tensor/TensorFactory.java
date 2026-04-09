@@ -65,6 +65,7 @@ public final class TensorFactory {
         if (type == GGMLType.BF16) return new BF16FloatTensor(data, elementCount);
         if (type == GGMLType.Q4_0) return new Q4_0FloatTensor(data, elementCount);
         if (type == GGMLType.Q5_0) return new Q5_0FloatTensor(data, elementCount);
+        if (type == GGMLType.Q5_1) return new Q5_1FloatTensor(data, elementCount);
         if (type == GGMLType.Q8_0) return new Q8_0FloatTensor(data, elementCount);
         if (type == GGMLType.Q4_K) return new Q4_KFloatTensor(data, elementCount);
         if (type == GGMLType.Q3_K) return new Q3_KFloatTensor(data, elementCount);

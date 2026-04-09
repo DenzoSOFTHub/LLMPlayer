@@ -827,9 +827,6 @@ public class CudaForwardPass implements AutoCloseable {
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
         if (config.expertCount() > 0) return false;
-        // Granite residual/attention/logit scaling is complex — needs dedicated GPU forward pass
-        // TODO: implement GraniteCudaForwardPass with proper scaling kernels
-        if (config.residualScale() > 0) return false;
 
         TransformerLayerWeights firstLayer = weights.layers()[0];
         // Require at least pre-norm or post-norm for attention and FFN
@@ -1101,6 +1098,7 @@ public class CudaForwardPass implements AutoCloseable {
             launchMatmulCublas(ml[2], layerIdx, 2); // wv
         }
 
+
         // 2b. Add QKV bias if present (Qwen2)
         if (hasBias) {
             launchBias(gpuQ, gpuQBias[layerIdx], qDim, biasQGridDim);
@@ -1195,6 +1193,7 @@ public class CudaForwardPass implements AutoCloseable {
             launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
             launchBias(gpuX, gpuXb, dim, numWorkGroups);
         }
+
     }
 
     private void forwardLayerProfiled(InferenceState state, TransformerLayerWeights layerWeights,

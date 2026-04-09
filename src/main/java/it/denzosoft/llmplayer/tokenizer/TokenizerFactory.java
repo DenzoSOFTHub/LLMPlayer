@@ -22,7 +22,8 @@ public final class TokenizerFactory {
 
         String[] merges = metadata.getStringArray("tokenizer.ggml.merges");
 
-        if ("gpt2".equals(model) || "bpe".equals(model)) {
+        specialTokens.setModelType(model);
+        if ("gpt2".equals(model) || "bpe".equals(model) || "gemma4".equals(model)) {
             return new BPETokenizer(tokens, scores, merges, specialTokens);
         } else {
             return new SentencePieceTokenizer(tokens, scores, specialTokens);

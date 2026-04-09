@@ -118,7 +118,6 @@ public class Attention {
             activeRope.applyAllHeads(state.q, headCount, position);
             activeRope.applyAllHeads(state.k, headCountKV, position);
         }
-
         // Store K and V in cache
         float[] keyCache = state.kvCache.keyLayer(layer);
         float[] valueCache = state.kvCache.valueLayer(layer);
@@ -197,6 +196,14 @@ public class Attention {
         if (config.architecture() == ModelArchitecture.GPT_OSS) {
             return layer % 2 == 0;
         }
+        // Gemma 4: pattern array (true=SWA/local, false=full/global)
+        if (config.architecture() == ModelArchitecture.GEMMA4) {
+            boolean[] pattern = config.slidingWindowPattern();
+            if (pattern != null && layer < pattern.length) {
+                return !pattern[layer]; // pattern[layer]=true means SWA (local), so NOT global
+            }
+            return layer % 6 == 5; // fallback: same as Gemma 3
+        }
         return true; // default: global (shouldn't reach here with slidingWindow > 0)
     }
 
@@ -240,7 +247,6 @@ public class Attention {
             activeRope.applyAllHeads(state.q, headCount, position);
             activeRope.applyAllHeads(state.k, headCountKV, position);
         }
-
         // Store K and V in cache
         float[] keyCache = state.kvCache.keyLayer(layer);
         float[] valueCache = state.kvCache.valueLayer(layer);

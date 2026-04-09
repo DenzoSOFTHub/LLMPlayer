@@ -68,6 +68,9 @@ public class ApiHandler {
             } else if ("/api/hardware/plan".equals(path)) {
                 if ("POST".equals(method)) handleHardwarePlan(exchange);
                 else methodNotAllowed(exchange);
+            } else if ("/api/metrics".equals(path)) {
+                if ("GET".equals(method)) handleMetrics(exchange);
+                else methodNotAllowed(exchange);
             } else {
                 Map<String, Object> err = new LinkedHashMap<>();
                 err.put("error", "Not found");
@@ -347,6 +350,54 @@ public class ApiHandler {
         result.put("memorySafe", plan.memoryCheck().isSafe());
         result.put("estimatedRam", plan.memoryCheck().estimatedRam());
         result.put("availableRam", plan.memoryCheck().availableRam());
+        sendJson(exchange, 200, result);
+    }
+
+    private void handleMetrics(HttpExchange exchange) throws IOException {
+        LLMPlayerMetrics m = LLMPlayerMetrics.getInstance();
+        Map<String, Object> result = new LinkedHashMap<>();
+
+        // Model
+        Map<String, Object> model = new LinkedHashMap<>();
+        model.put("name", m.getModelName());
+        model.put("architecture", m.getArchitecture());
+        model.put("fileSizeMB", m.getModelFileSizeMB());
+        model.put("contextLength", m.getContextLength());
+        model.put("blockCount", m.getBlockCount());
+        model.put("embeddingLength", m.getEmbeddingLength());
+        model.put("vocabSize", m.getVocabSize());
+        result.put("model", model);
+
+        // Generation stats
+        Map<String, Object> gen = new LinkedHashMap<>();
+        gen.put("totalGenerations", m.getTotalGenerations());
+        gen.put("totalTokensGenerated", m.getTotalTokensGenerated());
+        gen.put("totalPromptTokens", m.getTotalPromptTokens());
+        gen.put("lastTokensPerSecond", Math.round(m.getLastTokensPerSecond() * 10.0) / 10.0);
+        gen.put("averageTokensPerSecond", Math.round(m.getAverageTokensPerSecond() * 10.0) / 10.0);
+        gen.put("lastGenerationTimeMs", m.getLastGenerationTimeMs());
+        gen.put("totalGenerationTimeMs", m.getTotalGenerationTimeMs());
+        result.put("generation", gen);
+
+        // Memory
+        Map<String, Object> mem = new LinkedHashMap<>();
+        mem.put("heapUsedMB", m.getHeapUsedMB());
+        mem.put("heapMaxMB", m.getHeapMaxMB());
+        mem.put("offHeapUsedMB", m.getOffHeapUsedMB());
+        mem.put("kvCacheEstimateMB", m.getKvCacheEstimateMB());
+        result.put("memory", mem);
+
+        // GPU
+        Map<String, Object> gpu = new LinkedHashMap<>();
+        gpu.put("enabled", m.isGpuEnabled());
+        gpu.put("deviceName", m.getGpuDeviceName());
+        gpu.put("layersUsed", m.getGpuLayersUsed());
+        gpu.put("layersTotal", m.getGpuLayersTotal());
+        gpu.put("moeOptimized", m.isMoeOptimizedGpu());
+        gpu.put("vramTotalMB", m.getGpuVramTotalMB());
+        gpu.put("vramFreeMB", m.getGpuVramFreeMB());
+        result.put("gpu", gpu);
+
         sendJson(exchange, 200, result);
     }
 

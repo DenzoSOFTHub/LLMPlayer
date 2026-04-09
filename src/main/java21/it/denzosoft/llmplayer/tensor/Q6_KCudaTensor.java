@@ -22,11 +22,28 @@ public class Q6_KCudaTensor extends CudaFloatTensor {
     @Override
     public GGMLType type() { return GGMLType.Q6_K; }
 
-    @Override
-    protected String kernelResourcePath() { return "kernels/cuda/matmul_q6_k.cu"; }
+    private static final boolean USE_SMEM =
+        "true".equals(System.getProperty("cuda.q6k.smem", "false"));
+    private static final boolean USE_TILED =
+        !"false".equals(System.getProperty("cuda.q6k.tiled", "true"));
 
     @Override
-    protected String kernelName() { return "matmul_q6_k"; }
+    protected String kernelResourcePath() {
+        if (USE_TILED) return "kernels/cuda/matmul_q6_k_tiled.cu";
+        return USE_SMEM ? "kernels/cuda/matmul_q6_k_smem.cu" : "kernels/cuda/matmul_q6_k.cu";
+    }
+
+    @Override
+    protected String kernelName() {
+        if (USE_TILED) return "matmul_q6_k_tiled";
+        return USE_SMEM ? "matmul_q6_k_smem" : "matmul_q6_k";
+    }
+
+    @Override
+    protected int computeSharedMemBytes(int cols, long cudaBlockSize) {
+        if (USE_TILED) return 256 * 4; // one tile = 1KB
+        return USE_SMEM ? cols * 4 : 0;
+    }
 
     @Override
     protected int blockBytes() { return BLOCK_BYTES; }

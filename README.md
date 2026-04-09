@@ -1,16 +1,16 @@
 # LLMPlayer v1.9.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 16 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3, Phi-3/4, Mistral3/Devstral, and **Nemotron-H** (hybrid Mamba-2 + Transformer). Quantized formats: Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32. Includes CUDA GPU acceleration with graph mode (up to 48 tok/s on RTX 4050), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, and **Nemotron-H** (hybrid Mamba-2 + Transformer). Quantized formats: Q2_K through Q8_0, Q5_1, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32. Includes CUDA GPU acceleration with graph mode (up to 56 tok/s on RTX 4050), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics, and a built-in LoRA fine-tuning pipeline.
 
-### What's new in v1.8.0
+### What's new in v1.9.0
 
-- **Nemotron-H architecture**: hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. GPU-resident forward pass with dedicated CUDA kernels (`mamba2_scan.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). 9.9 tok/s for 4B model on RTX 4050.
-- **Qwen3.5 CUDA graph**: new `Qwen35CudaForwardPass` with fused DeltaNet recurrence kernel, transposed S matrix, fused conv1d+SiLU. Qwen3.5-4B: 12 tok/s (+53%), Qwen3.5-9B: 7 tok/s (+110%).
-- **Embedding on CPU** for all architectures: frees ~500 MB VRAM for more GPU layers. Qwen3.5-9B now fits entirely in 6 GB VRAM (was 29/32 layers, now 32/32).
-- **cuBLAS support** (opt-in via `-Dcuda.cublas=true`): pre-dequantizes Q4_K to FP16, uses `cublasGemmEx` for mixed-precision gemv. Bindings via Panama FFM (zero native dependencies). Best for GPUs with >500 GB/s bandwidth.
-- **dp4a integer dot product** (opt-in via `-Dcuda.dp4a=true`): `__dp4a` int8 dot product for Q4_K×Q8_1. Marginal gain on consumer GPUs, more impactful on A100/H100.
-- **Improved VRAM budget**: subtracts non-layer tensor sizes, uses 90% of device memory. More accurate layer offloading for models near the VRAM limit.
-- 8 new CUDA kernels, 5 new models benchmarked (Qwen3.5-2B/9B-Claude-4.6, Llama-3.1-8B, Nemotron-3-Nano-4B).
+- **Gemma 4 architecture**: Per-Layer Embeddings (PLE), dual headSize (SWA=256, full=512), shared KV cache, V-norm, dual RoPE, K-norm with (1+w), logit soft-capping. Dedicated `Gemma4InferenceEngine`.
+- **Gemma 3n architecture**: PLE support via Gemma4 engine.
+- **Granite Hybrid architecture**: Mamba-2 + Attention + FFN hybrid with integrated SwiGLU FFN per layer. Reuses NemotronH engine with embedding/attention/residual/logit scaling.
+- **Granite 3.3 CUDA graph**: fixed GPU forward pass (was blocked, now 17x faster: 1.0 → 17.0 tok/s).
+- **CUDA kernel optimizations**: dp4a enabled by default for Q4_K/Q5_K/Q6_K, Q5_K shared-memory kernel (+7%), Q6_K tiled kernel (+9%), DeltaNet v2 float4 vectorization (+4%). Qwen3.5-4B: 18 tok/s (+59%), Llama-1B: 56 tok/s (+17%).
+- **JMX metrics**: runtime monitoring via `it.denzosoft.llmplayer:type=LLMPlayer` MXBean + REST at `/api/metrics`.
+- 12 new models benchmarked across 4 new architectures. 34+ models total across 20 architectures.
 
 ## Requirements
 
@@ -465,7 +465,7 @@ The architecture is automatically detected from the `general.architecture` field
 
 Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s), Java 25, SimdVectorOps.
 
-**32+ models tested** across 16 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS, Nemotron-H).
+**34+ models tested** across 20 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Command-R/Cohere, OLMo2, GPT-OSS, Nemotron-H, Granite 3.3, Granite Hybrid).
 
 ### Top results — CUDA GPU (ranked by tok/s)
 
@@ -490,6 +490,23 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 | 16 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | CUDA graph (Qwen35) | 7.9 |
 
 Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
+
+### LLMPlayer vs llama.cpp (CPU comparison)
+
+LLMPlayer CUDA graph vs llama.cpp CPU-only (`llama-cpp-python`, same hardware, same GGUF files):
+
+| Model | Params | Quant | LLMPlayer GPU | LLMPlayer CPU | llama.cpp CPU | GPU vs llama.cpp |
+|-------|--------|-------|-------------:|-------------:|-------------:|---------:|
+| Qwen3-0.6B | 0.6B | Q8_0 | **74.6** | 5.9 | 4.5 | **16.6x** |
+| Llama-3.2-1B | 1B | Q4_K_M | **52.8** | 3.5 | 4.3 | **12.3x** |
+| Qwen3-1.7B | 1.7B | Q8_0 | **32.1** | 2.9 | 4.2 | **7.6x** |
+| Granite-3.3-2B | 2B | Q4_K_M | **26.4** | 1.3 | 1.8 | **14.7x** |
+| Falcon3-3B | 3B | Q4_K_M | **22.9** | 1.3 | 4.8 | **4.8x** |
+| SmolLM3-3B | 3B | Q4_K_M | **22.4** | 1.3 | N/A | — |
+| Qwen3-4B | 4B | Q4_K_M | **18.3** | 0.9 | 1.9 | **9.6x** |
+| Qwen3-8B | 8B | Q4_K_M | **10.2** | 0.5 | 1.7 | **6.0x** |
+
+LLMPlayer with CUDA graph is **5–17x faster** than llama.cpp running CPU-only on the same machine. On CPU-only, llama.cpp is 1.2–3.7x faster than LLMPlayer (expected: C/C++ native SIMD vs Java Vector API). The GPU acceleration closes this gap and provides a significant net advantage.
 
 ### GPU strategy summary
 

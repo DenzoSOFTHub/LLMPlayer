@@ -143,7 +143,7 @@ public class LLMPlayerUI extends JFrame {
         int row = 0;
 
         // Title
-        JLabel title = new JLabel("LLMPlayer v1.0");
+        JLabel title = new JLabel("LLMPlayer v" + it.denzosoft.llmplayer.LLMPlayer.VERSION);
         title.setFont(title.getFont().deriveFont(Font.BOLD, 16f));
         gc.gridy = row++; gc.insets = new Insets(0, 0, 10, 0);
         p.add(title, gc);

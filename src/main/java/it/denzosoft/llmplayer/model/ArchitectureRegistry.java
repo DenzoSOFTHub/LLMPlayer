@@ -94,4 +94,13 @@ public final class ArchitectureRegistry {
     public static String ssmIn(int layer) { return "blk." + layer + ".ssm_in.weight"; }
     public static String ssmD(int layer) { return "blk." + layer + ".ssm_d"; }
     public static String ssmConv1dBias(int layer) { return "blk." + layer + ".ssm_conv1d.bias"; }
+
+    // Gemma 4 PLE (Per-Layer Embeddings)
+    public static final String PER_LAYER_TOKEN_EMBD = "per_layer_token_embd.weight";
+    public static final String PER_LAYER_MODEL_PROJ = "per_layer_model_proj.weight";
+    public static final String PER_LAYER_PROJ_NORM = "per_layer_proj_norm.weight";
+    public static String pleInpGate(int layer) { return "blk." + layer + ".inp_gate.weight"; }
+    public static String pleProj(int layer) { return "blk." + layer + ".proj.weight"; }
+    public static String plePostNorm(int layer) { return "blk." + layer + ".post_norm.weight"; }
+    public static String layerOutputScale(int layer) { return "blk." + layer + ".layer_output_scale.weight"; }
 }

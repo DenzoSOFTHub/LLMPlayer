@@ -63,6 +63,23 @@ public final class ModelConfig {
     private int[] perLayerKvHeads;    // 0=Mamba/FFN, >0=attention
     private int[] perLayerFfnLength;  // 0=Mamba/attention, >0=FFN
 
+    // Gemma 4: per-layer sliding window pattern and PLE config (mutable — set after construction)
+    private boolean[] slidingWindowPattern; // true=SWA, false=full attention per layer
+    private int sharedKvLayers;             // number of top layers sharing KV cache
+    private int embeddingLengthPerLayer;    // PLE dim (256 for E4B)
+    private float ropeFreqBaseSwa;          // theta for SWA layers (10000)
+    private int ropeDimCountSwa;            // RoPE dim for SWA layers
+    public void setSlidingWindowPattern(boolean[] v) { this.slidingWindowPattern = v; }
+    public void setSharedKvLayers(int v) { this.sharedKvLayers = v; }
+    public void setEmbeddingLengthPerLayer(int v) { this.embeddingLengthPerLayer = v; }
+    public void setRopeFreqBaseSwa(float v) { this.ropeFreqBaseSwa = v; }
+    public void setRopeDimCountSwa(int v) { this.ropeDimCountSwa = v; }
+    public boolean[] slidingWindowPattern() { return slidingWindowPattern; }
+    public int sharedKvLayers() { return sharedKvLayers; }
+    public int embeddingLengthPerLayer() { return embeddingLengthPerLayer; }
+    public float ropeFreqBaseSwa() { return ropeFreqBaseSwa; }
+    public int ropeDimCountSwa() { return ropeDimCountSwa; }
+
     public ModelConfig(ModelArchitecture architecture, String name, int embeddingLength, int blockCount,
                        int headCount, int headCountKV, int contextLength, int vocabSize, int intermediateSize,
                        float ropeFreqBase, float normEps, int headSize, int kvDim, int ropeType,
@@ -233,7 +250,16 @@ public final class ModelConfig {
             if (intermediateSize == 0) intermediateSize = embeddingLength * 4;
         } else {
             intermediateSize = metadata.getInt(prefix + "feed_forward_length", embeddingLength * 4);
-            perLayerFfnLength = null;
+            // Granite Hybrid: scalar feed_forward_length + per-layer kv_heads array
+            // Build per-layer FFN length: attention layers (kv>0) have FFN, Mamba layers don't
+            if (arch == ModelArchitecture.GRANITE_HYBRID && perLayerKvHeads != null) {
+                perLayerFfnLength = new int[perLayerKvHeads.length];
+                for (int i = 0; i < perLayerKvHeads.length; i++) {
+                    perLayerFfnLength[i] = perLayerKvHeads[i] > 0 ? intermediateSize : 0;
+                }
+            } else {
+                perLayerFfnLength = null;
+            }
         }
 
         // Vocab size from tokenizer
@@ -254,12 +280,14 @@ public final class ModelConfig {
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
                 || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
-                || arch == ModelArchitecture.GRANITE) {
+                || arch == ModelArchitecture.GRANITE || arch == ModelArchitecture.GEMMA4
+                || arch == ModelArchitecture.GEMMA3N) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
                 || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
                 || arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.OLMO2
-                || arch == ModelArchitecture.GPT_OSS) {
+                || arch == ModelArchitecture.GPT_OSS
+                || arch == ModelArchitecture.GRANITE_HYBRID) {
             ropeType = 2;  // ROPE_TYPE_NEOX
         } else if (arch == ModelArchitecture.QWEN35) {
             ropeType = 2;  // ROPE_TYPE_NEOX (IMROPE uses split-half pairing like NEOX)
@@ -285,7 +313,13 @@ public final class ModelConfig {
         // Override headSize when metadata specifies a different key_length
         // (e.g., Mistral3/Devstral: embeddingLength/headCount=160 but keyLength=128,
         //  Qwen3.5: embeddingLength/headCount=160 but keyLength=256 for full attention layers)
-        if (keyLength != headSize && arch != ModelArchitecture.DEEPSEEK2) {
+        // Gemma 4: key_length=512 is for full attention layers, key_length_swa=256 is for SWA layers
+        // and all tensors use SWA dims. Use key_length_swa for headSize.
+        if (arch == ModelArchitecture.GEMMA4) {
+            int keyLengthSwa = metadata.getInt(prefix + "attention.key_length_swa", headSize);
+            headSize = keyLengthSwa;
+            kvDim = headSize * headCountKV;
+        } else if (keyLength != headSize && arch != ModelArchitecture.DEEPSEEK2) {
             headSize = keyLength;
             kvDim = headSize * headCountKV;
         }
@@ -297,6 +331,10 @@ public final class ModelConfig {
 
         // RoPE dimension count: read AFTER headSize override so default is correct
         int ropeDimensionCount = metadata.getInt(prefix + "rope.dimension_count", headSize);
+        // Gemma 4: ropeDimCount from metadata may exceed headSize (512 > 256); clamp to headSize
+        if (arch == ModelArchitecture.GEMMA4 && ropeDimensionCount > headSize) {
+            ropeDimensionCount = headSize;
+        }
 
         // MoE parameters (read before dense/MoE split to determine default)
         int expertCount = metadata.getInt(prefix + "expert_count", 0);
@@ -356,8 +394,8 @@ public final class ModelConfig {
         // MoE expert weight scale (applied after optional L2 normalization)
         float expertWeightsScale = metadata.getFloat(prefix + "expert_weights_scale", 1.0f);
 
-        // Nemotron-H: use ROPE_TYPE_NORMAL for attention layers
-        if (arch == ModelArchitecture.NEMOTRON_H) {
+        // Nemotron-H / Granite Hybrid: use ROPE_TYPE_NORMAL for attention layers
+        if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
             ropeType = 0; // ROPE_TYPE_NORMAL
         }
 
@@ -380,6 +418,45 @@ public final class ModelConfig {
         if (embeddingScale != 0) config.setEmbeddingScale(embeddingScale);
         if (attentionScale != 0) config.setAttentionScale(attentionScale);
         if (residualScale != 0) config.setResidualScale(residualScale);
+
+        // Gemma 4: attention scale = 1.0 (model handles scaling via QK-norm internally)
+        if (arch == ModelArchitecture.GEMMA4 && config.attentionScale() == 0f) {
+            config.setAttentionScale(1.0f);
+        }
+
+        // Gemma 3n: same PLE config as Gemma 4
+        if (arch == ModelArchitecture.GEMMA3N) {
+            config.setEmbeddingLengthPerLayer(metadata.getInt(prefix + "embedding_length_per_layer_input", 0));
+            config.setEmbeddingScale((float) Math.sqrt(embeddingLength));
+            // Parse sliding window pattern
+            Object swpObj = metadata.get(prefix + "attention.sliding_window_pattern");
+            if (swpObj instanceof Object[] swpArr) {
+                boolean[] pattern = new boolean[swpArr.length];
+                for (int i = 0; i < swpArr.length; i++) {
+                    pattern[i] = swpArr[i] instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(swpArr[i]));
+                }
+                config.setSlidingWindowPattern(pattern);
+            }
+        }
+
+        // Gemma 4: PLE config, shared KV, sliding window pattern, dual RoPE
+        if (arch == ModelArchitecture.GEMMA4) {
+            config.setSharedKvLayers(metadata.getInt(prefix + "attention.shared_kv_layers", 0));
+            config.setEmbeddingLengthPerLayer(metadata.getInt(prefix + "embedding_length_per_layer_input", 0));
+            config.setRopeFreqBaseSwa(metadata.getFloat(prefix + "rope.freq_base_swa", ropeFreqBase));
+            config.setRopeDimCountSwa(metadata.getInt(prefix + "rope.dimension_count_swa", ropeDimensionCount));
+            // Parse sliding window pattern (boolean array from GGUF)
+            Object swpObj = metadata.get(prefix + "attention.sliding_window_pattern");
+            if (swpObj instanceof Object[] swpArr) {
+                boolean[] pattern = new boolean[swpArr.length];
+                for (int i = 0; i < swpArr.length; i++) {
+                    pattern[i] = swpArr[i] instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(swpArr[i]));
+                }
+                config.setSlidingWindowPattern(pattern);
+            }
+            // Gemma 4 uses sqrt(dim) embedding scaling like Gemma 2/3
+            config.setEmbeddingScale((float) Math.sqrt(embeddingLength));
+        }
 
         return config;
     }

@@ -528,6 +528,54 @@ Builds an optimal hardware configuration plan for a model, considering available
 
 ---
 
+### GET `/api/metrics`
+
+Returns runtime metrics including model info, generation statistics, memory usage, and GPU VRAM status. No request body needed.
+
+#### Response
+
+```json
+{
+  "model": {
+    "name": "Qwen3.5-4B",
+    "architecture": "QWEN35",
+    "fileSizeMB": 2600,
+    "contextLength": 2048,
+    "blockCount": 32,
+    "embeddingLength": 2560,
+    "vocabSize": 151936
+  },
+  "generation": {
+    "totalGenerations": 5,
+    "totalTokensGenerated": 300,
+    "totalPromptTokens": 100,
+    "lastTokensPerSecond": 18.0,
+    "averageTokensPerSecond": 15.5,
+    "lastGenerationTimeMs": 3333,
+    "totalGenerationTimeMs": 19354
+  },
+  "memory": {
+    "heapUsedMB": 512,
+    "heapMaxMB": 8192,
+    "offHeapUsedMB": 45,
+    "kvCacheEstimateMB": 128
+  },
+  "gpu": {
+    "enabled": true,
+    "deviceName": "NVIDIA RTX 4050 Laptop GPU",
+    "layersUsed": 32,
+    "layersTotal": 32,
+    "moeOptimized": false,
+    "vramTotalMB": 6140,
+    "vramFreeMB": 1024
+  }
+}
+```
+
+These same metrics are also available via JMX MXBean at `it.denzosoft.llmplayer:type=LLMPlayer`.
+
+---
+
 ## OpenAI Client Configuration
 
 ### Open WebUI

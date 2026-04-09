@@ -95,7 +95,9 @@ public class ModelLoader {
 
         ModelArchitecture arch = config.architecture();
         boolean isMoEArch = config.expertCount() > 0;
-        if (arch == ModelArchitecture.NEMOTRON_H) {
+        if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
+            weights = loadWeights(gguf, config, gpuLayers);
+        } else if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
             nemHWeights = loadNemotronHWeights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.QWEN35) {
             q35Weights = loadQwen35Weights(gguf, config, gpuLayers);
@@ -601,22 +603,57 @@ public class ModelLoader {
             FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
             int type = config.nemotronLayerType(i);
 
-            if (type == 0) { // Mamba-2
-                layers[i] = new NemotronHLayerWeights(attnNorm,
-                    loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
-                    loadTensor(gguf, ArchitectureRegistry.ssmOut(i)));
-            } else if (type == 1) { // Attention
-                layers[i] = new NemotronHLayerWeights(attnNorm,
-                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnK(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnV(i)),
-                    loadTensor(gguf, ArchitectureRegistry.attnOutput(i)));
+            if (type == 0) { // Mamba-2 (optionally with integrated FFN for Granite Hybrid)
+                FloatTensor ffnGateMamba = tryLoadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+                if (ffnGateMamba != null) {
+                    // Mamba + SwiGLU FFN (Granite Hybrid)
+                    layers[i] = NemotronHLayerWeights.mambaWithFFN(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmOut(i)),
+                        tryLoadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),
+                        ffnGateMamba,
+                        loadTensor(gguf, ArchitectureRegistry.ffnUp(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ffnDown(i)));
+                } else {
+                    // Pure Mamba (Nemotron-H)
+                    layers[i] = new NemotronHLayerWeights(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmOut(i)));
+                }
+            } else if (type == 1) { // Attention (optionally with integrated FFN for Granite Hybrid)
+                FloatTensor ffnGate = tryLoadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+                if (ffnGate != null) {
+                    // Attention + FFN (Granite Hybrid style)
+                    layers[i] = NemotronHLayerWeights.attention(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                        tryLoadTensor(gguf, ArchitectureRegistry.ffnNorm(i)),
+                        ffnGate,
+                        loadTensor(gguf, ArchitectureRegistry.ffnUp(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ffnDown(i)));
+                } else {
+                    // Pure attention (Nemotron-H style) — no FFN
+                    layers[i] = NemotronHLayerWeights.attention(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                        null, null, null, null);
+                }
             } else { // FFN
                 layers[i] = new NemotronHLayerWeights(attnNorm,
                     loadTensor(gguf, ArchitectureRegistry.ffnUp(i)),
@@ -637,12 +674,14 @@ public class ModelLoader {
         }
         if (ropeFreqsInfo != null) {
             FloatTensor ropeFreqsTensor = createTensor(gguf, ropeFreqsInfo);
-            int halfDim = config.ropeDimensionCount() / 2;
-            float[] factors = new float[halfDim];
-            for (int i = 0; i < halfDim; i++) {
+            // Load ALL frequency factors from the tensor (for Gemma 4, full attention layers
+            // have larger headSize than SWA, so we need more factors than ropeDimensionCount/2)
+            int totalFactors = (int) ropeFreqsInfo.elementCount();
+            float[] factors = new float[totalFactors];
+            for (int i = 0; i < totalFactors; i++) {
                 factors[i] = ropeFreqsTensor.getFloat(i);
             }
-            System.out.println("  Loaded rope_freqs.weight: " + halfDim + " frequency factors");
+            System.out.println("  Loaded rope_freqs.weight: " + totalFactors + " frequency factors");
             return factors;
         }
         return null;
@@ -656,7 +695,8 @@ public class ModelLoader {
         return createTensor(gguf, info);
     }
 
-    private static FloatTensor tryLoadTensor(GGUFFile gguf, String name) {
+    /** Load a tensor by name, returning null if not found. Visible for engine-specific loading. */
+    public static FloatTensor tryLoadTensor(GGUFFile gguf, String name) {
         GGUFTensorInfo info = gguf.findTensor(name);
         if (info == null) {
             return null;
