@@ -18,7 +18,10 @@ public enum ModelArchitecture {
     QWEN35("qwen35"),
     SMOLLM3("smollm3"),
     NEMOTRON_H("nemotron_h"),
-    GRANITE("granite");
+    GRANITE("granite"),
+    GEMMA4("gemma4"),
+    GEMMA3N("gemma3n"),
+    GRANITE_HYBRID("granitehybrid");
 
     private final String ggufName;
 

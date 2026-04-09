@@ -24,11 +24,21 @@ public class Q5_KCudaTensor extends CudaFloatTensor {
     @Override
     public GGMLType type() { return GGMLType.Q5_K; }
 
-    @Override
-    protected String kernelResourcePath() { return "kernels/cuda/matmul_q5_k.cu"; }
+    private static final boolean USE_SMEM =
+        !"false".equals(System.getProperty("cuda.q5k.smem", "true"));
 
     @Override
-    protected String kernelName() { return "matmul_q5_k"; }
+    protected String kernelResourcePath() {
+        return USE_SMEM ? "kernels/cuda/matmul_q5_k_smem.cu" : "kernels/cuda/matmul_q5_k.cu";
+    }
+
+    @Override
+    protected String kernelName() { return USE_SMEM ? "matmul_q5_k_smem" : "matmul_q5_k"; }
+
+    @Override
+    protected int computeSharedMemBytes(int cols, long cudaBlockSize) {
+        return USE_SMEM ? cols * 4 : 0;
+    }
 
     @Override
     protected int blockBytes() { return BLOCK_BYTES; }

@@ -62,6 +62,11 @@ public class InferenceEngine {
         if (arch == ModelArchitecture.GEMMA3 && config.slidingWindow() > 0) {
             ropeLocal = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, 10000f,
                 config.ropeType(), ropeFreqFactors);
+        } else if (arch == ModelArchitecture.GEMMA4 && config.slidingWindow() > 0) {
+            // Gemma 4: both SWA and full use same freq factors (proportional RoPE)
+            // Only theta differs: SWA=ropeFreqBaseSwa (10K), full=main theta (1M)
+            ropeLocal = new RoPE(config.headSize(), ropeDimCount, maxSeqLen,
+                config.ropeFreqBaseSwa(), config.ropeType(), ropeFreqFactors);
         }
         this.attention = new Attention(config, rope, ropeLocal);
         attention.initNormCachesIfNeeded(weights.layers());
@@ -215,10 +220,10 @@ public class InferenceEngine {
             weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
         }
 
-        // 5. Logit scaling
+        // 5. Logit scaling (skip if GPU already applied it via CudaForwardPass)
         // Command-R: multiply by logitScale
         // Granite: DIVIDE by logitScale (llama.cpp: 1.0f / f_logit_scale)
-        if (logitScale > 0f) {
+        if (logitScale > 0f && !logitsDone) {
             float scale = (config.architecture() == ModelArchitecture.GRANITE)
                 ? (1.0f / logitScale) : logitScale;
             for (int i = 0; i < vocabSize; i++) {

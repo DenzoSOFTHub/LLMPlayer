@@ -11,6 +11,8 @@ import it.denzosoft.llmplayer.inference.NemotronHInferenceEngine;
 import it.denzosoft.llmplayer.inference.NemotronHState;
 import it.denzosoft.llmplayer.inference.Qwen35InferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen35State;
+import it.denzosoft.llmplayer.inference.Gemma4InferenceEngine;
+import it.denzosoft.llmplayer.inference.Gemma4State;
 import it.denzosoft.llmplayer.gguf.GGUFTensorInfo;
 import it.denzosoft.llmplayer.model.ArchitectureRegistry;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
@@ -45,6 +47,7 @@ public class LLMEngine implements AutoCloseable {
     private final Qwen3MoEInferenceEngine q3moeEngine;   // Qwen3 MoE only
     private final Qwen35InferenceEngine q35Engine;        // Qwen3.5 only
     private final NemotronHInferenceEngine nemHEngine;   // Nemotron-H only
+    private final Gemma4InferenceEngine gemma4Engine;    // Gemma 4 only
     private final Tokenizer tokenizer;
     private final ChatTemplate chatTemplate;
     private final SpecialTokens specialTokens;
@@ -84,11 +87,21 @@ public class LLMEngine implements AutoCloseable {
         this.moeOptimizedGpu = moeOptimizedGpu;
 
         ModelArchitecture arch = loadedModel.config().architecture();
-        if (arch == ModelArchitecture.NEMOTRON_H) {
+        if ((arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N)
+                && loadedModel.config().embeddingLengthPerLayer() > 0) {
+            // Use dedicated Gemma4 engine only for PLE models (E2B/E4B)
             this.engine = null;
             this.ds2Engine = null;
             this.q3moeEngine = null;
             this.q35Engine = null;
+            this.nemHEngine = null;
+            this.gemma4Engine = createGemma4Engine(loadedModel, maxContextLength);
+        } else if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
+            this.engine = null;
+            this.ds2Engine = null;
+            this.q3moeEngine = null;
+            this.q35Engine = null;
+            this.gemma4Engine = null;
             this.nemHEngine = new NemotronHInferenceEngine(
                 loadedModel.config(), loadedModel.nemotronHWeights(), maxContextLength,
                 loadedModel.nemotronHWeights().ropeFreqFactors());
@@ -97,11 +110,13 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q3moeEngine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.q35Engine = new Qwen35InferenceEngine(
                 loadedModel.config(), loadedModel.qwen35Weights(), maxContextLength,
                 loadedModel.qwen35Weights().ropeFreqFactors());
         } else if (arch == ModelArchitecture.DEEPSEEK2) {
             this.engine = null;
+            this.gemma4Engine = null;
             this.ds2Engine = new DeepSeek2InferenceEngine(
                 loadedModel.config(), loadedModel.deepSeek2Weights(), maxContextLength,
                 loadedModel.deepSeek2Weights().ropeFreqFactors());
@@ -113,6 +128,7 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -121,6 +137,7 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -129,6 +146,7 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -137,6 +155,7 @@ public class LLMEngine implements AutoCloseable {
             this.ds2Engine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.q3moeEngine = new Qwen3MoEInferenceEngine(
                 loadedModel.config(), loadedModel.qwen3MoEWeights(), maxContextLength,
                 loadedModel.qwen3MoEWeights().ropeFreqFactors());
@@ -145,9 +164,13 @@ public class LLMEngine implements AutoCloseable {
             this.q3moeEngine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
+            this.gemma4Engine = null;
             this.engine = new InferenceEngine(loadedModel.config(), loadedModel.weights(), maxContextLength,
                 loadedModel.weights().ropeFreqFactors());
         }
+
+        // Register JMX metrics
+        registerJmxMetrics();
 
         // Try to initialize GPU-resident forward pass for kernel chaining
         if (this.engine != null && gpuChainEnabled && gpuResources != null) {
@@ -177,6 +200,33 @@ public class LLMEngine implements AutoCloseable {
         // Try to initialize expert GPU cache for MoE models
         if (this.q3moeEngine != null && gpuResources != null && moeOptimizedGpu) {
             tryInitExpertGpuCache();
+        }
+    }
+
+    private void registerJmxMetrics() {
+        try {
+            LLMPlayerMetrics metrics = LLMPlayerMetrics.getInstance();
+            ModelConfig config = loadedModel.config();
+            metrics.setModelInfo(
+                config.name(),
+                config.architecture() != null ? config.architecture().name() : "",
+                modelFileSize / (1024 * 1024),
+                maxContextLength,
+                config.blockCount(),
+                config.embeddingLength(),
+                config.vocabSize(),
+                "" // quantization type not stored in config
+            );
+            metrics.setGpuInfo(
+                gpuLayersUsed >= 0,
+                gpuDeviceName,
+                gpuLayersUsed,
+                config.blockCount(),
+                moeOptimizedGpu,
+                kvCacheEstimate / (1024 * 1024)
+            );
+        } catch (Throwable ignored) {
+            // JMX registration is best-effort
         }
     }
 
@@ -371,7 +421,13 @@ public class LLMEngine implements AutoCloseable {
         // Dispatch to appropriate engine
         GenerationResponse response;
         Object stateForCache;
-        if (nemHEngine != null) {
+        if (gemma4Engine != null) {
+            Gemma4State state = (cached != null)
+                ? (Gemma4State) cached.state
+                : gemma4Engine.createState();
+            stateForCache = state;
+            response = generateGemma4(gemma4Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (nemHEngine != null) {
             NemotronHState state = (cached != null)
                 ? (NemotronHState) cached.state
                 : nemHEngine.createState(maxContextLength);
@@ -460,8 +516,13 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
         long startTime = System.nanoTime();
         float[] logits = null;
+        // Prefill: skip output matmul for all tokens except the last
         for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(state, promptTokens[i], i);
+            if (i < promptLen - 1) {
+                eng.forwardNoOutput(state, promptTokens[i], i);
+            } else {
+                logits = eng.forward(state, promptTokens[i], i);
+            }
         }
         long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -515,6 +576,77 @@ public class LLMEngine implements AutoCloseable {
                     return eng.forward(state, token, position);
                 }
             });
+    }
+
+    private GenerationResponse generateGemma4(Gemma4InferenceEngine eng, CompositeSampler sampler,
+                                                  int[] promptTokens, GenerationRequest request,
+                                                  StreamingCallback callback,
+                                                  Gemma4State state, int prefillStart) {
+        int promptLen = promptTokens.length;
+        eng.setState(state);
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            logits = eng.forward(promptTokens[i], i, i == promptLen - 1);
+        }
+        long genStartTime = System.nanoTime();
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override
+                public float[] forward(int token, int position) {
+                    return eng.forward(token, position, true);
+                }
+            });
+    }
+
+    private static Gemma4InferenceEngine createGemma4Engine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
+        ModelConfig config = loadedModel.config();
+        it.denzosoft.llmplayer.model.ModelWeights weights = loadedModel.weights();
+        it.denzosoft.llmplayer.gguf.GGUFFile gguf = loadedModel.ggufFile();
+        int blockCount = config.blockCount();
+        int pleDim = config.embeddingLengthPerLayer();
+
+        // Load PLE global tensors (always on CPU — lookup only)
+        it.denzosoft.llmplayer.tensor.FloatTensor pleTokenEmbd = null;
+        it.denzosoft.llmplayer.tensor.FloatTensor pleModelProj = null;
+        float[] pleProjNormWeights = null;
+        it.denzosoft.llmplayer.tensor.FloatTensor[] pleInpGate = new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        it.denzosoft.llmplayer.tensor.FloatTensor[] pleProj = new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        float[][] plePostNorm = new float[blockCount][];
+        float[] layerOutputScale = new float[blockCount];
+        java.util.Arrays.fill(layerOutputScale, 1.0f);
+
+        if (pleDim > 0) {
+            try {
+                pleTokenEmbd = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_TOKEN_EMBD);
+            } catch (UnsupportedOperationException e) {
+                System.err.println("  Warning: PLE token embedding unsupported quantization (" + e.getMessage() + "), disabling PLE");
+                pleTokenEmbd = null;
+            }
+            pleModelProj = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_MODEL_PROJ);
+            it.denzosoft.llmplayer.tensor.FloatTensor normTensor = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_PROJ_NORM);
+            if (normTensor != null) {
+                pleProjNormWeights = new float[pleDim];
+                for (int i = 0; i < pleDim; i++) pleProjNormWeights[i] = normTensor.getFloat(i);
+            }
+
+            for (int i = 0; i < blockCount; i++) {
+                pleInpGate[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.pleInpGate(i));
+                pleProj[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.pleProj(i));
+                it.denzosoft.llmplayer.tensor.FloatTensor n = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.plePostNorm(i));
+                if (n != null) {
+                    plePostNorm[i] = new float[config.embeddingLength()];
+                    for (int j = 0; j < config.embeddingLength(); j++) plePostNorm[i][j] = n.getFloat(j);
+                }
+                it.denzosoft.llmplayer.tensor.FloatTensor s = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.layerOutputScale(i));
+                if (s != null) layerOutputScale[i] = s.getFloat(0);
+            }
+        }
+
+        return new Gemma4InferenceEngine(config, weights, maxContextLength,
+            pleTokenEmbd, pleModelProj, pleProjNormWeights,
+            pleInpGate, pleProj, plePostNorm, layerOutputScale,
+            weights.ropeFreqFactors());
     }
 
     private interface ForwardFunction {
@@ -574,6 +706,10 @@ public class LLMEngine implements AutoCloseable {
         AggregateEvaluator evaluator = AggregateEvaluator.createDefault(
             specialTokens.getEosId(), request.maxTokens());
         List<EvaluationResult> evalResults = evaluator.evaluateAll(evalCtx);
+
+        // Record JMX metrics
+        try { LLMPlayerMetrics.getInstance().recordGeneration(genTokenCount, promptLen, tokPerSec, totalTimeMs); }
+        catch (Throwable ignored) {}
 
         return new GenerationResponse(
             responseText.toString(), genTokenCount, promptLen, tokPerSec, totalTimeMs, evalResults);
@@ -1434,6 +1570,9 @@ public class LLMEngine implements AutoCloseable {
             TensorFactory.setGpuBackend("cuda");
             TensorFactory.setGpuBufferManager(bufManager);
 
+            // Register CudaContext for JMX VRAM queries
+            try { LLMPlayerMetrics.getInstance().setCudaContext(cudaContext); } catch (Throwable ignored) {}
+
             return new AutoCloseable() {
                 @Override
                 public void close() throws Exception {
@@ -1496,6 +1635,7 @@ public class LLMEngine implements AutoCloseable {
 
     @Override
     public void close() {
+        try { LLMPlayerMetrics.getInstance().reset(); } catch (Throwable ignored) {}
         if (gpuResources != null) {
             try { gpuResources.close(); } catch (Exception ignored) {}
         }

@@ -24,6 +24,9 @@ public class NemotronHInferenceEngine {
     private final int vocabSize;
     private final int blockCount;
     private final float normEps;
+    private final float embeddingScale;  // Granite Hybrid: 12.0
+    private final float logitScale;      // Granite Hybrid: 8.0
+    private final float residualScale;   // Granite Hybrid: 0.22
 
     // Mamba-2 dimensions
     private final int ssmInnerSize;   // 7680
@@ -63,6 +66,9 @@ public class NemotronHInferenceEngine {
         this.vocabSize = config.vocabSize();
         this.blockCount = config.blockCount();
         this.normEps = config.normEps();
+        this.embeddingScale = config.embeddingScale();
+        this.logitScale = config.logitScale();
+        this.residualScale = config.residualScale();
 
         this.ssmInnerSize = config.ssmInnerSize();
         this.ssmStateSize = config.ssmStateSize();
@@ -122,6 +128,10 @@ public class NemotronHInferenceEngine {
         for (int i = 0; i < dim; i++) {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
+        // Granite Hybrid: embedding scaling
+        if (embeddingScale > 0f) {
+            for (int i = 0; i < dim; i++) state.x[i] *= embeddingScale;
+        }
 
         // 2. Try GPU forward pass
         if (gpuForwardPass != null) {
@@ -151,6 +161,11 @@ public class NemotronHInferenceEngine {
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+        // Granite Hybrid: logit scaling (divide by logitScale)
+        if (logitScale > 0f) {
+            float scale = 1.0f / logitScale;
+            for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
+        }
         return state.logits;
     }
 
@@ -158,7 +173,14 @@ public class NemotronHInferenceEngine {
         gpuUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
         if (computeLogits && gpuLayerCount == blockCount) {
             Boolean ok = (Boolean) gpuForwardGraph.invoke(gpuForwardPass, state.logits);
-            if (ok) return state.logits;
+            if (ok) {
+                // Granite Hybrid: logit scaling after GPU computation
+                if (logitScale > 0f) {
+                    float scale = 1.0f / logitScale;
+                    for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
+                }
+                return state.logits;
+            }
         }
         for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
         if (gpuLayerCount < blockCount) {
@@ -173,7 +195,13 @@ public class NemotronHInferenceEngine {
         if (!computeLogits) return null;
         if (gpuLayerCount == blockCount) {
             Boolean ok = (Boolean) gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
-            if (ok) return state.logits;
+            if (ok) {
+                if (logitScale > 0f) {
+                    float scale = 1.0f / logitScale;
+                    for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
+                }
+                return state.logits;
+            }
             gpuDownloadX.invoke(gpuForwardPass, state.x);
         }
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
@@ -246,8 +274,13 @@ public class NemotronHInferenceEngine {
         Arrays.fill(state.xb, 0);
         lw.ssmOut().matmulParallel(state.ssm_y, state.xb, dim, ssmInnerSize);
 
-        // Residual
-        for (int i = 0; i < dim; i++) state.x[i] += state.xb[i];
+        // Residual (with Granite scaling if configured)
+        applyResidual(state);
+
+        // Integrated FFN (Granite Hybrid: Mamba layers also have SwiGLU FFN)
+        if (lw.ffnUp() != null) {
+            runIntegratedFFN(state, lw);
+        }
     }
 
     private void applyConv1d(NemotronHState state, NemotronHLayerWeights lw, int layer) {
@@ -338,8 +371,10 @@ public class NemotronHInferenceEngine {
         System.arraycopy(state.k, 0, keyCache, state.kvCache.offset(position), kvDim);
         System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
 
-        // Multi-head attention (GQA)
-        float invSqrt = 1.0f / (float) Math.sqrt(headSize);
+        // Multi-head attention (GQA) — Granite Hybrid uses custom attentionScale if set
+        float invSqrt = config.attentionScale() > 0f
+            ? config.attentionScale()
+            : (1.0f / (float) Math.sqrt(headSize));
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
             int qOff = h * headSize;
@@ -369,8 +404,13 @@ public class NemotronHInferenceEngine {
         Arrays.fill(state.xb, 0);
         lw.wo().matmulParallel(state.xb2, state.xb, dim, headCount * headSize);
 
-        // Residual
-        for (int i = 0; i < dim; i++) state.x[i] += state.xb[i];
+        // Residual (with Granite scaling if configured)
+        applyResidual(state);
+
+        // Integrated FFN (Granite Hybrid: attention layers also have SwiGLU FFN)
+        if (lw.ffnUp() != null) {
+            runIntegratedFFN(state, lw);
+        }
     }
 
     // ==================== FFN (squared ReLU) ====================
@@ -381,22 +421,76 @@ public class NemotronHInferenceEngine {
 
         int ffnDim = config.nemotronLayerFfnLength(layer);
 
-        // Up projection
-        Arrays.fill(state.hb, 0, ffnDim, 0);
-        lw.ffnUp().matmulParallel(state.xb, state.hb, ffnDim, dim);
-
-        // Squared ReLU: max(0, x)^2
-        for (int i = 0; i < ffnDim; i++) {
-            float v = state.hb[i];
-            state.hb[i] = v > 0 ? v * v : 0;
+        if (lw.ffnGate() != null) {
+            // SwiGLU FFN (Granite Hybrid): gate + up + SiLU + element-wise mul + down
+            // Use ssm_x as temp buffer for up projection (large enough: ssmInnerSize >= ffnDim for micro)
+            float[] gate = state.hb;
+            float[] up = state.ssm_x.length >= ffnDim ? state.ssm_x : new float[ffnDim];
+            Arrays.fill(gate, 0, ffnDim, 0);
+            Arrays.fill(up, 0, ffnDim, 0);
+            lw.ffnGate().matmulParallel(state.xb, gate, ffnDim, dim);
+            lw.ffnUp().matmulParallel(state.xb, up, ffnDim, dim);
+            for (int i = 0; i < ffnDim; i++) {
+                float v = gate[i];
+                gate[i] = (v / (1.0f + (float) Math.exp(-v))) * up[i]; // SiLU(gate) * up
+            }
+            Arrays.fill(state.xb, 0);
+            lw.ffnDown().matmulParallel(gate, state.xb, dim, ffnDim);
+        } else {
+            // Squared ReLU FFN (Nemotron-H): up + sqReLU + down
+            Arrays.fill(state.hb, 0, ffnDim, 0);
+            lw.ffnUp().matmulParallel(state.xb, state.hb, ffnDim, dim);
+            for (int i = 0; i < ffnDim; i++) {
+                float v = state.hb[i];
+                state.hb[i] = v > 0 ? v * v : 0;
+            }
+            Arrays.fill(state.xb, 0);
+            lw.ffnDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
         }
 
-        // Down projection
-        Arrays.fill(state.xb, 0);
-        lw.ffnDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
+        // Residual (with Granite scaling if configured)
+        applyResidual(state);
+    }
 
-        // Residual
-        for (int i = 0; i < dim; i++) state.x[i] += state.xb[i];
+    // ==================== Integrated FFN (Granite Hybrid) ====================
+
+    /**
+     * Run SwiGLU FFN after Mamba or Attention layer.
+     * Uses ffnNorm (separate from attnNorm) and SwiGLU activation.
+     */
+    private void runIntegratedFFN(NemotronHState state, NemotronHLayerWeights lw) {
+        it.denzosoft.llmplayer.tensor.FloatTensor normTensor = lw.ffnNorm() != null ? lw.ffnNorm() : lw.attnNorm();
+        float[] normW = cacheWeights(normTensor, dim);
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normW, dim, normEps);
+
+        int ffnDim = config.intermediateSize();
+
+        // SwiGLU: gate + up + SiLU + mul + down
+        float[] gate = state.hb;
+        float[] up = state.ssm_x.length >= ffnDim ? state.ssm_x : new float[ffnDim];
+        Arrays.fill(gate, 0, ffnDim, 0);
+        Arrays.fill(up, 0, ffnDim, 0);
+        lw.ffnGate().matmulParallel(state.xb, gate, ffnDim, dim);
+        lw.ffnUp().matmulParallel(state.xb, up, ffnDim, dim);
+        for (int i = 0; i < ffnDim; i++) {
+            float v = gate[i];
+            gate[i] = (v / (1.0f + (float) Math.exp(-v))) * up[i];
+        }
+        Arrays.fill(state.xb, 0);
+        lw.ffnDown().matmulParallel(gate, state.xb, dim, ffnDim);
+
+        // Residual (with Granite scaling if configured)
+        applyResidual(state);
+    }
+
+    // ==================== Residual ====================
+
+    private void applyResidual(NemotronHState state) {
+        if (residualScale > 0f) {
+            for (int i = 0; i < dim; i++) state.x[i] += residualScale * state.xb[i];
+        } else {
+            for (int i = 0; i < dim; i++) state.x[i] += state.xb[i];
+        }
     }
 
     // ==================== Utility ====================

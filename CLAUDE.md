@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, GPT-OSS/Sonar, and Nemotron-H (hybrid Mamba-2) architectures with quantized formats (Q2_K through Q8_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, and Nemotron-H (hybrid Mamba-2) architectures with quantized formats (Q2_K through Q8_0, Q5_1, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -57,7 +57,7 @@ The project compiles from three source roots under the default `java25` profile:
 
 **Token embedding optimization**: across all architectures, the token embedding tensor is loaded on CPU (not GPU). It is only used for a single-element lookup per token (~16 KB), making GPU residency wasteful (~500+ MB of VRAM). When output weights are tied to embedding weights, the output tensor is reloaded separately on GPU for the matmul projection.
 
-Classes in `java21/` and `java25/` are **never imported directly** from base code. They are loaded via `Class.forName()` reflection with try/catch fallbacks, allowing graceful degradation on older JVMs. There are six reflection loading sites:
+Classes in `java21/` and `java25/` are **never imported directly** from base code. They are loaded via `Class.forName()` reflection with try/catch fallbacks, allowing graceful degradation on older JVMs. Reflection loading sites:
 
 | Loading site | Java 21+ class | Fallback |
 |---|---|---|
@@ -100,13 +100,14 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 4. `generate()` tokenizes the prompt (with chat template if enabled), runs prefill, then auto-regressive decoding with the configured sampler
 5. Each `generate()` call creates its own `InferenceState` — model weights are immutable mmap'd memory, making `LLMEngine` thread-safe
 
-### Inference engine dispatch (four paths)
+### Inference engine dispatch (six paths)
 
-1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3, Command-R, OLMo2, GPT-OSS.
-5. **Nemotron-H** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias, sliding window, dual RoPE) + `SwiGLUFFN` (with GeGLU for Gemma). Gemma 2/3 use pre+post attention/FFN norms and embedding scaling.
+1. **Standard** (`InferenceEngine`): Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3, Command-R, OLMo2, Falcon3, GPT-OSS, Granite 3.3. Uses `TransformerBlock` → `Attention` (GQA with optional QK-norm/bias, sliding window, dual RoPE) + `SwiGLUFFN` (with GeGLU for Gemma). Gemma 2/3 use pre+post attention/FFN norms and embedding scaling. Granite 3.3 uses four custom scaling factors (embedding, attention, residual, logit) read from GGUF `granite.*` metadata keys.
 2. **DeepSeek2** (`DeepSeek2InferenceEngine`): DeepSeek2 and GLM-4.7-Flash (also uses `deepseek2` GGUF arch). Uses MLA (Multi-Head Latent Attention) + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 3. **Qwen3 MoE** (`Qwen3MoEInferenceEngine`): Qwen3-Coder-30B-A3B and similar. Standard GQA attention with QK-norm + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 4. **Qwen3.5** (`Qwen35InferenceEngine`): Hybrid DeltaNet + full attention architecture. Alternates Gated DeltaNet (linear attention/SSM) and standard GQA layers in a 3:1 ratio (`full_attention_interval=4`). DeltaNet layers use recurrent state `S` with update rule `S_new = alpha*S + beta*outer(k, v - alpha*S^T@k)`, output `o = S^T_new @ q`. Full attention layers use a packed Q+gate projection where `wq` outputs interleaved `[Q_h0, gate_h0, Q_h1, gate_h1, ...]` — these must be deinterleaved into separate Q and gate arrays before use. Gate is applied as `sigmoid(gate) * attn_output`. Both layer types include short conv1d (width 4) on Q/K and use QK-norm. State is maintained per-layer in `Qwen35State`.
+5. **Nemotron-H / Granite Hybrid** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Granite Hybrid adds embedding/attention/residual/logit scaling and integrated SwiGLU FFN (with separate ffn_norm) inside Mamba and Attention layers.
+6. **Gemma 4 / Gemma 3n** (`Gemma4InferenceEngine`): For PLE (Per-Layer Embeddings) models (E2B/E4B). Features: per-layer token embedding/projection tensors, dual headSize (SWA=256, full=512 per-layer), shared KV cache (layers 24-41 reuse KV from layers 6-23), V-norm (RMSNorm without learnable scale on V), dual RoPE (SWA theta=10K, full theta=1M with proportional frequency factors), K-norm with (1+w) weight adjustment, attention scale=1.0, logit soft-capping, layer output scaling. Uses `Gemma4State` with variable-size buffers per layer.
 
 ### Tensor system
 
@@ -174,6 +175,17 @@ LLMPlayer-specific endpoints for model loading, GPU configuration, and diagnosti
 | `/api/gpu/devices` | GET | Enumerate OpenCL devices |
 | `/api/memory/check` | POST | Check RAM availability for a model |
 | `/api/hardware/plan` | POST | Build optimal hardware config plan |
+| `/api/metrics` | GET | Runtime metrics: model info, generation stats, memory, GPU VRAM |
+
+### JMX Monitoring
+
+Runtime metrics are exposed via JMX MXBean at `it.denzosoft.llmplayer:type=LLMPlayer`. Connect with JConsole, VisualVM, or any JMX client.
+
+**Interface:** `LLMPlayerMXBean.java` — **Implementation:** `LLMPlayerMetrics.java` (singleton, thread-safe atomics).
+
+Attributes: `ModelName`, `Architecture`, `TotalGenerations`, `TotalTokensGenerated`, `LastTokensPerSecond`, `AverageTokensPerSecond`, `HeapUsedMB`, `HeapMaxMB`, `GpuVramTotalMB`, `GpuVramFreeMB`, `GpuLayersUsed`, `KvCacheEstimateMB`.
+
+Also available via REST: `GET /api/metrics` returns the same data as JSON (model, generation, memory, GPU sections).
 
 #### Chat Persistence API (`/api/chats/*`)
 
@@ -236,7 +248,7 @@ Response parsing in `OpenAIHandler.tryParseToolCalls()`. Multi-tool-call parsing
 ### Resources
 
 - `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/kernels/cuda/` — CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head). Compiled at runtime via NVRTC by `CudaContext`. Includes `matmul_q4_k_coalesced.cu` (alternative coalesced kernel, opt-in via `-Dcuda.q4k.coalesced=true`).
+- `src/main/resources/kernels/cuda/` — CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus dp4a variants (`matmul_q4_k_dp4a.cu`, `matmul_q5_k_dp4a.cu`, `matmul_q6_k_dp4a.cu`), shared-memory variants (`matmul_q5_k_smem.cu`, `matmul_q6_k_tiled.cu`), DeltaNet kernels (`deltanet_fused.cu`, `deltanet_fused_v2.cu`), Mamba-2 kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`), and auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head, conv1d_silu, alpha_beta_gates, deinterleave_q_gate, sigmoid_elementwise_mul, sqrelu). Compiled at runtime via NVRTC by `CudaContext`.
 - `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
 - `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
@@ -278,7 +290,7 @@ Two modes for keeping activations on GPU between transformer layers, reducing CP
 
 Key design: **zero-allocation hot paths** — all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE architectures.
+**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Falcon3, OLMo2, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`), Granite 3.3 (with scaling factors). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE architectures, Gemma 4/3n (PLE).
 
 #### Qwen3.5 CUDA forward pass (`Qwen35CudaForwardPass`)
 
@@ -341,9 +353,9 @@ When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backe
 
 ## Benchmarks
 
-See `BENCHMARKS.md` for full results (27 models tested) and `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling.
+See `BENCHMARKS.md` for full results (34+ models tested across 20 architectures) and `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling.
 
-Current best: Llama-3.2-1B Q4_K_M at **53-56 tok/s** (CUDA graph mode, RTX 4050 Laptop GPU).
+Current best: Llama-3.2-1B Q4_K_M at **55.8 tok/s** (CUDA graph mode, RTX 4050 Laptop GPU).
 
 ### CUDA kernel design patterns
 
@@ -360,9 +372,12 @@ All properties are set via `-Dproperty=value` on the Java command line.
 | `cuda.nograph` | `false` | Disable CUDA graph capture; use per-layer kernel launches instead |
 | `cuda.cublas` | `false` | Enable cuBLAS for Q4_K matmul (pre-dequantizes to FP16; requires `libcublas.so`) |
 | `cuda.cublas.fp32` | `false` | Use FP32 instead of FP16 for cuBLAS dequantization (more VRAM, slower) |
-| `cuda.dp4a` | `false` | Enable `__dp4a` integer dot product for Qwen3.5 (opt-in; ~2% gain on RTX 4050, more on A100/H100) |
+| `cuda.dp4a` | `true` | Enable `__dp4a` integer dot product for Q4_K/Q5_K/Q6_K matmul. Quantizes input to Q8_1 then uses int8 dp4a. |
 | `cuda.q4k.coalesced` | `false` | Use coalesced Q4_K kernel variant (all threads process same group) |
 | `cuda.q4k.smem` | `false` | Use shared-memory input tiling Q4_K kernel variant |
+| `cuda.q5k.smem` | `true` | Use shared-memory input kernel for Q5_K (+7% throughput) |
+| `cuda.q6k.tiled` | `true` | Use tiled shared-memory kernel for Q6_K (256-element tiles, +9% throughput) |
+| `cuda.deltanet.v2` | `true` | Use float4-vectorized DeltaNet kernel (+4% throughput) |
 | `cuda.profile` | `false` | Enable CUDA per-section timing (adds `finish()` barriers; ~15-25% overhead) |
 | `cpu.profile` | `false` | Enable CPU per-layer timing (standard InferenceEngine only) |
 | `matmul.tiled` | `false` | Enable cache-friendly tiled matmul on CPU (Java 21+) |

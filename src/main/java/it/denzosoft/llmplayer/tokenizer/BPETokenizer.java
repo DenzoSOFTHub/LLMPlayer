@@ -16,6 +16,7 @@ public class BPETokenizer implements Tokenizer {
     private final Map<Long, Integer> mergeRanks; // pair hash -> merge priority
     private final SpecialTokens specialTokens;
     private final Map<String, Integer> specialTokenMap;
+    private final boolean useGpt2ByteMapping; // false for gemma4 (uses SentencePiece-style encoding)
 
     // GPT-2 / Llama 3 pre-tokenization pattern
     private static final Pattern PRE_TOKENIZE = Pattern.compile(
@@ -33,12 +34,27 @@ public class BPETokenizer implements Tokenizer {
         }
 
         // Build special token map for quick lookup of multi-char special tokens
+        // Gemma 4: <|turn>, <turn|> etc. should NOT be special tokens — they are encoded
+        // as regular BPE text (multi-token). Only true control tokens (BOS/EOS) are special.
+        boolean isGemma4 = "gemma4".equals(
+            specialTokens != null ? specialTokens.getModelType() : null);
+        this.useGpt2ByteMapping = !isGemma4;
         for (int i = 0; i < vocab.length; i++) {
             String token = vocab[i];
-            if (token.startsWith("<|") && token.endsWith("|>")) {
-                specialTokenMap.put(token, i);
-            } else if (token.startsWith("<") && token.endsWith(">") && token.length() > 2) {
-                specialTokenMap.put(token, i);
+            if (isGemma4) {
+                // Gemma 4: register angle-bracket tokens AND \n/\n\n as special tokens.
+                // Use SentencePiece byte mapping for regular text (not GPT-2 byte mapping).
+                if (token.startsWith("<") && token.endsWith(">") && token.length() > 2) {
+                    specialTokenMap.put(token, i);
+                } else if ("\n".equals(token) || "\n\n".equals(token)) {
+                    specialTokenMap.put(token, i);
+                }
+            } else {
+                if (token.startsWith("<|") && token.endsWith("|>")) {
+                    specialTokenMap.put(token, i);
+                } else if (token.startsWith("<") && token.endsWith(">") && token.length() > 2) {
+                    specialTokenMap.put(token, i);
+                }
             }
         }
 
@@ -81,12 +97,17 @@ public class BPETokenizer implements Tokenizer {
                 continue;
             }
 
-            // Pre-tokenize using regex
-            Matcher matcher = PRE_TOKENIZE.matcher(part);
-            while (matcher.find()) {
-                String word = matcher.group();
-                List<Integer> wordTokens = bpeEncode(word);
-                allTokens.addAll(wordTokens);
+            if (useGpt2ByteMapping) {
+                // GPT-2/Llama3 pre-tokenize using regex
+                Matcher matcher = PRE_TOKENIZE.matcher(part);
+                while (matcher.find()) {
+                    String word = matcher.group();
+                    allTokens.addAll(bpeEncode(word));
+                }
+            } else {
+                // Gemma 4: replace spaces with ▁ (SentencePiece style), then BPE the whole piece
+                String spPart = part.replace(' ', '\u2581');
+                allTokens.addAll(bpeEncode(spPart));
             }
         }
 
@@ -133,20 +154,39 @@ public class BPETokenizer implements Tokenizer {
 
     private List<Integer> bpeEncode(String word) {
         // Convert to byte-level tokens
-        byte[] bytes = word.getBytes(StandardCharsets.UTF_8);
-        List<Integer> tokens = new ArrayList<>(bytes.length);
-
-        for (byte b : bytes) {
-            String byteStr = byteToToken(b);
-            Integer id = tokenToId.get(byteStr);
-            if (id != null) {
-                tokens.add(id);
-            } else {
-                // Try direct single-char lookup
-                id = tokenToId.get(String.valueOf((char) (b & 0xFF)));
+        List<Integer> tokens;
+        if (useGpt2ByteMapping) {
+            byte[] bytes = word.getBytes(StandardCharsets.UTF_8);
+            tokens = new ArrayList<>(bytes.length);
+            for (byte b : bytes) {
+                String byteStr = byteToToken(b);
+                Integer id = tokenToId.get(byteStr);
                 if (id != null) {
                     tokens.add(id);
+                } else {
+                    id = tokenToId.get(String.valueOf((char) (b & 0xFF)));
+                    if (id != null) tokens.add(id);
                 }
+            }
+        } else {
+            // Non-GPT-2 mode (Gemma 4): lookup each character directly in vocabulary
+            tokens = new ArrayList<>(word.length());
+            for (int i = 0; i < word.length(); ) {
+                int cp = word.codePointAt(i);
+                String ch = new String(Character.toChars(cp));
+                Integer id = tokenToId.get(ch);
+                if (id != null) {
+                    tokens.add(id);
+                } else {
+                    // Fallback: try UTF-8 byte-level tokens (<0xXX>)
+                    byte[] bytes = ch.getBytes(StandardCharsets.UTF_8);
+                    for (byte b : bytes) {
+                        String hexTok = String.format("<0x%02X>", b & 0xFF);
+                        id = tokenToId.get(hexTok);
+                        if (id != null) tokens.add(id);
+                    }
+                }
+                i += Character.charCount(cp);
             }
         }
 

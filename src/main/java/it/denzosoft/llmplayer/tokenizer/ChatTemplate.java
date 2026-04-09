@@ -58,11 +58,13 @@ public class ChatTemplate {
             return formatCommandR(userMessage);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2(userMessage);
-        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3) {
+        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3 || architecture == ModelArchitecture.GEMMA3N) {
             return formatGemma(userMessage);
+        } else if (architecture == ModelArchitecture.GEMMA4) {
+            return formatGemma4(userMessage);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOss(userMessage);
-        } else if (architecture == ModelArchitecture.GRANITE) {
+        } else if (architecture == ModelArchitecture.GRANITE || architecture == ModelArchitecture.GRANITE_HYBRID) {
             return formatGranite(userMessage);
         }
         return formatLlama3(userMessage); // default fallback
@@ -89,11 +91,13 @@ public class ChatTemplate {
             return formatCommandRChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2Chat(systemMessage, userMessage);
-        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3) {
+        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3 || architecture == ModelArchitecture.GEMMA3N) {
             return formatGemmaChat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.GEMMA4) {
+            return formatGemma4Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOssChat(systemMessage, userMessage);
-        } else if (architecture == ModelArchitecture.GRANITE) {
+        } else if (architecture == ModelArchitecture.GRANITE || architecture == ModelArchitecture.GRANITE_HYBRID) {
             return formatGraniteChat(systemMessage, userMessage);
         }
         return formatLlama3Chat(systemMessage, userMessage); // default fallback
@@ -223,11 +227,13 @@ public class ChatTemplate {
             return formatCommandRConversation(messages);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2Conversation(messages);
-        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3) {
+        } else if (architecture == ModelArchitecture.GEMMA2 || architecture == ModelArchitecture.GEMMA3 || architecture == ModelArchitecture.GEMMA3N) {
             return formatGemmaConversation(messages);
+        } else if (architecture == ModelArchitecture.GEMMA4) {
+            return formatGemma4Conversation(messages);
         } else if (architecture == ModelArchitecture.GPT_OSS) {
             return formatGptOssConversation(messages);
-        } else if (architecture == ModelArchitecture.GRANITE) {
+        } else if (architecture == ModelArchitecture.GRANITE || architecture == ModelArchitecture.GRANITE_HYBRID) {
             return formatGraniteConversation(messages);
         }
         return formatLlama3Conversation(messages);
@@ -606,6 +612,34 @@ public class ChatTemplate {
         }
         sb.append("<|start_of_role|>user<|end_of_role|>").append(userMessage).append("<|end_of_text|>\n");
         sb.append("<|start_of_role|>assistant<|end_of_role|>\n");
+        return sb.toString();
+    }
+
+    // Gemma 4 format: <|turn>role\nmessage<turn|>
+    private String formatGemma4(String userMessage) {
+        return "<|turn>user\n" + userMessage + "<turn|>\n<|turn>model\n";
+    }
+
+    private String formatGemma4Chat(String systemMessage, String userMessage) {
+        StringBuilder sb = new StringBuilder();
+        if (systemMessage != null && !systemMessage.isEmpty()) {
+            sb.append("<|turn>system\n").append(systemMessage).append("<turn|>\n");
+        }
+        sb.append("<|turn>user\n").append(userMessage).append("<turn|>\n");
+        sb.append("<|turn>model\n");
+        return sb.toString();
+    }
+
+    private String formatGemma4Conversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            String role = "assistant".equals(msg[0]) ? "model" : msg[0];
+            sb.append("<|turn>").append(role).append("\n");
+            sb.append(msg[1]).append("<turn|>\n");
+        }
+        if (!messages.isEmpty() && !"assistant".equals(messages.get(messages.size() - 1)[0])) {
+            sb.append("<|turn>model\n");
+        }
         return sb.toString();
     }
 }

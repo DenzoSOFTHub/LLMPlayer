@@ -13,6 +13,7 @@ public class SpecialTokens {
     private final int[] additionalEosIds; // extra stop tokens (GPT-OSS: <|end|>)
     private final Map<String, Integer> specialTokenMap;
     private final boolean addBos;  // whether to prepend BOS token
+    private String modelType;     // tokenizer model type (e.g. "gemma4")
 
     public SpecialTokens(int bosId, int eosId, int padId, int eotId, int[] additionalEosIds,
                           Map<String, Integer> specialTokenMap) {
@@ -32,6 +33,8 @@ public class SpecialTokens {
 
     public int getBosId() { return bosId; }
     public boolean shouldAddBos() { return addBos; }
+    public String getModelType() { return modelType; }
+    public void setModelType(String type) { this.modelType = type; }
     public int getEosId() { return eosId; }
     public int getPadId() { return padId; }
     public int getEotId() { return eotId; }

@@ -20,6 +20,10 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
         "true".equals(System.getProperty("cuda.q4k.coalesced", "false"));
     private static final boolean USE_SMEM =
         "true".equals(System.getProperty("cuda.q4k.smem", "false"));
+    private static final boolean USE_2WARP =
+        "true".equals(System.getProperty("cuda.q4k.2warp", "false"));
+    private static final boolean USE_MULTIBLOCK =
+        "true".equals(System.getProperty("cuda.q4k.multiblock", "false"));
 
     public Q4_KCudaTensor(TensorData data, long size, CudaBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -30,12 +34,16 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     protected String kernelResourcePath() {
+        if (USE_2WARP) return "kernels/cuda/matmul_q4_k_2warp.cu";
+        if (USE_MULTIBLOCK) return "kernels/cuda/matmul_q4_k_multiblock.cu";
         if (USE_SMEM) return "kernels/cuda/matmul_q4_k_smem.cu";
         return USE_COALESCED ? "kernels/cuda/matmul_q4_k_coalesced.cu" : "kernels/cuda/matmul_q4_k.cu";
     }
 
     @Override
     protected String kernelName() {
+        if (USE_2WARP) return "matmul_q4_k_2warp";
+        if (USE_MULTIBLOCK) return "matmul_q4_k_multiblock";
         if (USE_SMEM) return "matmul_q4_k_smem";
         return USE_COALESCED ? "matmul_q4_k_coalesced" : "matmul_q4_k";
     }
@@ -47,9 +55,20 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
     protected int blockSize() { return BLOCK_SIZE; }
 
     @Override
+    public int getMatmulGridDim(int rows, int cols) {
+        if (USE_2WARP) {
+            int blockDim = getMatmulBlockDim(cols);
+            int rowsPerBlock = blockDim / 64; // 2 warps per row
+            return (int) ((rows + rowsPerBlock - 1) / rowsPerBlock);
+        }
+        return super.getMatmulGridDim(rows, cols);
+    }
+
+    @Override
     protected int computeSharedMemBytes(int cols, long cudaBlockSize) {
-        // smem kernel needs 256 floats (1024 bytes) for input tile
-        return USE_SMEM ? 256 * 4 : 0;
+        if (USE_2WARP) return 64 * 4;
+        if (USE_SMEM) return 256 * 4;
+        return 0;
     }
 
     @Override

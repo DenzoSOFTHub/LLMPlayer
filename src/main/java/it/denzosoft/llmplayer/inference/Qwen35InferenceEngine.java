@@ -67,6 +67,7 @@ public class Qwen35InferenceEngine {
     private Method gpuForwardGraphArgmax;
     private Method gpuForwardFinalLogits;
     private Method gpuForwardFinalArgmax;
+    private Method gpuForwardGraphPrefill;
     private Method gpuDownloadX;
 
     public Qwen35InferenceEngine(ModelConfig config, Qwen35Weights weights, int maxSeqLen,
@@ -154,6 +155,7 @@ public class Qwen35InferenceEngine {
             gpuForwardGraphArgmax = fwdClass.getMethod("forwardGraphArgmax");
             gpuForwardFinalLogits = fwdClass.getMethod("forwardFinalLogits", float[].class);
             gpuForwardFinalArgmax = fwdClass.getMethod("forwardFinalArgmax");
+            gpuForwardGraphPrefill = fwdClass.getMethod("forwardGraphPrefill");
             gpuDownloadX = fwdClass.getMethod("downloadX", float[].class);
 
             Method getGpuLayers = fwdClass.getMethod("getGpuLayerCount");
@@ -221,10 +223,10 @@ public class Qwen35InferenceEngine {
         // Upload embedding + token params
         gpuUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
 
-        // Try CUDA graph (all layers + output in single launch)
-        if (computeLogits && gpuLayerCount == blockCount) {
+        // Try CUDA graph (use generation graph for both prefill and generation)
+        if (gpuLayerCount == blockCount) {
             Boolean graphOk = (Boolean) gpuForwardGraph.invoke(gpuForwardPass, state.logits);
-            if (graphOk) return state.logits;
+            if (graphOk) return computeLogits ? state.logits : null;
         }
 
         // Per-layer GPU forward

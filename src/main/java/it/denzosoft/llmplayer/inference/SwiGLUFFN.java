@@ -25,7 +25,9 @@ public class SwiGLUFFN {
         this.config = config;
         // Gemma2/3 uses GELU activation instead of SiLU
         this.useGelu = config.architecture() == ModelArchitecture.GEMMA2
-                     || config.architecture() == ModelArchitecture.GEMMA3;
+                     || config.architecture() == ModelArchitecture.GEMMA3
+                     || config.architecture() == ModelArchitecture.GEMMA4
+                     || config.architecture() == ModelArchitecture.GEMMA3N;
     }
 
     /**
