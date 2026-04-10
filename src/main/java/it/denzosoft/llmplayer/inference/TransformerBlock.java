@@ -22,6 +22,7 @@ public class TransformerBlock {
     private final float[][] cachedPostFfnNorm;  // null entries if not used
 
     private final float residualScale; // Granite: 0.22 (scale before residual add)
+    private final boolean useLayerNorm; // Command-R: centered LayerNorm instead of RMSNorm
 
     // CPU profiling (enabled via -Dcpu.profile=true)
     private final boolean cpuProfile;
@@ -35,6 +36,7 @@ public class TransformerBlock {
         this.attention = attention;
         this.ffn = ffn;
         this.residualScale = config.residualScale();
+        this.useLayerNorm = config.useLayerNorm();
         this.cpuProfile = "true".equals(System.getProperty("cpu.profile"));
 
         int dim = config.embeddingLength();
@@ -69,7 +71,11 @@ public class TransformerBlock {
         // Pre-attention norm (standard/GLM4/Gemma2/Command-R) or pass-through (OLMo2)
         if (cpuProfile) t0 = System.nanoTime();
         if (cachedAttnNorm[layer] != null) {
-            RMSNorm.apply(state.xb, state.x, cachedAttnNorm[layer], dim, config.normEps());
+            if (useLayerNorm) {
+                LayerNorm.apply(state.xb, state.x, cachedAttnNorm[layer], dim, config.normEps());
+            } else {
+                RMSNorm.apply(state.xb, state.x, cachedAttnNorm[layer], dim, config.normEps());
+            }
         } else {
             System.arraycopy(state.x, 0, state.xb, 0, dim);
         }
@@ -84,9 +90,13 @@ public class TransformerBlock {
         attention.forward(state, weights, layer, position);
         if (cpuProfile) { t1 = System.nanoTime(); profileAttnNs += t1 - t0; t0 = t1; }
 
-        // Post-attention norm (GLM4/Gemma2/OLMo2)
+        // Post-attention norm (GLM4/Gemma2/OLMo2) — also Command-R if it ever ships one
         if (cachedPostAttnNorm[layer] != null) {
-            RMSNorm.apply(state.xb, state.xb, cachedPostAttnNorm[layer], dim, config.normEps());
+            if (useLayerNorm) {
+                LayerNorm.apply(state.xb, state.xb, cachedPostAttnNorm[layer], dim, config.normEps());
+            } else {
+                RMSNorm.apply(state.xb, state.xb, cachedPostAttnNorm[layer], dim, config.normEps());
+            }
             if (cpuProfile) { t1 = System.nanoTime(); profilePostAttnNormNs += t1 - t0; t0 = t1; }
         }
 
@@ -105,7 +115,11 @@ public class TransformerBlock {
             System.arraycopy(state.logits, 0, state.xb, 0, dim);
         } else if (cachedFfnNorm[layer] != null) {
             // Standard pre-FFN norm
-            RMSNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
+            if (useLayerNorm) {
+                LayerNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
+            } else {
+                RMSNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
+            }
         } else {
             // Post-norm only (OLMo2): FFN takes x directly
             System.arraycopy(state.x, 0, state.xb, 0, dim);
@@ -118,7 +132,11 @@ public class TransformerBlock {
 
         // Post-FFN norm (GLM4/Gemma2/OLMo2)
         if (cachedPostFfnNorm[layer] != null) {
-            RMSNorm.apply(state.xb, state.xb, cachedPostFfnNorm[layer], dim, config.normEps());
+            if (useLayerNorm) {
+                LayerNorm.apply(state.xb, state.xb, cachedPostFfnNorm[layer], dim, config.normEps());
+            } else {
+                RMSNorm.apply(state.xb, state.xb, cachedPostFfnNorm[layer], dim, config.normEps());
+            }
             if (cpuProfile) { t1 = System.nanoTime(); profilePostFfnNormNs += t1 - t0; t0 = t1; }
         }
 

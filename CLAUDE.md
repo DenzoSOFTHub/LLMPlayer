@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, and Nemotron-H (hybrid Mamba-2) architectures with quantized formats (Q2_K through Q8_0, Q5_1, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -31,7 +31,9 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --ena
 
 **Build environment note:** If the system JDK is not Java 25, set `JAVA_HOME` before running Maven (e.g. `export JAVA_HOME=/usr/lib/jvm/jdk-25.0.2+10 && export PATH=$JAVA_HOME/bin:$PATH`).
 
-Unit test directory exists but is empty. Integration tests for the OpenAI-compatible API are in `test-openai-api.sh` (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures (llama, qwen2, qwen3, phi3, deepseek2, mistral3) with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
+Unit test directory exists but is empty (no JUnit dependency to preserve zero-deps). Test scripts:
+- `test-architectures.sh` — smoke test that loads each supported architecture (Llama, Qwen2/3/3.5, Gemma 2/3/3n/4, Phi-3/4, Mistral3, OLMo2, Falcon3, Granite 3.3, Granite Hybrid, Nemotron-H, SmolLM3, DeepSeek2, Qwen3MoE) and verifies it can generate at least one token. Auto-detects Java 21+. Run with `./test-architectures.sh` for CPU-only or `./test-architectures.sh --gpu` for GPU mode. Set `INCLUDE_LARGE=1` to include 30B+ MoE models.
+- `test-openai-api.sh` — integration tests for the OpenAI-compatible API (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
 
 `run.sh` (Linux/macOS) and `run.bat` (Windows) are launcher scripts with all required JVM flags for Java 25, but they are **not checked into the repo** (excluded via `.gitignore`). Create them locally — see README.md for the script contents.
 
@@ -183,9 +185,9 @@ Runtime metrics are exposed via JMX MXBean at `it.denzosoft.llmplayer:type=LLMPl
 
 **Interface:** `LLMPlayerMXBean.java` — **Implementation:** `LLMPlayerMetrics.java` (singleton, thread-safe atomics).
 
-Attributes: `ModelName`, `Architecture`, `TotalGenerations`, `TotalTokensGenerated`, `LastTokensPerSecond`, `AverageTokensPerSecond`, `HeapUsedMB`, `HeapMaxMB`, `GpuVramTotalMB`, `GpuVramFreeMB`, `GpuLayersUsed`, `KvCacheEstimateMB`.
+Attributes: `ModelName`, `Architecture`, `TotalGenerations`, `TotalTokensGenerated`, `LastTokensPerSecond`, `AverageTokensPerSecond`, `RecentTokensPerSecond` (60s rolling window), `RecentSampleCount`, `HeapUsedMB`, `HeapMaxMB`, `GpuVramTotalMB`, `GpuVramFreeMB`, `GpuLayersUsed`, `KvCacheEstimateMB`.
 
-Also available via REST: `GET /api/metrics` returns the same data as JSON (model, generation, memory, GPU sections).
+Also available via REST: `GET /api/metrics` returns the same data as JSON (model, generation, memory, GPU sections). The rolling window keeps the last 256 generations within the 60-second window for live tok/s monitoring.
 
 #### Chat Persistence API (`/api/chats/*`)
 
@@ -247,8 +249,8 @@ Response parsing in `OpenAIHandler.tryParseToolCalls()`. Multi-tool-call parsing
 
 ### Resources
 
-- `src/main/resources/kernels/` — 12 OpenCL kernel files (matmul variants for each quantization type, plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`). Loaded and compiled on-demand by `OpenCLContext`.
-- `src/main/resources/kernels/cuda/` — CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS plus dp4a variants (`matmul_q4_k_dp4a.cu`, `matmul_q5_k_dp4a.cu`, `matmul_q6_k_dp4a.cu`), shared-memory variants (`matmul_q5_k_smem.cu`, `matmul_q6_k_tiled.cu`), DeltaNet kernels (`deltanet_fused.cu`, `deltanet_fused_v2.cu`), Mamba-2 kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`), and auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head, conv1d_silu, alpha_beta_gates, deinterleave_q_gate, sigmoid_elementwise_mul, sqrelu). Compiled at runtime via NVRTC by `CudaContext`.
+- `src/main/resources/kernels/` — 14 OpenCL kernel files: 7 matmul variants (`matmul_f32.cl`, `matmul_q3_k.cl`, `matmul_q4_0.cl`, `matmul_q4_k.cl`, `matmul_q5_k.cl`, `matmul_q6_k.cl`, `matmul_q8_0.cl`) plus `rmsnorm.cl`, `softmax.cl`, `silu.cl`, `saxpy.cl`, `accumulate.cl`, `elementwise_mul.cl`, `fill_zero.cl`. Loaded and compiled on-demand by `OpenCLContext`.
+- `src/main/resources/kernels/cuda/` — CUDA kernel files (`.cu`). Matmul kernels for Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, F32, BF16, F16, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4 plus dp4a variants (`matmul_q4_k_dp4a.cu`, `matmul_q5_k_dp4a.cu`, `matmul_q6_k_dp4a.cu`), shared-memory variants (`matmul_q5_k_smem.cu`, `matmul_q6_k_smem.cu`, `matmul_q6_k_tiled.cu`), 2-warp variant (`matmul_q4_k_2warp.cu`), coalesced variant (`matmul_q4_k_coalesced.cu`), DeltaNet kernels (`deltanet_fused.cu`, `deltanet_fused_v2.cu`, `deltanet_recurrence.cu`), Mamba-2 kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`), cuBLAS support kernels (`dequant_q4_k_f16.cu`, `dequant_q4_k_f32.cu`, `convert_f32_to_f16.cu`, `quantize_q8.cu`), and auxiliary kernels (RMSNorm, RoPE, attention, softmax, SiLU, argmax, split_qkv, split_gate_up, fused_gate_up, rmsnorm_per_head, conv1d_short, conv1d_silu, alpha_beta_gates, deinterleave_q_gate, sigmoid_elementwise_mul, sqrelu, scale_inplace, silu_mul). Compiled at runtime via NVRTC by `CudaContext`. Note: `matmul_mxfp4.cu` exists but no `MXFP4CudaTensor` wrapper is wired up — MXFP4 is currently CPU-only at the tensor layer.
 - `src/main/resources/web-ui.html` — Model config web UI served at `/` by `WebServer` in `--web` mode.
 - `src/main/resources/chat-ui.html` — Chat UI with conversation persistence and branching, served at `/chat`.
 
@@ -361,7 +363,7 @@ Current best: Llama-3.2-1B Q4_K_M at **55.8 tok/s** (CUDA graph mode, RTX 4050 L
 
 All CUDA matmul kernels use 1 warp (32 threads) per output row with `__shfl_down_sync` reduction. Grid: `ceil(rows / (blockSize/32))` blocks.
 
-**CUDA alignment constraints**: `__ldg((const unsigned int*)ptr)` requires 4-byte aligned `ptr`. Block sizes NOT divisible by 4: Q8_0 (34B), Q4_0 (18B), Q6_K (210B), Q3_K (110B) — these kernels use byte-level `__ldg` only. Q4_K (144B) and Q5_K (176B) are safe for uint32 `__ldg`.
+**CUDA alignment constraints**: `__ldg((const unsigned int*)ptr)` requires 4-byte aligned `ptr`. Block sizes NOT divisible by 4: Q8_0 (34B), Q4_0 (18B), Q5_0 (22B), Q6_K (210B), Q3_K (110B), IQ4_NL (18B), IQ3_XXS (98B), IQ3_S (110B), IQ2_S (82B) — these kernels use byte-level `__ldg` only. Block sizes safe for uint32 `__ldg`: Q4_K (144B), Q5_K (176B), Q5_1 (24B), IQ4_XS (136B).
 
 ### JVM tuning properties
 
@@ -375,6 +377,7 @@ All properties are set via `-Dproperty=value` on the Java command line.
 | `cuda.dp4a` | `true` | Enable `__dp4a` integer dot product for Q4_K/Q5_K/Q6_K matmul. Quantizes input to Q8_1 then uses int8 dp4a. |
 | `cuda.q4k.coalesced` | `false` | Use coalesced Q4_K kernel variant (all threads process same group) |
 | `cuda.q4k.smem` | `false` | Use shared-memory input tiling Q4_K kernel variant |
+| `cuda.q4k.2warp` | `false` | Use 2-warp-per-row Q4_K kernel (splits column groups between two warps with shared-memory partial-sum reduction) |
 | `cuda.q5k.smem` | `true` | Use shared-memory input kernel for Q5_K (+7% throughput) |
 | `cuda.q6k.tiled` | `true` | Use tiled shared-memory kernel for Q6_K (256-element tiles, +9% throughput) |
 | `cuda.deltanet.v2` | `true` | Use float4-vectorized DeltaNet kernel (+4% throughput) |

@@ -27,6 +27,7 @@ public class InferenceEngine {
     private final float finalLogitSoftCap;
     private final float logitScale;
     private final float embeddingScale;
+    private final boolean useLayerNorm; // Command-R: centered LayerNorm instead of RMSNorm
 
     // GPU-resident forward pass (null if not available or not supported)
     private AutoCloseable gpuForwardPass;
@@ -88,6 +89,8 @@ public class InferenceEngine {
         // Pre-cache output norm weights
         int dim = config.embeddingLength();
         this.normWeightCache = RMSNorm.cacheWeights(weights.outputNorm(), dim);
+
+        this.useLayerNorm = config.useLayerNorm();
     }
 
     /**
@@ -212,8 +215,12 @@ public class InferenceEngine {
         int vocabSize = config.vocabSize();
 
         if (!logitsDone) {
-            // 3. Final RMSNorm
-            VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
+            // 3. Final norm (RMSNorm or LayerNorm for Command-R)
+            if (useLayerNorm) {
+                LayerNorm.apply(state.xb, state.x, normWeightCache, dim, config.normEps());
+            } else {
+                VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
+            }
 
             // 4. Output projection: logits = output_weight * xb
             Arrays.fill(state.logits, 0);
@@ -356,7 +363,11 @@ public class InferenceEngine {
             block.forward(state, weights.layers()[layer], layer, position);
         }
 
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
+        if (useLayerNorm) {
+            LayerNorm.apply(state.xb, state.x, normWeightCache, dim, config.normEps());
+        } else {
+            VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
+        }
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
 

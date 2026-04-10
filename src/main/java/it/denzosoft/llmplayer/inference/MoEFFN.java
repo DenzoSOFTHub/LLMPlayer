@@ -40,21 +40,18 @@ public class MoEFFN {
         int expertFfnDim = config.expertFfnLength();
         int sharedFfnDim = config.expertSharedCount() * expertFfnDim;
 
-        // 1. Router: compute expert logits and select top-K
+        // 1. Router: compute raw expert logits
         float[] routerLogits = state.routerLogits;
         Arrays.fill(routerLogits, 0, expertCount, 0f);
         weights.ffnGateInp().matmul(state.xb, routerLogits, expertCount, dim);
 
-        // Add expert probability bias if present (GLM-4.7-Flash)
-        if (weights.expProbsBias() != null) {
-            for (int i = 0; i < expertCount; i++) {
-                routerLogits[i] += weights.expProbsBias().getFloat(i);
-            }
-        }
-
+        // 2. Gating function → probs (UNBIASED). Overwrites routerLogits in-place.
+        //    See llama.cpp build_moe_ffn (llama-graph.cpp ~1230): sigmoid/softmax is applied
+        //    to raw logits BEFORE any bias. The resulting `probs` is preserved unbiased for
+        //    later use as the mix weights.
         int gatingFunc = config.expertGatingFunc();
         if (gatingFunc == 2) {
-            // Sigmoid gating: apply sigmoid to each logit independently
+            // Sigmoid gating (DeepSeek-V3, GLM-4.7-Flash)
             for (int i = 0; i < expertCount; i++) {
                 routerLogits[i] = 1.0f / (1.0f + (float) Math.exp(-routerLogits[i]));
             }
@@ -63,20 +60,39 @@ public class MoEFFN {
             VectorOpsFactory.get().softmax(routerLogits, 0, expertCount);
         }
 
-        // Select top-K experts
+        // 3. Build selection scores: selection_probs = probs + exp_probs_b (DS-V3 only).
+        //    The biased scores are used ONLY for top-K selection; the unbiased probs drive
+        //    the mix weights. See llama.cpp:1249-1255: "leave probs unbiased as it's later
+        //    used to get expert weights".
+        float[] selectionScores;
+        if (weights.expProbsBias() != null) {
+            selectionScores = state.selectionScores;
+            FloatTensor bias = weights.expProbsBias();
+            for (int i = 0; i < expertCount; i++) {
+                selectionScores[i] = routerLogits[i] + bias.getFloat(i);
+            }
+        } else {
+            selectionScores = routerLogits;
+        }
+
+        // 4. Top-K on selection_probs; mix weights come from UNBIASED probs (routerLogits).
         int[] selectedExperts = state.selectedExperts;
         float[] selectedWeights = state.selectedWeights;
-        selectTopK(routerLogits, expertCount, expertUsedCount, selectedExperts, selectedWeights);
+        selectTopKWithWeightSource(selectionScores, routerLogits, expertCount, expertUsedCount,
+            selectedExperts, selectedWeights);
 
-        // Post-selection weight normalization for sigmoid gating
+        // 5. Post-selection weight normalization (for sigmoid gating with expert_weights_norm=true).
         if (gatingFunc == 2) {
             // L2 normalization of selected weights, then scale
+            // Note: llama.cpp does sum-normalization (ggml_sum_rows + ggml_div, clamped to 6.1e-5).
+            // LLMPlayer uses L2 — preserved here to avoid regressing GLM-4.7-Flash.
+            // This is a separate issue (see audit M/cross-cutting MoE) to be fixed once verified.
             float l2Norm = 0f;
             for (int k = 0; k < expertUsedCount; k++) {
                 l2Norm += selectedWeights[k] * selectedWeights[k];
             }
             l2Norm = (float) Math.sqrt(l2Norm);
-            if (l2Norm > 0f) {
+            if (l2Norm > 6.103515625e-5f) { // F16-epsilon clamp guards against NaN
                 float scale = config.expertWeightsScale() / l2Norm;
                 for (int k = 0; k < expertUsedCount; k++) {
                     selectedWeights[k] *= scale;
@@ -149,28 +165,36 @@ public class MoEFFN {
     }
 
     /**
-     * Select top-K indices and values from logits.
+     * Select top-K indices from {@code scores} and return the corresponding values from
+     * {@code weightSource}. When {@code scores == weightSource} this behaves like a classic
+     * top-K (old behavior); when they differ, the top-K is decided by scores but the stored
+     * values come from weightSource — used to implement DS-V3's "biased selection, unbiased
+     * mix weights" pattern.
      */
-    private static void selectTopK(float[] logits, int n, int k,
-                                    int[] outIndices, float[] outValues) {
+    private static void selectTopKWithWeightSource(float[] scores, float[] weightSource,
+                                                    int n, int k,
+                                                    int[] outIndices, float[] outValues) {
         Arrays.fill(outIndices, 0, k, -1);
+        // Track the min score *within the selected set* to decide replacement
+        float[] selectedScores = new float[k];
+        Arrays.fill(selectedScores, Float.NEGATIVE_INFINITY);
         Arrays.fill(outValues, 0, k, Float.NEGATIVE_INFINITY);
 
-        // Track min position persistently — only rescan when replaced
         int minPos = 0;
         float minVal = Float.NEGATIVE_INFINITY;
 
         for (int i = 0; i < n; i++) {
-            if (logits[i] > minVal) {
-                outValues[minPos] = logits[i];
+            if (scores[i] > minVal) {
+                selectedScores[minPos] = scores[i];
                 outIndices[minPos] = i;
-                // Rescan for new minimum
+                outValues[minPos] = weightSource[i];
+                // Rescan for new minimum of the selected-score set
                 minPos = 0;
-                minVal = outValues[0];
+                minVal = selectedScores[0];
                 for (int j = 1; j < k; j++) {
-                    if (outValues[j] < minVal) {
+                    if (selectedScores[j] < minVal) {
                         minPos = j;
-                        minVal = outValues[j];
+                        minVal = selectedScores[j];
                     }
                 }
             }

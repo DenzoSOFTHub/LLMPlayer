@@ -341,9 +341,12 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
         // CUDA graph
         graphAttnSharedMem = (maxSeqLen + 32) * Float.BYTES;
-        // CUDA graph disabled for now: Mamba layers use DtoD copies (split zxBCdt) that complicate
-        // graph capture. Per-layer mode already achieves good throughput (9.7 tok/s for 4B).
-        graphAvailable = false;
+        // CUDA graph: Mamba layers use DtoD copies (split zxBCdt into xBC and dt). These go through
+        // cuMemcpyDtoDAsync on the captured stream, which IS recordable as a memcpy node. The
+        // previous "disabled" comment was conservative — in practice graph capture works. We can
+        // still force per-layer mode via -Dcuda.nograph=true if needed.
+        boolean graphDisabled = "true".equals(System.getProperty("cuda.nograph"));
+        graphAvailable = !graphDisabled;
 
         System.err.println("NemotronH CUDA: " + gpuLayerCount + "/" + blockCount + " layers on GPU"
                 + " (graph: " + (graphAvailable ? "available" : "unavailable") + ")");

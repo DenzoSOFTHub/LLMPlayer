@@ -54,7 +54,7 @@ public class ChatTemplate {
             return formatPhi3(userMessage);
         } else if (architecture == ModelArchitecture.MISTRAL3) {
             return formatMistral3(userMessage);
-        } else if (architecture == ModelArchitecture.COMMAND_R) {
+        } else if ((architecture == ModelArchitecture.COMMAND_R || architecture == ModelArchitecture.COHERE2)) {
             return formatCommandR(userMessage);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2(userMessage);
@@ -87,7 +87,7 @@ public class ChatTemplate {
             return formatPhi3Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.MISTRAL3) {
             return formatMistral3Chat(systemMessage, userMessage);
-        } else if (architecture == ModelArchitecture.COMMAND_R) {
+        } else if ((architecture == ModelArchitecture.COMMAND_R || architecture == ModelArchitecture.COHERE2)) {
             return formatCommandRChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2Chat(systemMessage, userMessage);
@@ -223,7 +223,7 @@ public class ChatTemplate {
             return formatPhi3Conversation(messages);
         } else if (architecture == ModelArchitecture.MISTRAL3) {
             return formatMistral3Conversation(messages);
-        } else if (architecture == ModelArchitecture.COMMAND_R) {
+        } else if ((architecture == ModelArchitecture.COMMAND_R || architecture == ModelArchitecture.COHERE2)) {
             return formatCommandRConversation(messages);
         } else if (architecture == ModelArchitecture.OLMO2) {
             return formatOLMo2Conversation(messages);

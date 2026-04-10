@@ -3,8 +3,11 @@ package it.denzosoft.llmplayer.sampler;
 import java.util.*;
 
 /**
- * Composite sampler pipeline: repetition penalty -> temperature -> top-K -> softmax(K) -> top-P -> sample.
- * Optimized: softmax only on top-K candidates (not full vocab), quickselect for top-K.
+ * Composite sampler pipeline:
+ *   DRY penalty -> repetition penalty -> temperature -> top-K -> softmax(K) -> min-P -> top-P -> (mirostat|multinomial).
+ *
+ * <p>Optimized: softmax only on top-K candidates (not full vocab), quickselect for top-K.
+ * Modern samplers (min-P, DRY, mirostat) are disabled unless explicitly set in SamplerConfig.
  */
 public class CompositeSampler implements Sampler {
 
@@ -13,19 +16,32 @@ public class CompositeSampler implements Sampler {
     private final List<Integer> recentTokens;
     private final int maxRecentTokens;
 
+    // Mirostat v2 running state: current surprise threshold
+    private float mirostatMu;
+
     public CompositeSampler(SamplerConfig config) {
         this.config = config;
         this.random = new Random(config.seed());
         this.recentTokens = new ArrayList<>();
-        this.maxRecentTokens = 64;
+        // Keep enough tokens for DRY lookback when enabled; DRY range can be large.
+        this.maxRecentTokens = Math.max(64, config.dryRange());
+        // Initialize mirostat mu to 2 * tau (standard starting value)
+        this.mirostatMu = 2.0f * config.mirostatTau();
     }
 
     @Override
     public int sample(float[] logits) {
         int vocabSize = logits.length;
 
-        // 1. Repetition penalty (applied in-place to logits copy)
+        // 0. Copy logits so we don't mutate caller's buffer
         float[] probs = Arrays.copyOf(logits, vocabSize);
+
+        // 1. DRY penalty (before repetition penalty, applied to logits)
+        if (config.dryMultiplier() > 0f) {
+            applyDryPenalty(probs, vocabSize);
+        }
+
+        // 2. Repetition penalty (in-place on logits copy)
         if (config.repetitionPenalty() != 1.0f) {
             for (int tokenId : recentTokens) {
                 if (tokenId >= 0 && tokenId < vocabSize) {
@@ -38,33 +54,31 @@ public class CompositeSampler implements Sampler {
             }
         }
 
-        // 2. Greedy (temperature == 0)
+        // 3. Greedy (temperature == 0)
         if (config.temperature() == 0.0f) {
             int bestToken = argmax(probs, vocabSize);
             addRecentToken(bestToken);
             return bestToken;
         }
 
-        // 3. Temperature scaling
+        // 4. Temperature scaling
         float invTemp = 1.0f / config.temperature();
         for (int i = 0; i < vocabSize; i++) {
             probs[i] *= invTemp;
         }
 
-        // 4. Top-K: find K largest logits, then softmax ONLY those K values
+        // 5. Top-K: find K largest logits, then softmax ONLY those K values
         int k = config.topK();
         if (k <= 0 || k >= vocabSize) k = vocabSize;
 
         if (k < vocabSize) {
-            // Find k-th largest value using quickselect (O(n) avg vs O(n log n) sort)
             float threshold = quickselect(probs, vocabSize, k);
-            // Zero out below threshold and collect top-K indices
             for (int i = 0; i < vocabSize; i++) {
                 if (probs[i] < threshold) probs[i] = Float.NEGATIVE_INFINITY;
             }
         }
 
-        // 5. Softmax (only non-neg-inf values contribute, but Math.exp(-inf) = 0 so this is safe)
+        // 6. Softmax
         float max = Float.NEGATIVE_INFINITY;
         for (int i = 0; i < vocabSize; i++) {
             if (probs[i] > max) max = probs[i];
@@ -83,14 +97,155 @@ public class CompositeSampler implements Sampler {
             for (int i = 0; i < vocabSize; i++) probs[i] *= invSum;
         }
 
-        // 6. Top-P (nucleus) filtering
+        // 7. min-P: keep tokens with prob >= minP * max_prob (applied BEFORE top-P)
+        //    See llama.cpp llama_sampler_init_min_p — this is the modern default in many clients.
+        if (config.minP() > 0f) {
+            applyMinP(probs, vocabSize, config.minP());
+        }
+
+        // 8. Top-P (nucleus)
         if (config.topP() < 1.0f) {
             applyTopP(probs, vocabSize, config.topP());
         }
 
-        // 7. Multinomial sampling
-        int sampled = multinomialSample(probs, vocabSize);
+        // 9. Final selection: mirostat v2 (if enabled) or standard multinomial
+        int sampled;
+        if (config.mirostatMode() == 2) {
+            sampled = sampleMirostatV2(probs, vocabSize);
+        } else {
+            sampled = multinomialSample(probs, vocabSize);
+        }
         addRecentToken(sampled);
+        return sampled;
+    }
+
+    /**
+     * min-P filter: keep only tokens whose probability is at least {@code minP * max_prob}.
+     * Zeros out below-threshold tokens and renormalizes.
+     */
+    private static void applyMinP(float[] probs, int size, float minP) {
+        float max = 0f;
+        for (int i = 0; i < size; i++) {
+            if (probs[i] > max) max = probs[i];
+        }
+        if (max <= 0f) return;
+        float threshold = minP * max;
+        float sum = 0f;
+        for (int i = 0; i < size; i++) {
+            if (probs[i] < threshold) probs[i] = 0f;
+            sum += probs[i];
+        }
+        if (sum > 0f) {
+            float invSum = 1.0f / sum;
+            for (int i = 0; i < size; i++) probs[i] *= invSum;
+        }
+    }
+
+    /**
+     * DRY (Don't Repeat Yourself) penalty: for every token t in the vocabulary, compute the
+     * longest suffix of recentTokens that, if extended by t, would match an earlier occurrence
+     * in recentTokens. If the match length exceeds {@code allowedLength}, apply an exponential
+     * penalty {@code multiplier * base^(match_length - allowedLength)} to the logit of t.
+     *
+     * <p>This is a simplified version of the DRY sampler (see llama.cpp sampling.cpp). It uses
+     * O(range * vocab) in the worst case; in practice tiny because only a few candidate tokens
+     * have matches.
+     */
+    private void applyDryPenalty(float[] logits, int vocabSize) {
+        int n = recentTokens.size();
+        if (n < 2) return;
+        int range = Math.min(n, config.dryRange());
+        int start = n - range;
+
+        // The "current suffix" we're trying to extend is the last token(s) of recentTokens.
+        // For each earlier position p where recentTokens[p] == recentTokens[n-1], compute the
+        // length of the suffix match: how far backward (p-1,n-2), (p-2,n-3)... the tokens match.
+        // Then the token that would be "next" after position p is recentTokens[p+1] — that's
+        // our penalty target.
+        int lastToken = recentTokens.get(n - 1);
+        float multiplier = config.dryMultiplier();
+        float base = config.dryBase();
+        int allowedLength = config.dryAllowedLength();
+
+        // Track the longest match ending at each earlier position
+        for (int p = start; p < n - 1; p++) {
+            if (recentTokens.get(p) != lastToken) continue;
+
+            // Count match length by walking backward: (p, n-1) match, so start with 1
+            int matchLen = 1;
+            int pi = p - 1;
+            int ni = n - 2;
+            while (pi >= start && ni > p && recentTokens.get(pi).intValue() == recentTokens.get(ni).intValue()) {
+                matchLen++;
+                pi--;
+                ni--;
+            }
+
+            // The token that would extend this repetition is recentTokens[p+1]
+            int nextToken = recentTokens.get(p + 1);
+            if (nextToken < 0 || nextToken >= vocabSize) continue;
+
+            if (matchLen >= allowedLength) {
+                // Exponential penalty: multiplier * base^(matchLen - allowedLength)
+                float penalty = multiplier * (float) Math.pow(base, matchLen - allowedLength);
+                logits[nextToken] -= penalty;
+            }
+        }
+    }
+
+    /**
+     * Mirostat v2 sampling: maintains a running surprise threshold {@code mu}, truncates the
+     * candidate set to tokens with surprise &lt;= mu, samples, then updates mu based on the
+     * observed surprise. Mathematically independent of vocab size — targets a specific entropy.
+     *
+     * <p>See llama.cpp llama_sampler_init_mirostat_v2. Assumes {@code probs} is already a
+     * normalized distribution (after top-K/top-P/min-P filtering).
+     */
+    private int sampleMirostatV2(float[] probs, int vocabSize) {
+        // Collect non-zero candidates with their indices, sort descending by probability
+        int nonZero = 0;
+        for (int i = 0; i < vocabSize; i++) {
+            if (probs[i] > 0f) nonZero++;
+        }
+        if (nonZero == 0) return multinomialSample(probs, vocabSize);
+
+        int[] indices = new int[nonZero];
+        int idx = 0;
+        for (int i = 0; i < vocabSize; i++) {
+            if (probs[i] > 0f) indices[idx++] = i;
+        }
+        sortIndicesByProb(indices, probs, nonZero);
+
+        // Truncate to tokens with surprise = -log2(p) <= mu
+        // (equivalently: p >= 2^-mu)
+        float pThreshold = (float) Math.pow(2.0, -mirostatMu);
+        int keepCount = 0;
+        for (int i = 0; i < nonZero; i++) {
+            if (probs[indices[i]] >= pThreshold) keepCount++;
+            else break;
+        }
+        if (keepCount == 0) keepCount = 1; // always keep at least the best
+
+        // Renormalize the kept subset
+        float sum = 0f;
+        for (int i = 0; i < keepCount; i++) sum += probs[indices[i]];
+        if (sum <= 0f) return indices[0];
+
+        // Sample one token from the renormalized subset
+        float r = random.nextFloat() * sum;
+        float cum = 0f;
+        int sampled = indices[0];
+        for (int i = 0; i < keepCount; i++) {
+            cum += probs[indices[i]];
+            if (r < cum) { sampled = indices[i]; break; }
+        }
+
+        // Update mu: observed surprise - tau, scaled by eta
+        float observedProb = probs[sampled] / sum;
+        float observedSurprise = -(float) (Math.log(observedProb) / Math.log(2.0));
+        float error = observedSurprise - config.mirostatTau();
+        mirostatMu -= config.mirostatEta() * error;
+
         return sampled;
     }
 
