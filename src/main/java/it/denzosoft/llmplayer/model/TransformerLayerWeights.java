@@ -16,6 +16,7 @@ public final class TransformerLayerWeights {
     private final FloatTensor qBias;
     private final FloatTensor kBias;
     private final FloatTensor vBias;
+    private final FloatTensor woBias; // E13: attn_output.bias (Qwen2/SmolLM3 variants + Command-R)
     private final FloatTensor qNorm;
     private final FloatTensor kNorm;
     private final FloatTensor postAttnNorm;
@@ -28,7 +29,7 @@ public final class TransformerLayerWeights {
                                    FloatTensor qNorm, FloatTensor kNorm,
                                    FloatTensor postAttnNorm, FloatTensor postFfnNorm) {
         this(attnNorm, ffnNorm, wq, wk, wv, wo, null, wGate, wUp, wDown,
-             qBias, kBias, vBias, qNorm, kNorm, postAttnNorm, postFfnNorm);
+             qBias, kBias, vBias, null, qNorm, kNorm, postAttnNorm, postFfnNorm);
     }
 
     public TransformerLayerWeights(FloatTensor attnNorm, FloatTensor ffnNorm,
@@ -36,6 +37,17 @@ public final class TransformerLayerWeights {
                                    FloatTensor wqkv,
                                    FloatTensor wGate, FloatTensor wUp, FloatTensor wDown,
                                    FloatTensor qBias, FloatTensor kBias, FloatTensor vBias,
+                                   FloatTensor qNorm, FloatTensor kNorm,
+                                   FloatTensor postAttnNorm, FloatTensor postFfnNorm) {
+        this(attnNorm, ffnNorm, wq, wk, wv, wo, wqkv, wGate, wUp, wDown,
+             qBias, kBias, vBias, null, qNorm, kNorm, postAttnNorm, postFfnNorm);
+    }
+
+    public TransformerLayerWeights(FloatTensor attnNorm, FloatTensor ffnNorm,
+                                   FloatTensor wq, FloatTensor wk, FloatTensor wv, FloatTensor wo,
+                                   FloatTensor wqkv,
+                                   FloatTensor wGate, FloatTensor wUp, FloatTensor wDown,
+                                   FloatTensor qBias, FloatTensor kBias, FloatTensor vBias, FloatTensor woBias,
                                    FloatTensor qNorm, FloatTensor kNorm,
                                    FloatTensor postAttnNorm, FloatTensor postFfnNorm) {
         this.attnNorm = attnNorm;
@@ -51,6 +63,7 @@ public final class TransformerLayerWeights {
         this.qBias = qBias;
         this.kBias = kBias;
         this.vBias = vBias;
+        this.woBias = woBias;
         this.qNorm = qNorm;
         this.kNorm = kNorm;
         this.postAttnNorm = postAttnNorm;
@@ -70,6 +83,7 @@ public final class TransformerLayerWeights {
     public FloatTensor qBias() { return qBias; }
     public FloatTensor kBias() { return kBias; }
     public FloatTensor vBias() { return vBias; }
+    public FloatTensor woBias() { return woBias; }
     public FloatTensor qNorm() { return qNorm; }
     public FloatTensor kNorm() { return kNorm; }
     public FloatTensor postAttnNorm() { return postAttnNorm; }
