@@ -75,7 +75,11 @@ public class NemotronHState {
         this.v = new float[kvDim];
         this.att = new float[headCount * maxSeqLen];
         this.xb2 = new float[Math.max(qDim, dim)];
-        this.kvCache = new KVCache(blockCount, kvDim, maxSeqLen);
+        // KV cache honors -Dkv.q8=true for the attention-layer KV
+        KVCache.Mode nhKvMode = "true".equals(System.getProperty("kv.q8"))
+            && (kvDim % KVCache.Q8_BLOCK == 0)
+            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        this.kvCache = new KVCache(blockCount, kvDim, maxSeqLen, nhKvMode);
 
         // FFN buffers
         this.hb = new float[config.intermediateSize()];

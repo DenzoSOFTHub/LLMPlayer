@@ -497,41 +497,36 @@ public class Qwen35InferenceEngine {
         rope.applyAllHeads(state.q, headCount, position);
         rope.applyAllHeads(state.k, headCountKV, position);
 
-        // Store K, V in cache
-        float[] keyCache = state.kvCache.keyLayer(layer);
-        float[] valueCache = state.kvCache.valueLayer(layer);
-        System.arraycopy(state.k, 0, keyCache, state.kvCache.offset(position), kvDim);
-        System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
+        // Store K, V in cache (transparently quantizes in Q8 mode)
+        state.kvCache.storeK(layer, position, state.k, kvDim);
+        state.kvCache.storeV(layer, position, state.v, kvDim);
 
         // Multi-head attention
-        float invSqrt = 1.0f / (float) Math.sqrt(headSize);
+        final float invSqrt = 1.0f / (float) Math.sqrt(headSize);
+        final KVCache kv = state.kvCache;
+        final int layerFinal = layer;
+        final int positionFinal = position;
+        final int headSizeFinal = headSize;
         IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
-            int qOff = h * headSize;
-            int kvOff = kvHead * headSize;
+            int qOff = h * headSizeFinal;
+            int kvHeadOff = kvHead * headSizeFinal;
 
             // Attention scores
-            for (int t = 0; t <= position; t++) {
-                float score = 0;
-                int keyOff = state.kvCache.offset(t) + kvOff;
-                for (int i = 0; i < headSize; i++) {
-                    score += state.q[qOff + i] * keyCache[keyOff + i];
-                }
+            for (int t = 0; t <= positionFinal; t++) {
+                float score = kv.dotK(layerFinal, t, kvHeadOff, headSizeFinal, state.q, qOff);
                 state.att[h * maxSeqLen + t] = score * invSqrt;
             }
 
             // Softmax
-            softmax(state.att, h * maxSeqLen, position + 1);
+            softmax(state.att, h * maxSeqLen, positionFinal + 1);
 
             // Weighted sum of values
-            int outOff = h * headSize;
-            Arrays.fill(state.xb2, outOff, outOff + headSize, 0);
-            for (int t = 0; t <= position; t++) {
+            int outOff = h * headSizeFinal;
+            Arrays.fill(state.xb2, outOff, outOff + headSizeFinal, 0);
+            for (int t = 0; t <= positionFinal; t++) {
                 float a = state.att[h * maxSeqLen + t];
-                int valOff = state.kvCache.offset(t) + kvOff;
-                for (int i = 0; i < headSize; i++) {
-                    state.xb2[outOff + i] += a * valueCache[valOff + i];
-                }
+                kv.saxpyV(layerFinal, t, kvHeadOff, headSizeFinal, a, state.xb2, outOff);
             }
         });
 
