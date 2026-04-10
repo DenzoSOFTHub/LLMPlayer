@@ -46,6 +46,10 @@ public class NemotronHInferenceEngine {
 
     // Output norm cache
     private final float[] outputNormCache;
+    // E11: pre-cache all per-layer norm weights so forwardMamba2/Attention/FFN don't
+    // re-dequantize a fresh float[dim] every token (was ~70 KB GC churn per token on 4B).
+    private final float[][] attnNormPerLayer;   // [blockCount][dim]
+    private final float[][] ffnNormPerLayer;    // [blockCount][dim] (FFN layers only)
 
     // GPU forward pass (reflection-loaded)
     private AutoCloseable gpuForwardPass;
@@ -86,6 +90,19 @@ public class NemotronHInferenceEngine {
 
         this.outputNormCache = new float[dim];
         for (int i = 0; i < dim; i++) outputNormCache[i] = weights.outputNorm().getFloat(i);
+
+        // E11: pre-cache all per-layer norm weights (avoid per-token float[dim] allocation)
+        this.attnNormPerLayer = new float[blockCount][];
+        this.ffnNormPerLayer = new float[blockCount][];
+        for (int i = 0; i < blockCount; i++) {
+            NemotronHLayerWeights lw = weights.layers()[i];
+            if (lw.attnNorm() != null) {
+                attnNormPerLayer[i] = cacheWeights(lw.attnNorm(), dim);
+            }
+            if (lw.ffnNorm() != null) {
+                ffnNormPerLayer[i] = cacheWeights(lw.ffnNorm(), dim);
+            }
+        }
 
         this.rope = new RoPE(headSize, config.ropeDimensionCount(), maxSeqLen,
             config.ropeFreqBase(), config.ropeType(), ropeFreqFactors);
@@ -218,9 +235,8 @@ public class NemotronHInferenceEngine {
     // ==================== Mamba-2 ====================
 
     private void forwardMamba2(NemotronHState state, NemotronHLayerWeights lw, int layer) {
-        // RMSNorm
-        float[] normW = cacheWeights(lw.attnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normW, dim, normEps);
+        // RMSNorm (E11: pre-cached, no per-token allocation)
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormPerLayer[layer], dim, normEps);
 
         // Input projection: xb -> zxBCdt [ssmInnerSize + convChannels + ssmTimeStepRank]
         int projDim = ssmInnerSize + convChannels + ssmTimeStepRank;
@@ -279,7 +295,7 @@ public class NemotronHInferenceEngine {
 
         // Integrated FFN (Granite Hybrid: Mamba layers also have SwiGLU FFN)
         if (lw.ffnUp() != null) {
-            runIntegratedFFN(state, lw);
+            runIntegratedFFN(state, lw, layer);
         }
     }
 
@@ -348,8 +364,7 @@ public class NemotronHInferenceEngine {
     // ==================== Attention ====================
 
     private void forwardAttention(NemotronHState state, NemotronHLayerWeights lw, int layer, int position) {
-        float[] normW = cacheWeights(lw.attnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normW, dim, normEps);
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormPerLayer[layer], dim, normEps);
 
         int qDim = headCount * headSize;
 
@@ -406,15 +421,14 @@ public class NemotronHInferenceEngine {
 
         // Integrated FFN (Granite Hybrid: attention layers also have SwiGLU FFN)
         if (lw.ffnUp() != null) {
-            runIntegratedFFN(state, lw);
+            runIntegratedFFN(state, lw, layer);
         }
     }
 
     // ==================== FFN (squared ReLU) ====================
 
     private void forwardFFN(NemotronHState state, NemotronHLayerWeights lw, int layer) {
-        float[] normW = cacheWeights(lw.attnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, normW, dim, normEps);
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormPerLayer[layer], dim, normEps);
 
         int ffnDim = config.nemotronLayerFfnLength(layer);
 
@@ -455,9 +469,10 @@ public class NemotronHInferenceEngine {
      * Run SwiGLU FFN after Mamba or Attention layer.
      * Uses ffnNorm (separate from attnNorm) and SwiGLU activation.
      */
-    private void runIntegratedFFN(NemotronHState state, NemotronHLayerWeights lw) {
-        it.denzosoft.llmplayer.tensor.FloatTensor normTensor = lw.ffnNorm() != null ? lw.ffnNorm() : lw.attnNorm();
-        float[] normW = cacheWeights(normTensor, dim);
+    private void runIntegratedFFN(NemotronHState state, NemotronHLayerWeights lw, int layer) {
+        // Integrated FFN uses ffn_norm if present (Granite Hybrid), else attn_norm fallback.
+        // Pre-cached in ffnNormPerLayer[layer] (falls back to attnNormPerLayer if ffn_norm absent).
+        float[] normW = ffnNormPerLayer[layer] != null ? ffnNormPerLayer[layer] : attnNormPerLayer[layer];
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, normW, dim, normEps);
 
         int ffnDim = config.intermediateSize();

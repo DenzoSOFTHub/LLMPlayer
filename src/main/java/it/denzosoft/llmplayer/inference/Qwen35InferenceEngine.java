@@ -50,6 +50,13 @@ public class Qwen35InferenceEngine {
 
     // Pre-cached norm weights
     private final float[] outputNormCache;
+    // E11: pre-cache all per-layer norm weights at construction time so the forward pass
+    // doesn't re-dequantize + allocate a new float[dim] every token. Before the fix, each
+    // forward pass called cacheWeightsInline() several times per layer, generating ~800 KB
+    // of garbage per token on the 4B model.
+    private final float[][] attnNormPerLayer;    // [blockCount][dim]
+    private final float[][] postAttnNormPerLayer; // [blockCount][dim] (full-attention layers)
+    private final float[][] ssmNormPerLayer;     // [blockCount][stateSize] (DeltaNet layers)
 
     // RoPE for full attention layers
     private final RoPE rope;
@@ -117,6 +124,23 @@ public class Qwen35InferenceEngine {
             if (!lw.isDeltaNet() && lw.qNorm() != null) {
                 qNormCache[layer] = cacheWeights(lw.qNorm(), headSize);
                 kNormCache[layer] = cacheWeights(lw.kNorm(), headSize);
+            }
+        }
+
+        // E11: pre-cache per-layer norm weights (attn_norm always, post_attn + ssm_norm per type)
+        this.attnNormPerLayer = new float[blockCount][];
+        this.postAttnNormPerLayer = new float[blockCount][];
+        this.ssmNormPerLayer = new float[blockCount][];
+        for (int layer = 0; layer < blockCount; layer++) {
+            Qwen35LayerWeights lw = weights.layers()[layer];
+            if (lw.attnNorm() != null) {
+                attnNormPerLayer[layer] = cacheWeights(lw.attnNorm(), dim);
+            }
+            if (lw.postAttnNorm() != null) {
+                postAttnNormPerLayer[layer] = cacheWeights(lw.postAttnNorm(), dim);
+            }
+            if (lw.isDeltaNet() && lw.ssmNorm() != null) {
+                ssmNormPerLayer[layer] = cacheWeights(lw.ssmNorm(), stateSize);
             }
         }
     }
@@ -276,9 +300,8 @@ public class Qwen35InferenceEngine {
     // ==================== DeltaNet Forward Pass ====================
 
     private void forwardDeltaNet(Qwen35State state, Qwen35LayerWeights lw, int layer) {
-        // Pre-attention RMSNorm
-        float[] attnNormW = cacheWeightsInline(lw.attnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormW, dim, normEps);
+        // Pre-attention RMSNorm (uses pre-cached weights, no per-token allocation)
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormPerLayer[layer], dim, normEps);
 
         // Project to QKV: xb -> qkv
         Arrays.fill(state.qkv, 0);
@@ -321,9 +344,8 @@ public class Qwen35InferenceEngine {
         // Split QKV and run DeltaNet recurrence per head
         deltaNetRecurrence(state, layer);
 
-        // Apply ssm_norm (per-head RMSNorm on the d_v output)
-        float[] ssmNormW = cacheWeightsInline(lw.ssmNorm(), stateSize);
-        applyPerHeadNorm(state.deltaOut, ssmNormW, timeStepRank, dV, normEps);
+        // Apply ssm_norm (per-head RMSNorm on the d_v output) — pre-cached
+        applyPerHeadNorm(state.deltaOut, ssmNormPerLayer[layer], timeStepRank, dV, normEps);
 
         // Gate the output: deltaOut *= gate
         for (int i = 0; i < innerSize; i++) {
@@ -340,7 +362,7 @@ public class Qwen35InferenceEngine {
         }
 
         // Post-attention norm + FFN + residual
-        forwardFFN(state, lw);
+        forwardFFN(state, lw, layer);
     }
 
     private void applyConv1d(Qwen35State state, Qwen35LayerWeights lw, int layer) {
@@ -461,9 +483,8 @@ public class Qwen35InferenceEngine {
     // ==================== Full Attention Forward Pass ====================
 
     private void forwardAttention(Qwen35State state, Qwen35LayerWeights lw, int layer, int position) {
-        // Pre-attention RMSNorm
-        float[] attnNormW = cacheWeightsInline(lw.attnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormW, dim, normEps);
+        // Pre-attention RMSNorm (pre-cached)
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, attnNormPerLayer[layer], dim, normEps);
 
         int qDim = headCount * headSize;
         int qGateDim = qDim * 2; // Q projection packs Q + gate
@@ -545,15 +566,14 @@ public class Qwen35InferenceEngine {
         }
 
         // Post-attention norm + FFN + residual
-        forwardFFN(state, lw);
+        forwardFFN(state, lw, layer);
     }
 
     // ==================== SwiGLU FFN ====================
 
-    private void forwardFFN(Qwen35State state, Qwen35LayerWeights lw) {
-        // Post-attention / FFN norm
-        float[] ffnNormW = cacheWeightsInline(lw.postAttnNorm(), dim);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, ffnNormW, dim, normEps);
+    private void forwardFFN(Qwen35State state, Qwen35LayerWeights lw, int layer) {
+        // Post-attention / FFN norm (pre-cached)
+        VectorOpsFactory.get().rmsnorm(state.xb, state.x, postAttnNormPerLayer[layer], dim, normEps);
 
         // SwiGLU FFN: h = SiLU(gate @ xb) * (up @ xb), output = down @ h
         Arrays.fill(state.hb, 0);

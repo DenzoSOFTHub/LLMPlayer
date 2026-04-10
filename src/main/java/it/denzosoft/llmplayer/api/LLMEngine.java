@@ -601,6 +601,22 @@ public class LLMEngine implements AutoCloseable {
 
     private static Gemma4InferenceEngine createGemma4Engine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         ModelConfig config = loadedModel.config();
+        // KNOWN INCOMPLETE SUPPORT: Gemma 3n (aka "Gemma 4") requires the AltUp (4 parallel
+        // activation streams with learned router/predict/correct coefficients) and Laurel
+        // (low-rank residual) machinery — see llama.cpp gemma3n-iswa.cpp. LLMPlayer currently
+        // implements only the PLE (per-layer embeddings) sub-path; altup/laurel are absent.
+        // Empirically verified on gemma-3n-E4B-it-Q4_K_M: output is random multi-language
+        // tokens ("gill თ NN Sna Sho Sangio…"). Warn the user so they don't mistake the
+        // output for a working model. See Top-10 audit H10 for full implementation plan.
+        System.err.println();
+        System.err.println("  ====================================================================");
+        System.err.println("  WARNING: Gemma 3n / Gemma 4 (PLE) support is INCOMPLETE.");
+        System.err.println("  Missing: AltUp (4-stream activations) and Laurel (low-rank residual).");
+        System.err.println("  Expected output: garbage tokens (random words, multiple languages).");
+        System.err.println("  This is an architectural gap, not a quantization issue.");
+        System.err.println("  Track: Top-10 audit H10 in commit history.");
+        System.err.println("  ====================================================================");
+        System.err.println();
         it.denzosoft.llmplayer.model.ModelWeights weights = loadedModel.weights();
         it.denzosoft.llmplayer.gguf.GGUFFile gguf = loadedModel.ggufFile();
         int blockCount = config.blockCount();
