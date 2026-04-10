@@ -213,6 +213,9 @@ public class ModelLoader {
             output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
         }
 
+        // E12: output.bias — optional bias for the lm_head matmul (some Qwen2 variants ship it)
+        FloatTensor outputBias = tryLoadTensor(gguf, ArchitectureRegistry.OUTPUT_BIAS);
+
         // For partial GPU offloading: if gpuLayers >= 0, only load first N layers on GPU
         boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
         Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
@@ -268,7 +271,7 @@ public class ModelLoader {
         // Load rope_freqs.weight if present (for extended context RoPE)
         float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
 
-        return new ModelWeights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
+        return new ModelWeights(tokenEmbedding, outputNorm, output, outputBias, layers, ropeFreqFactors);
     }
 
     private static DeepSeek2Weights loadDeepSeek2Weights(GGUFFile gguf, ModelConfig config,

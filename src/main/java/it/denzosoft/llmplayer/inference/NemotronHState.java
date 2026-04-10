@@ -17,6 +17,7 @@ public class NemotronHState {
     public final float[] xBC;     // [ssmInnerSize + 2*ssmGroupCount*ssmStateSize] after conv+SiLU
     public final float[] ssm_x;   // [ssmInnerSize] x portion of xBC
     public final float[] ssm_y;   // [ssmInnerSize] SSM output
+    public final float[] convResult; // [convChannels] — pre-allocated conv1d output buffer (E21)
 
     // Mamba-2 persistent state per Mamba layer
     // ssmState[layer][head][stateSize] — recurrent state
@@ -66,6 +67,7 @@ public class NemotronHState {
         this.xBC = new float[convChannels];
         this.ssm_x = new float[ssmInnerSize];
         this.ssm_y = new float[ssmInnerSize];
+        this.convResult = new float[convChannels]; // E21: pre-allocated, no per-token alloc
 
         // Attention buffers
         int qDim = headCount * headSize;

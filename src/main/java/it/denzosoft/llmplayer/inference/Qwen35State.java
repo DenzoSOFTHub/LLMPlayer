@@ -28,6 +28,7 @@ public class Qwen35State {
 
     // DeltaNet buffers
     public final float[] qkv;      // QKV projection output [qkvDim]
+    public final float[] convResult; // E21: pre-allocated conv1d output buffer [qkvDim]
     public final float[] gate;     // gate output [innerSize]
     public final float[] alpha;    // alpha gate [timeStepRank]
     public final float[] beta;     // beta gate [timeStepRank]
@@ -88,6 +89,7 @@ public class Qwen35State {
 
         // DeltaNet buffers
         this.qkv = new float[qkvDim];
+        this.convResult = new float[qkvDim]; // E21: pre-allocated conv1d output
         this.gate = new float[innerSize];
         this.alpha = new float[timeStepRank];
         this.beta = new float[timeStepRank];

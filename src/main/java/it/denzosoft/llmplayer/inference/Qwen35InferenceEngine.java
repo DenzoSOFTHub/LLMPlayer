@@ -376,7 +376,8 @@ public class Qwen35InferenceEngine {
         // So element for (channel, kernel_pos) is at offset: channel * convKernel + kernel_pos
         // PyTorch Conv1d convention: weight[0] = oldest input, weight[K-1] = current input
         // For causal conv: output[t] = sum_k(weight[K-1-k] * input[t-k]) for k=0..K-1
-        float[] result = new float[qkvDim];
+        // E21: use pre-allocated state.convResult (was: new float[qkvDim] every token)
+        float[] result = state.convResult;
         for (int ch = 0; ch < qkvDim; ch++) {
             float sum = 0;
             // Current value (k=0): weight[convKernel-1] * input[t]
