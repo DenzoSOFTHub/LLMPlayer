@@ -12,6 +12,7 @@ public final class ArchitectureRegistry {
     public static final String TOKEN_EMBD = "token_embd.weight";
     public static final String OUTPUT_NORM = "output_norm.weight";
     public static final String OUTPUT = "output.weight";
+    public static final String OUTPUT_BIAS = "output.bias"; // E12: optional, some Qwen2 variants
 
     // Per-layer tensor name patterns (N = layer index)
     public static String attnNorm(int layer) { return "blk." + layer + ".attn_norm.weight"; }

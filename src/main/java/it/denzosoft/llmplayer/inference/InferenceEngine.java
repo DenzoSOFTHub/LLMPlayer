@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.ModelWeights;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.util.Arrays;
@@ -225,6 +226,11 @@ public class InferenceEngine {
             // 4. Output projection: logits = output_weight * xb
             Arrays.fill(state.logits, 0);
             weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+            // E12: optional output.bias for Qwen2 variants — see llama.cpp qwen2.cpp:119-121
+            if (weights.outputBias() != null) {
+                FloatTensor ob = weights.outputBias();
+                for (int i = 0; i < vocabSize; i++) state.logits[i] += ob.getFloat(i);
+            }
         }
 
         // 5. Logit scaling (skip if GPU already applied it via CudaForwardPass)
@@ -370,6 +376,11 @@ public class InferenceEngine {
         }
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+        // E12: optional output.bias
+        if (weights.outputBias() != null) {
+            FloatTensor ob = weights.outputBias();
+            for (int i = 0; i < vocabSize; i++) state.logits[i] += ob.getFloat(i);
+        }
 
         return state.logits;
     }

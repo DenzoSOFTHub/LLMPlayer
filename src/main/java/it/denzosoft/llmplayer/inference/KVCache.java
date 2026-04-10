@@ -197,6 +197,13 @@ public class KVCache {
         }
     }
 
+    // Inline scalar Q8 dequant. Tried delegating to VectorOps.dotQ8Block (SIMD with FMA) but
+    // the per-call dispatch through VectorOpsFactory.get() costs more than the SIMD savings:
+    // for a 40K-call-per-token attention pass, the virtual dispatch dominates over the FMA
+    // win. The HotSpot JIT inlines and partly auto-vectorizes this static method better.
+    // Future work: a localized SIMD class wired in directly without VectorOpsFactory dispatch
+    // could deliver real speedup, especially with ByteVector-based byte→float conversion.
+
     private static float dotQ8Block(float[] q, int qOff, byte[] kQuants, int kOff,
                                      float[] kScales, int kScalesOff, int n) {
         int blocks = n / Q8_BLOCK;
@@ -207,7 +214,7 @@ public class KVCache {
             int kBase = kOff + b * Q8_BLOCK;
             float acc = 0f;
             for (int i = 0; i < Q8_BLOCK; i++) {
-                acc += q[qBase + i] * kQuants[kBase + i]; // byte → int → float promotion
+                acc += q[qBase + i] * kQuants[kBase + i];
             }
             total += acc * scale;
         }

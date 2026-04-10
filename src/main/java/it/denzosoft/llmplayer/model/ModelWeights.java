@@ -6,14 +6,22 @@ public final class ModelWeights {
     private final FloatTensor tokenEmbedding;
     private final FloatTensor outputNorm;
     private final FloatTensor output;
+    private final FloatTensor outputBias; // E12: optional output.bias for the lm_head matmul
     private final TransformerLayerWeights[] layers;
     private final float[] ropeFreqFactors;
 
     public ModelWeights(FloatTensor tokenEmbedding, FloatTensor outputNorm, FloatTensor output,
                         TransformerLayerWeights[] layers, float[] ropeFreqFactors) {
+        this(tokenEmbedding, outputNorm, output, null, layers, ropeFreqFactors);
+    }
+
+    public ModelWeights(FloatTensor tokenEmbedding, FloatTensor outputNorm, FloatTensor output,
+                        FloatTensor outputBias,
+                        TransformerLayerWeights[] layers, float[] ropeFreqFactors) {
         this.tokenEmbedding = tokenEmbedding;
         this.outputNorm = outputNorm;
         this.output = output;
+        this.outputBias = outputBias;
         this.layers = layers;
         this.ropeFreqFactors = ropeFreqFactors;
     }
@@ -21,6 +29,7 @@ public final class ModelWeights {
     public FloatTensor tokenEmbedding() { return tokenEmbedding; }
     public FloatTensor outputNorm() { return outputNorm; }
     public FloatTensor output() { return output; }
+    public FloatTensor outputBias() { return outputBias; }
     public TransformerLayerWeights[] layers() { return layers; }
     public float[] ropeFreqFactors() { return ropeFreqFactors; }
 }

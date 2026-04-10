@@ -304,7 +304,8 @@ public class NemotronHInferenceEngine {
         int histSize = ssmConvKernel - 1;
         int pos = state.convStatePos[layer];
 
-        float[] result = new float[convChannels];
+        // E21: use pre-allocated state.convResult instead of allocating per-token
+        float[] result = state.convResult;
         for (int ch = 0; ch < convChannels; ch++) {
             float sum = lw.ssmConv1d().getFloat((long) ch * ssmConvKernel + (ssmConvKernel - 1)) * state.xBC[ch];
             for (int k = 1; k < ssmConvKernel; k++) {
