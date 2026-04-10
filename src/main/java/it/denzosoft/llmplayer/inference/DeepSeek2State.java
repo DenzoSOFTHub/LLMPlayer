@@ -30,9 +30,9 @@ public class DeepSeek2State {
     public final float[] qCompressed;    // [qLoraRank] - output of wqA
     public final float[] qCompressedNorm;// [qLoraRank] - after RMSNorm
 
-    // KV cache: separate key and value dimensions
-    public final float[][] keyCache;     // [layers][maxSeqLen * headCount * keyLength]
-    public final float[][] valueCache;   // [layers][maxSeqLen * headCount * valueLength]
+    // KV cache: uses asymmetric KVCache (keyLength != valueLength for MLA).
+    // Supports -Dkv.q8=true for Q8_0 storage (3.56× memory reduction).
+    public final KVCache kvCache;
 
     // Dense FFN buffers (for leading dense blocks)
     public final float[] hb;    // [ffnDim]
@@ -92,9 +92,21 @@ public class DeepSeek2State {
         this.qCompressed = new float[Math.max(qLoraRank, 1)];
         this.qCompressedNorm = new float[Math.max(qLoraRank, 1)];
 
-        // KV caches
-        this.keyCache = new float[blockCount][maxSeqLen * totalKeyDim];
-        this.valueCache = new float[blockCount][maxSeqLen * totalValDim];
+        // KV cache: asymmetric MLA cache with separate K/V dimensions (keyLength vs valueLength).
+        // Honors -Dkv.q8=true for Q8_0 quantization. MLA has huge KV (~5 GB at ctx=2k for
+        // DS-V2-Lite) so Q8 gives massive savings.
+        KVCache.Mode ds2KvMode = "true".equals(System.getProperty("kv.q8"))
+            && (totalKeyDim % KVCache.Q8_BLOCK == 0) && (totalValDim % KVCache.Q8_BLOCK == 0)
+            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        this.kvCache = new KVCache(blockCount, totalKeyDim, totalValDim, maxSeqLen, ds2KvMode);
+        if (ds2KvMode == KVCache.Mode.Q8_0) {
+            long q8Bytes = kvCache.memoryBytes();
+            long f32Bytes = 2L * blockCount * maxSeqLen * (totalKeyDim + totalValDim) * 2L; // approx
+            System.out.println("  DeepSeek2 MLA KV cache: Q8_0 mode (~"
+                + (q8Bytes / (1024 * 1024)) + " MB, vs ~"
+                + ((long) blockCount * maxSeqLen * (totalKeyDim + totalValDim) * 4 / (1024 * 1024))
+                + " MB in FLOAT32)");
+        }
 
         // Dense FFN
         this.hb = new float[ffnDim];

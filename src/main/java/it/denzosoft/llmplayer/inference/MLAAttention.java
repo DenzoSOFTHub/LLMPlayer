@@ -151,43 +151,42 @@ public class MLAAttention {
             rope.apply(state.q, qRopeOffset, position);
         }
 
-        // 7. Store K and V in cache
-        float[] keyCache = state.keyCache[layer];
-        float[] valueCache = state.valueCache[layer];
-        System.arraycopy(state.k, 0, keyCache, position * totalKeyDim, totalKeyDim);
-        System.arraycopy(state.v, 0, valueCache, position * totalValDim, totalValDim);
+        // 7. Store K and V in cache (transparently quantized if -Dkv.q8=true)
+        state.kvCache.storeK(layer, position, state.k, totalKeyDim);
+        state.kvCache.storeV(layer, position, state.v, totalValDim);
 
         // 8. Attention computation - parallel over heads
         float mscale = rope.getMscale();
-        float scaleFactor = mscale * mscale / (float) Math.sqrt(keyLength);
+        final float scaleFactor = mscale * mscale / (float) Math.sqrt(keyLength);
 
         Arrays.fill(state.xb2, 0, totalValDim, 0f);
 
+        final KVCache kv = state.kvCache;
+        final int layerFinal = layer;
+        final int positionFinal = position;
+        final int keyLengthFinal = keyLength;
+        final int valueLengthFinal = valueLength;
+
         IntStream.range(0, headCount).parallel().forEach(h -> {
-            int attOffset = h * (position + 1);
+            int attOffset = h * (positionFinal + 1);
+            int qOffset = h * keyLengthFinal;
+            int kHeadOff = h * keyLengthFinal;  // per-head K slice
+            int vHeadOff = h * valueLengthFinal; // per-head V slice
+            int outOffset = h * valueLengthFinal;
 
             // Compute attention scores
-            for (int t = 0; t <= position; t++) {
-                float score = 0f;
-                int qOffset = h * keyLength;
-                int kOffset = t * totalKeyDim + h * keyLength;
-                for (int i = 0; i < keyLength; i++) {
-                    score += state.q[qOffset + i] * keyCache[kOffset + i];
-                }
+            for (int t = 0; t <= positionFinal; t++) {
+                float score = kv.dotK(layerFinal, t, kHeadOff, keyLengthFinal, state.q, qOffset);
                 state.att[attOffset + t] = score * scaleFactor;
             }
 
             // Softmax
-            VectorOpsFactory.get().softmax(state.att, attOffset, position + 1);
+            VectorOpsFactory.get().softmax(state.att, attOffset, positionFinal + 1);
 
             // Weighted sum of values
-            int outOffset = h * valueLength;
-            for (int t = 0; t <= position; t++) {
+            for (int t = 0; t <= positionFinal; t++) {
                 float a = state.att[attOffset + t];
-                int vOffset = t * totalValDim + h * valueLength;
-                for (int i = 0; i < valueLength; i++) {
-                    state.xb2[outOffset + i] += a * valueCache[vOffset + i];
-                }
+                kv.saxpyV(layerFinal, t, vHeadOff, valueLengthFinal, a, state.xb2, outOffset);
             }
         });
 
