@@ -40,9 +40,10 @@ public class DeepSeek2State {
 
     // MoE buffers
     public final float[] xbSaved;        // [dim] - copy of xb for MoE (since xb is reused as output)
-    public final float[] routerLogits;   // [expertCount]
+    public final float[] routerLogits;   // [expertCount] — after gating, holds unbiased probs
+    public final float[] selectionScores;// [expertCount] — probs + exp_probs_b, used only for top-K selection (DS-V3/GLM-4.7-Flash)
     public final int[] selectedExperts;  // [expertUsedCount]
-    public final float[] selectedWeights;// [expertUsedCount]
+    public final float[] selectedWeights;// [expertUsedCount] — from unbiased probs (not selectionScores)
     public final float[] moeHb;          // [expertFfnLength] - per-expert gate/silu buffer
     public final float[] moeHb2;         // [expertFfnLength] - per-expert up buffer
     public final float[] expertOut;      // [dim] - single expert output
@@ -102,6 +103,7 @@ public class DeepSeek2State {
         // MoE
         this.xbSaved = new float[dim];
         this.routerLogits = new float[Math.max(expertCount, 1)];
+        this.selectionScores = new float[Math.max(expertCount, 1)];
         this.selectedExperts = new int[Math.max(expertUsedCount, 1)];
         this.selectedWeights = new float[Math.max(expertUsedCount, 1)];
         this.moeHb = new float[Math.max(expertFfnDim, 1)];

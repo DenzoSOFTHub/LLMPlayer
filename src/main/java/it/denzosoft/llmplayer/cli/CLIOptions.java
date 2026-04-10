@@ -13,6 +13,14 @@ public class CLIOptions {
     private float topP = 0.9f;
     private float repetitionPenalty = 1.1f;
     private long seed = System.nanoTime();
+    private float minP = 0f;                // min-P (disabled by default)
+    private int mirostatMode = 0;           // 0=off, 2=mirostat v2
+    private float mirostatTau = 5.0f;
+    private float mirostatEta = 0.1f;
+    private float dryMultiplier = 0f;       // DRY (disabled by default)
+    private float dryBase = 1.75f;
+    private int dryAllowedLength = 2;
+    private int dryRange = 1024;
     private int threads = Runtime.getRuntime().availableProcessors();
     private boolean showInfo;
     private boolean help;
@@ -76,6 +84,22 @@ public class CLIOptions {
                 opts.topP = Float.parseFloat(args[++i]);
             } else if ("--repetition-penalty".equals(arg)) {
                 opts.repetitionPenalty = Float.parseFloat(args[++i]);
+            } else if ("--min-p".equals(arg)) {
+                opts.minP = Float.parseFloat(args[++i]);
+            } else if ("--mirostat".equals(arg)) {
+                opts.mirostatMode = Integer.parseInt(args[++i]);
+            } else if ("--mirostat-tau".equals(arg)) {
+                opts.mirostatTau = Float.parseFloat(args[++i]);
+            } else if ("--mirostat-eta".equals(arg)) {
+                opts.mirostatEta = Float.parseFloat(args[++i]);
+            } else if ("--dry-multiplier".equals(arg)) {
+                opts.dryMultiplier = Float.parseFloat(args[++i]);
+            } else if ("--dry-base".equals(arg)) {
+                opts.dryBase = Float.parseFloat(args[++i]);
+            } else if ("--dry-allowed-length".equals(arg)) {
+                opts.dryAllowedLength = Integer.parseInt(args[++i]);
+            } else if ("--dry-range".equals(arg)) {
+                opts.dryRange = Integer.parseInt(args[++i]);
             } else if ("--seed".equals(arg)) {
                 opts.seed = Long.parseLong(args[++i]);
             } else if ("--threads".equals(arg)) {
@@ -169,7 +193,9 @@ public class CLIOptions {
     }
 
     public SamplerConfig toSamplerConfig() {
-        return new SamplerConfig(temperature, topK, topP, repetitionPenalty, seed);
+        return new SamplerConfig(temperature, topK, topP, repetitionPenalty, seed,
+            minP, mirostatMode, mirostatTau, mirostatEta,
+            dryMultiplier, dryBase, dryAllowedLength, dryRange);
     }
 
     // Getters
@@ -233,6 +259,14 @@ public class CLIOptions {
         System.out.println("  --top-k <num>            Top-K sampling (default: 40)");
         System.out.println("  --top-p <num>            Top-P nucleus sampling (default: 0.9)");
         System.out.println("  --repetition-penalty <n> Repetition penalty (default: 1.1)");
+        System.out.println("  --min-p <num>            min-P sampling (e.g. 0.05, default: 0 = off)");
+        System.out.println("  --mirostat <0|2>         Mirostat sampler: 0=off, 2=mirostat v2 (default: 0)");
+        System.out.println("  --mirostat-tau <num>     Mirostat target entropy (default: 5.0)");
+        System.out.println("  --mirostat-eta <num>     Mirostat learning rate (default: 0.1)");
+        System.out.println("  --dry-multiplier <num>   DRY sampler multiplier (default: 0 = off; try 0.8)");
+        System.out.println("  --dry-base <num>         DRY exponential base (default: 1.75)");
+        System.out.println("  --dry-allowed-length <n> DRY min match length (default: 2)");
+        System.out.println("  --dry-range <num>        DRY lookback window (default: 1024)");
         System.out.println("  --seed <num>             Random seed");
         System.out.println("  --threads <num>          Number of threads");
         System.out.println("  --context-length, -c <n> Max context length (default: 2048)");

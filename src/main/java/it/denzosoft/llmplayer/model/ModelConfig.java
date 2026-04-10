@@ -199,6 +199,25 @@ public final class ModelConfig {
     public float attentionScale() { return attentionScale; }
     public float residualScale() { return residualScale; }
 
+    /**
+     * Returns true if this architecture uses standard Layer Normalization (mean-centered + variance)
+     * instead of RMS Normalization. True for Command-R / Cohere2 — see llama.cpp
+     * {@code command-r.cpp} and {@code cohere2-iswa.cpp} which use {@code LLM_NORM}.
+     */
+    public boolean useLayerNorm() {
+        return architecture == ModelArchitecture.COMMAND_R
+            || architecture == ModelArchitecture.COHERE2;
+    }
+
+    /**
+     * Returns true if this architecture skips RoPE on global (full-attention) layers and only
+     * applies it on sliding-window layers (NoPE-on-global pattern). Currently only Cohere2 — see
+     * llama.cpp {@code cohere2-iswa.cpp:64} which gates {@code ggml_rope_ext} on {@code if (is_swa)}.
+     */
+    public boolean useNoPeOnGlobalLayers() {
+        return architecture == ModelArchitecture.COHERE2;
+    }
+
     // Nemotron-H per-layer support
     public int[] perLayerKvHeads() { return perLayerKvHeads; }
     public int[] perLayerFfnLength() { return perLayerFfnLength; }
@@ -278,6 +297,7 @@ public final class ModelConfig {
         int ropeType;
         if (arch == ModelArchitecture.LLAMA || arch == ModelArchitecture.DEEPSEEK2
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
+                || arch == ModelArchitecture.COHERE2
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
                 || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
                 || arch == ModelArchitecture.GRANITE || arch == ModelArchitecture.GEMMA4

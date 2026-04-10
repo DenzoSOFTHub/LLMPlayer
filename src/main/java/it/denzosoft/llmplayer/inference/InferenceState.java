@@ -38,7 +38,23 @@ public class InferenceState {
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];
         this.logits = new float[config.vocabSize()];
-        this.kvCache = new KVCache(config.blockCount(), kvDim, maxSeqLen);
+        // KV cache mode: FLOAT32 (default) or Q8_0 (via -Dkv.q8=true JVM property).
+        // Q8_0 saves ~72% of KV memory (1.125 vs 4 bytes/elem) with near-zero quality loss,
+        // enabling longer contexts. Only applies to the standard InferenceEngine path.
+        KVCache.Mode kvMode = "true".equals(System.getProperty("kv.q8"))
+            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        // Q8_0 requires kvDim divisible by 32; fallback to F32 if this model's kvDim is odd.
+        if (kvMode == KVCache.Mode.Q8_0 && kvDim % KVCache.Q8_BLOCK != 0) {
+            System.err.println("[kv.q8] kvDim=" + kvDim + " not divisible by "
+                + KVCache.Q8_BLOCK + " — falling back to FLOAT32 KV cache.");
+            kvMode = KVCache.Mode.FLOAT32;
+        }
+        this.kvCache = new KVCache(config.blockCount(), kvDim, maxSeqLen, kvMode);
+        if (kvMode == KVCache.Mode.Q8_0) {
+            System.out.println("  KV cache: Q8_0 mode (~" + (kvCache.memoryBytes() / (1024 * 1024))
+                + " MB, vs ~" + (2L * config.blockCount() * maxSeqLen * kvDim * 4 / (1024 * 1024))
+                + " MB in FLOAT32)");
+        }
     }
 
     /**

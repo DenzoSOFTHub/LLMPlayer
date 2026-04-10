@@ -827,6 +827,9 @@ public class CudaForwardPass implements AutoCloseable {
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
         if (config.expertCount() > 0) return false;
+        // Command-R uses centered LayerNorm, not RMSNorm — CUDA path implements RMSNorm only.
+        // Force CPU until a layernorm.cu kernel is added.
+        if (config.useLayerNorm()) return false;
 
         TransformerLayerWeights firstLayer = weights.layers()[0];
         // Require at least pre-norm or post-norm for attention and FFN

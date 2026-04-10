@@ -10,6 +10,7 @@ public enum ModelArchitecture {
     QWEN3MOE("qwen3moe"),
     MISTRAL3("mistral3"),
     COMMAND_R("command-r"),
+    COHERE2("cohere2"),
     OLMO2("olmo2"),
     GEMMA2("gemma2"),
     GEMMA3("gemma3"),
@@ -38,8 +39,13 @@ public enum ModelArchitecture {
             }
         }
         // Handle aliases for architectures that may appear under different names
-        if ("command_r".equals(name) || "cohere".equals(name) || "cohere2".equals(name)) {
+        if ("command_r".equals(name) || "cohere".equals(name)) {
             return COMMAND_R;
+        }
+        // Cohere2 is intentionally separate: it differs from Command-R in NoPE-on-global-layers,
+        // ISWA cache layout (every 4th layer global), and lacks Q/K norms.
+        if ("cohere2".equals(name)) {
+            return COHERE2;
         }
         if ("gemma".equals(name)) {
             return GEMMA2; // Gemma1 uses same forward pass
