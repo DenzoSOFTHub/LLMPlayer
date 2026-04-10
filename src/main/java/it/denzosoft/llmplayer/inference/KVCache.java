@@ -34,7 +34,8 @@ public class KVCache {
     public enum Mode { FLOAT32, Q8_0 }
 
     private final Mode mode;
-    private final int kvDim;
+    private final int kvDim;  // K stride (and V stride when symmetric; == kDim)
+    private final int vDim;   // V stride (== kvDim when symmetric, or different for MLA)
     private final int maxSeqLen;
 
     // FLOAT32 mode
@@ -52,30 +53,40 @@ public class KVCache {
     }
 
     public KVCache(int blockCount, int kvDim, int maxSeqLen, Mode mode) {
+        this(blockCount, kvDim, kvDim, maxSeqLen, mode);
+    }
+
+    /**
+     * Asymmetric-dimension constructor for MLA (DeepSeek2), where keyLength ≠ valueLength.
+     * Standard GQA callers should use the symmetric overload which sets kDim == vDim.
+     */
+    public KVCache(int blockCount, int kDim, int vDim, int maxSeqLen, Mode mode) {
         this.mode = mode;
-        this.kvDim = kvDim;
+        this.kvDim = kDim;
+        this.vDim = vDim;
         this.maxSeqLen = maxSeqLen;
         if (mode == Mode.FLOAT32) {
-            this.keyCache = new float[blockCount][maxSeqLen * kvDim];
-            this.valueCache = new float[blockCount][maxSeqLen * kvDim];
+            this.keyCache = new float[blockCount][maxSeqLen * kDim];
+            this.valueCache = new float[blockCount][maxSeqLen * vDim];
             this.keyQuants = null;
             this.keyScales = null;
             this.valueQuants = null;
             this.valueScales = null;
         } else {
-            // Q8_0 requires kvDim divisible by block size (all standard models satisfy this:
-            // head_dim ∈ {64, 128, 256} × head_count_kv ≥ 1 — always multiples of 32).
-            if (kvDim % Q8_BLOCK != 0) {
+            // Q8_0 requires both dims divisible by block size.
+            if (kDim % Q8_BLOCK != 0 || vDim % Q8_BLOCK != 0) {
                 throw new IllegalArgumentException(
-                    "Q8_0 KV cache requires kvDim divisible by " + Q8_BLOCK + ", got " + kvDim);
+                    "Q8_0 KV cache requires kDim and vDim divisible by " + Q8_BLOCK
+                        + ", got kDim=" + kDim + ", vDim=" + vDim);
             }
-            int scalesPerPos = kvDim / Q8_BLOCK;
+            int kScalesPerPos = kDim / Q8_BLOCK;
+            int vScalesPerPos = vDim / Q8_BLOCK;
             this.keyCache = null;
             this.valueCache = null;
-            this.keyQuants = new byte[blockCount][maxSeqLen * kvDim];
-            this.keyScales = new float[blockCount][maxSeqLen * scalesPerPos];
-            this.valueQuants = new byte[blockCount][maxSeqLen * kvDim];
-            this.valueScales = new float[blockCount][maxSeqLen * scalesPerPos];
+            this.keyQuants = new byte[blockCount][maxSeqLen * kDim];
+            this.keyScales = new float[blockCount][maxSeqLen * kScalesPerPos];
+            this.valueQuants = new byte[blockCount][maxSeqLen * vDim];
+            this.valueScales = new float[blockCount][maxSeqLen * vScalesPerPos];
         }
     }
 
@@ -116,9 +127,9 @@ public class KVCache {
     /** Store the V projection for a single token at position {@code pos}. Quantizes if in Q8 mode. */
     public void storeV(int layer, int pos, float[] v, int len) {
         if (mode == Mode.FLOAT32) {
-            System.arraycopy(v, 0, valueCache[layer], pos * kvDim, len);
+            System.arraycopy(v, 0, valueCache[layer], pos * vDim, len);
         } else {
-            quantizeBlocks(v, 0, len, valueQuants[layer], pos * kvDim, valueScales[layer], pos * (kvDim / Q8_BLOCK));
+            quantizeBlocks(v, 0, len, valueQuants[layer], pos * vDim, valueScales[layer], pos * (vDim / Q8_BLOCK));
         }
     }
 
@@ -145,9 +156,9 @@ public class KVCache {
     public void saxpyV(int layer, int pos, int kvHeadOff, int headSize, float weight,
                         float[] out, int outOff) {
         if (mode == Mode.FLOAT32) {
-            VectorOpsFactory.get().saxpy(weight, valueCache[layer], pos * kvDim + kvHeadOff, out, outOff, headSize);
+            VectorOpsFactory.get().saxpy(weight, valueCache[layer], pos * vDim + kvHeadOff, out, outOff, headSize);
         } else {
-            int baseOff = pos * kvDim + kvHeadOff;
+            int baseOff = pos * vDim + kvHeadOff;
             int baseScales = baseOff / Q8_BLOCK;
             saxpyQ8Block(weight, valueQuants[layer], baseOff, valueScales[layer], baseScales, out, outOff, headSize);
         }
@@ -219,15 +230,19 @@ public class KVCache {
     }
 
     /**
-     * Approximate memory usage in bytes.
+     * Approximate memory usage in bytes, accounting for asymmetric K/V dims.
      */
     public long memoryBytes() {
         if (mode == Mode.FLOAT32) {
-            return 2L * keyCache.length * keyCache[0].length * 4;
+            long k = (long) keyCache.length * keyCache[0].length * 4;
+            long v = (long) valueCache.length * valueCache[0].length * 4;
+            return k + v;
         } else {
-            long kv = 2L * keyQuants.length * keyQuants[0].length;
-            long scales = 2L * keyScales.length * keyScales[0].length * 4;
-            return kv + scales;
+            long kq = (long) keyQuants.length * keyQuants[0].length;
+            long ks = (long) keyScales.length * keyScales[0].length * 4;
+            long vq = (long) valueQuants.length * valueQuants[0].length;
+            long vs = (long) valueScales.length * valueScales[0].length * 4;
+            return kq + ks + vq + vs;
         }
     }
 }
