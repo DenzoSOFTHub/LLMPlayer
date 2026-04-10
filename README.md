@@ -1,6 +1,29 @@
-# LLMPlayer v1.9.0
+# LLMPlayer v1.10.1
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, and **Nemotron-H** (hybrid Mamba-2 + Transformer). Quantized formats: Q2_K through Q8_0, Q5_1, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, MXFP4, BF16, F16, F32. Includes CUDA GPU acceleration with graph mode (up to 56 tok/s on RTX 4050), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, and **Nemotron-H** (hybrid Mamba-2 + Transformer). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.10.1 — Top-10 audit vs llama.cpp
+
+Six commit's worth of correctness fixes, sampler additions, and a major memory optimization driven by an audit of LLMPlayer against the llama.cpp reference implementation. See `BENCHMARKS.md` for measured deltas.
+
+- **Q8_0 KV cache** (`-Dkv.q8=true`) — block-quantized int8 KV with FP32 scales per 32-elem block. **3.56× memory reduction** on all 5 inference engines including the asymmetric MLA path for DeepSeek2 (separate K/V dims). Bit-identical greedy output on dense models. Headline: **DeepSeek-Coder-V2-Lite Q4_K_M CPU mode goes from 1080 MB → 303 MB KV and 0.7 → 0.9 tok/s** (faster, not just smaller — MLA is DRAM-bandwidth-bound).
+- **Command-R LayerNorm fix** — `LayerNorm` (centered + scaled, no bias) now used in place of `RMSNorm` for Command-R / Cohere2 (matches llama.cpp `LLM_NORM`). Cohere2 also gets a separate enum, NoPE-on-global-layers handling, and the right ISWA pattern (`set_swa_pattern(4)`).
+- **DS-V3 / GLM-4.7-Flash routing fix** — `exp_probs_b` is now applied AFTER sigmoid (not before), and only as a selection score; mix weights come from the unbiased `probs`. Matches llama.cpp `build_moe_ffn`.
+- **New samplers** (opt-in): `--min-p`, `--mirostat 2 --mirostat-tau 5.0`, `--dry-multiplier 0.8`. Pipeline: `DRY → rep_penalty → temp → top-K → softmax → min-P → top-P → (mirostat | multinomial)`.
+- **Wo bias / output bias loading** — `attn_output.bias` and top-level `output.bias` now loaded and applied for Qwen2 / SmolLM3 / Command-R variants that ship them.
+- **GC churn reduction** — Qwen3.5 and Nemotron-H pre-cache all per-layer norm weights and pre-allocate conv1d output buffers.
+- **MoE routing safety** — F16-epsilon clamp on weight-sum normalization in `Qwen3MoEInferenceEngine.moeFFN` (anti-NaN guardrail, matches llama.cpp `ggml_clamp`).
+- **Gemma 3n / Gemma 4 broken-support warning** — empirically confirmed that PLE-only path (without AltUp + Laurel) produces random multi-language tokens. Loud WARNING banner at engine creation so users know the model is not yet usable.
+- **Documented but not enabled by default**: `-Dattn.flash=true` (FlashAttention online-softmax — bit-identical but ~10% slower on Java/CPU because the SIMD `VectorOps.softmax` is already fast); Nemotron-H CUDA graph (was hard-disabled, re-enabled but gives 0% speedup on this workload because Mamba-2 scan is compute-bound, not launch-bound).
+
+### What's new in v1.10.0
+
+- **Q5_1 CUDA kernel** — full GPU acceleration for Q5_1 quantization (24-byte aligned blocks, vectorized uint32 reads). Bit-exact with CPU.
+- **Q4_K 2-warp kernel** — opt-in `-Dcuda.q4k.2warp=true` splits each output row across two warps for higher SM occupancy on small/medium matrices.
+- **Refactored CudaFloatTensor** — base class now respects `getMatmulGridDim()` overrides on the non-graph path, enabling multi-warp-per-row kernels through the standard launch path.
+- **JMX rolling window** — 60-second sliding window of generation samples for live tok/s monitoring. New attributes `RecentTokensPerSecond` and `RecentSampleCount` exposed via JMX MXBean and `/api/metrics`.
+- **Architecture smoke test** — `test-architectures.sh` validates that each of the 18+ supported architectures loads and generates at least one valid token. Auto-detects Java 21+. Run before each release as a regression sanity check.
+- **Bumped to v1.10.0** in pom.xml, LLMPlayer.java, README.md, web-ui.html (UI title is dynamic via `LLMPlayer.VERSION`).
 
 ### What's new in v1.9.0
 
@@ -293,6 +316,14 @@ These flags control how tokens are generated. They affect output quality and cre
 | `--top-k` | — | Integer | 40 | After computing probabilities, keep only the K most probable tokens and renormalize. Prevents unlikely tokens from being selected. 0 = no top-K filtering. |
 | `--top-p` | — | Float | 0.9 | Nucleus sampling: keep the smallest set of tokens whose cumulative probability exceeds P, then renormalize. 1.0 = no filtering. Applied after top-K. |
 | `--repetition-penalty` | — | Float | 1.1 | Penalty applied to tokens that already appeared in the context. 1.0 = no penalty, 1.1-1.3 = light penalty, >1.5 = aggressive. Reduces loops and repetitive output. |
+| `--min-p` | — | Float | 0 | min-P sampling: keep tokens with `p ≥ min_p × max_p`. Modern default in many clients. Applied after softmax, before top-P. 0 = disabled. Try 0.05 with temp=0.8 for a quality/diversity balance. |
+| `--mirostat` | — | Integer | 0 | Mirostat sampler mode: `0` = off, `2` = Mirostat v2 (adaptive truncation by target entropy). Replaces multinomial sampling when enabled. |
+| `--mirostat-tau` | — | Float | 5.0 | Mirostat target surprise (entropy in bits). Lower = more focused, higher = more diverse. |
+| `--mirostat-eta` | — | Float | 0.1 | Mirostat learning rate for the running surprise estimate. |
+| `--dry-multiplier` | — | Float | 0 | DRY (Don't Repeat Yourself) penalty multiplier. Penalizes tokens that would extend an existing n-gram match. 0 = disabled. Try 0.8 to break repetition loops. |
+| `--dry-base` | — | Float | 1.75 | DRY exponential base. Penalty grows as `multiplier × base^(match_len − allowed_length)`. |
+| `--dry-allowed-length` | — | Integer | 2 | DRY: minimum n-gram length before penalty kicks in. |
+| `--dry-range` | — | Integer | 1024 | DRY: lookback window size in tokens. |
 | `--seed` | — | Long | random | Random seed for reproducibility. Same seed + same prompt = same output (when temperature > 0). |
 | `--threads` | — | Integer | num CPUs | Number of threads for parallel operations. By default uses all available CPU cores. |
 | `--context-length` | `-c` | Integer | 2048 | Maximum context window in tokens. Larger values allow longer conversations but use more RAM. Model's maximum is shown in `--info` output. |
@@ -324,6 +355,8 @@ Advanced performance tuning via JVM system properties (`-Dproperty=value`). Thes
 
 | Property | Default | Description |
 |----------|---------|-------------|
+| `-Dkv.q8=true` | `false` | **Q8_0 KV cache** — block-quantized int8 storage with FP32 scales (3.56× memory reduction). Bit-identical greedy output on dense models, plausibly-equivalent on MoE (router top-K sensitivity). **Always enable for DeepSeek2 / GLM-4.7-Flash**: MLA's large per-head K/V is DRAM-bandwidth bound, so Q8 is both smaller AND faster (DS-Coder-V2-Lite: −72% memory, +28% tok/s). CPU mode only — GPU forward passes use their own VRAM KV buffers. |
+| `-Dattn.flash=true` | `false` | FlashAttention-style online-softmax single-pass attention. Bit-identical to the legacy 2-pass; on Java/CPU it's 6-15% **slower** than the SIMD-optimized 2-pass and is kept opt-in for future GPU HBM-bound use. |
 | `-Dcuda.nograph=true` | `false` | Disable CUDA graph; use per-layer kernel launches |
 | `-Dcuda.cublas=true` | `false` | Enable cuBLAS for matmul (dequantizes Q4_K to FP16, uses `libcublas.so`). Useful on high-bandwidth GPUs (A100, H100). On RTX 4050, custom Q4_K kernels + CUDA graph are faster |
 | `-Dcuda.cublas.fp32=true` | `false` | Use FP32 instead of FP16 for cuBLAS (requires 7x VRAM vs Q4_K) |

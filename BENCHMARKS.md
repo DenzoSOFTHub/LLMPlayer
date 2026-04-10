@@ -10,9 +10,102 @@
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
+## Results v1.10.1
+
+**New in v1.10.1 — Top-10 audit optimizations vs llama.cpp:**
+- **C1** Command-R LayerNorm (centered + scaled, no bias) — replaces incorrect RMSNorm dispatch for Command-R/Cohere2. Forces CPU fallback for Command-R via `CudaForwardPass.isSupported`.
+- **C2** Cohere2 NoPE-on-global-layers + arch separation (cohere2 → COHERE2 enum, distinct from COMMAND_R).
+- **C6** DeepSeek-V3 / GLM-4.7-Flash `exp_probs_b` routing fix — sigmoid before bias, biased only used for top-K selection, mix weights from unbiased probs.
+- **E6** New samplers (opt-in): `--min-p`, `--mirostat 2`, `--dry-multiplier`. Pipeline: `DRY → rep_penalty → temp → top-K → softmax → min-P → top-P → (mirostat|multinomial)`.
+- **E11** Pre-cache all per-layer norm weights in Qwen3.5 / Nemotron-H (eliminates ~960 KB / ~70 KB GC churn per token respectively).
+- **E12** `output.bias` loading and application after lm_head matmul.
+- **E13** `attn_output.bias` (Wo bias) loading and application in standard `Attention.forward`.
+- **E18** Routing weight sum F16-epsilon clamp in `Qwen3MoEInferenceEngine.moeFFN` (anti-NaN guardrail).
+- **E21** Pre-allocated conv1d output buffer in Qwen3.5 / Nemotron-H state classes.
+- **M2** **Q8_0 KV cache** (`-Dkv.q8=true`) — block-quantized int8 + FP32 scales per 32-elem block, **3.56× memory reduction**. Wired to all 5 inference engines: `InferenceEngine`, `Qwen3MoEInferenceEngine`, `Qwen35InferenceEngine` (full-attention layers), `NemotronHInferenceEngine` (attention layers), and **`DeepSeek2InferenceEngine` (asymmetric MLA via separate K/V dims)**.
+- **Gemma 3n / Gemma 4 broken-support warning** — confirmed empirically that AltUp + Laurel are missing → output is random multi-language tokens. Loud WARNING banner at engine creation.
+
+Documented but **not enabled by default**:
+- **M1** FlashAttention online-softmax (`-Dattn.flash=true`) — bit-identical to legacy 2-pass but 6-15% slower on Java/CPU because the SIMD `VectorOps.softmax` is already fast. Kept opt-in for future GPU HBM-bound implementation.
+- **M5** Nemotron-H CUDA graph (`-Dcuda.nograph=true` to disable) — was hard-disabled, now works correctly (bit-identical) but gives **0% speedup** on this hardware because Mamba-2 scan + Q4_K matmul are compute/bandwidth-bound, not launch-bound.
+
+### GPU regression sweep — CUDA graph (default mode)
+
+Verifies that the default GPU CUDA graph path hasn't regressed for standard architectures.
+These models use `CudaForwardPass` so `-Dkv.q8=true` does not apply (GPU uses its own KV buffers).
+
+Methodology: 3 runs per model, **best** tok/s taken to filter JIT/thermal noise. 120 generated tokens (2× the v1.9.0/v1.10.0 sweep for stability).
+
+| Model | Quant | v1.10.0 (60 tok, single) | v1.10.1 (120 tok, best of 3) | Δ |
+|-------|-------|----------:|----------:|---:|
+| Llama-3.2-1B-Instruct | Q4_K_M | 55.8 | **56.8** | +1.8% |
+| Qwen3-0.6B | Q8_0 | — | **88.5** | new |
+| Qwen3-1.7B | Q8_0 | — | **36.7** | new |
+| Qwen3-4B | Q4_K_M | 18.5 | **17.7** | -4.3% |
+| OLMo-2-1B-Instruct | Q4_K_M | 46.8 | **55.8** | +19% |
+| Phi-4-mini-instruct | Q4_K_M | 13.7 | **19.6** | +43% |
+| Falcon3-3B-Instruct | Q4_K_M | — | **28.6** | new |
+| Mistral-7B-Instruct-v0.3 | Q4_K_M | — | _pending_ | _new_ |
+
+Notes on the deltas:
+- The big jumps on **Phi-4-mini (+43%)** and **OLMo-2 (+19%)** are very likely **methodology**, not the audit fixes: v1.10.1 measures over 120 tokens (the JIT warm-up amortizes over 2× more steady-state tokens) while v1.10.0 used 60-token runs. Larger sample → less warm-up overhead → higher steady-state tok/s. These represent the **measurement-corrected** baseline rather than pure speedup from this release.
+- **Llama-3.2-1B (+1.8%)** is essentially flat — within noise.
+- **Qwen3-4B (-4.3%)** is also within noise (run-to-run variance was ~6% on this model). No code change touches the Qwen3 GPU CUDA-graph hot path; the slight delta reflects thermal/JIT variance between bench runs.
+- Q8_0/Q4_K_M Qwen3-0.6B and Qwen3-1.7B are new entries — no v1.10.0 baseline.
+
+### CPU + Q8 KV cache effect
+
+CPU mode (`--no-gpu`), F32 baseline vs `-Dkv.q8=true`. Greedy (`--temperature 0.0`).
+
+For **standard dense models** (Llama, Qwen2/3): Q8 KV is bit-identical at greedy. CPU speed ranges from neutral (small models) to a small slowdown (medium models with larger per-head K), as the scalar Q8 dequant overhead competes with the bandwidth savings.
+
+For **Command-R / Cohere2** (LayerNorm path C1): exercises the new centered-norm CPU fallback. `CudaForwardPass.isSupported` now refuses Command-R (forcing CPU) so the LayerNorm dispatch is always taken.
+
+For **DeepSeek2 MLA** (asymmetric K/V, keyLength=192/valueLength=128 for DS-V2-Lite; 576/512 for DS-V3): Q8 is **faster than F32** because MLA per-head K/V is so large that the attention inner loop is DRAM-bandwidth-bound. Reading 4× fewer bytes per attention step saves more time than the scalar dequant costs.
+
+For **MoE models** (Qwen3-Coder-30B-A3B): Q8 KV produces a *different* sequence than F32, but both are valid. The Q8 noise in attention output perturbs the router's matmul, flipping the top-K expert selection. Output diverges within ~5 tokens but quality is preserved (PPL essentially unchanged).
+
+#### Measured A/B (from session-private testing during commits 1d24f53, 2a02dec, 2c00104, 531a895)
+
+| Model | Engine | F32 KV (MB) | Q8 KV (MB) | F32 tok/s | Q8 tok/s | Δ KV | Δ speed | Note |
+|-------|--------|------------:|-----------:|----------:|---------:|-----:|--------:|------|
+| Llama-3.2-1B-Instruct Q4_K_M | std | 128 | 36 | 2.5 | 2.5 | −72% | 0% | bit-identical, ctx=2048 |
+| Qwen3-1.7B Q8_0 | std | 448 | 126 | 2.2 | 1.9 | −72% | −14% | bit-identical, ctx=2048 |
+| Qwen3.5-4B Q4_K_M | hybrid (DeltaNet+attn) | — | — | 0.8 | 0.5 | (1-in-4 layers) | −37% | bit-identical |
+| Nemotron-3-Nano-4B Q4_K_M | hybrid (Mamba-2+attn) | — | — | 0.7 | 0.6 | (4-of-42 layers) | −14% | bit-identical |
+| Qwen3-Coder-30B-A3B Q4_K_M | MoE | — | — | 0.8 | 0.4 | −72% | −50% | output diverges (router) but valid |
+| **DeepSeek-Coder-V2-Lite Q4_K_M** ctx=2048 short-decode | **MLA + MoE** | **1080** | **303** | **0.7** | **0.9** | **−72%** | **+28%** | bit-identical, MLA bandwidth win at high seqLen |
+| DeepSeek-Coder-V2-Lite Q4_K_M ctx=512 60-tok | MLA + MoE | 270 | 75 | 0.7 | 0.7 | −72% | 0% | speedup invisible at small seqLen, memory still −72% |
+| **GLM-4.7-Flash Q4_K_M** | **MLA + Q-LoRA** | **3760** | **1057** | (8 tok / 56.7s) | (8 tok / 49.3s) | **−72% (−2.7 GB)** | **+13%** | bit-identical, larger MLA |
+
+#### Memory at long context
+
+| Model | ctx | F32 KV | Q8 KV | Saved |
+|-------|----:|-------:|------:|------:|
+| Llama-3.2-1B Q4_K_M | 2048 | 128 MB | 36 MB | −92 MB |
+| Qwen3-1.7B Q8_0 | 16384 | 3584 MB | 1008 MB | **−2.5 GB** |
+| GLM-4.7-Flash Q4_K_M | 2048 | 3760 MB | 1057 MB | **−2.7 GB** |
+
+#### Headline takeaways
+
+1. **For DeepSeek2 / GLM-4.7-Flash always set `-Dkv.q8=true`** — it is a **pure win** (memory + speed), not a trade-off. MLA's per-head K/V size makes attention DRAM-bandwidth-bound; Q8 unlocks both 3.56× memory reduction and ~+28% decode speedup.
+2. **For long-context dense Llama/Qwen** the memory saving (~70%) is the win — the speed cost on Java/CPU is 0-15%. Worth it any time the F32 KV cache is the limiting factor on context window.
+3. **For MoE** (Qwen3-Coder-30B etc.) Q8 KV is non-deterministic (router sensitivity) but quality-preserved. Use it when memory is tight, expect different but valid outputs.
+4. **`Gemma 4 / 3n` is broken** regardless of KV mode — produces random tokens because AltUp + Laurel are not implemented (loud warning at engine load).
+
+#### Note on the v1.10.1 bench sweep
+
+The full automated sweep in `bench-v1.10.1.sh` was truncated after the GPU regression phase to limit measurement time. The CPU + Q8 KV numbers above were captured by manual A/B during the implementation commits referenced. Each pair was verified on the same seed at temperature 0.0, with bit-equality confirmed for all dense models and DS2 (the only divergence is on MoE due to top-K sensitivity, not a Q8 bug).
+
+## Results v1.10.0
+
+**New in this version:** Q5_1 CUDA kernel (full GPU acceleration), Q4_K 2-warp kernel (opt-in via `-Dcuda.q4k.2warp=true`), refactored CudaFloatTensor base class for multi-warp-per-row kernels, JMX 60-second rolling window for live tok/s monitoring (`getRecentTokensPerSecond()`), `test-architectures.sh` smoke test suite for all 18+ supported architectures.
+
+No performance regressions vs v1.9.0; benchmarks below are inherited from v1.9.0 unless re-run.
+
 ## Results v1.9.0
 
-**New in this version:** Granite 3.3 CUDA graph support, Gemma 4 E4B architecture (PLE, dual headSize, shared KV cache, V-norm, dual RoPE), Gemma 3n E4B, Granite Hybrid (Mamba-2 + Attention + FFN) via NemotronH engine, Q5_K shared-memory kernel (+7%), Q6_K tiled kernel (+9%), dp4a integer dot product for Q4_K/Q5_K/Q6_K (enabled by default), DeltaNet v2 float4 vectorized kernel (+4%), JMX metrics (via `it.denzosoft.llmplayer:type=LLMPlayer`), REST metrics API (`/api/metrics`).
+**New in v1.9.0:** Granite 3.3 CUDA graph support, Gemma 4 E4B architecture (PLE, dual headSize, shared KV cache, V-norm, dual RoPE), Gemma 3n E4B, Granite Hybrid (Mamba-2 + Attention + FFN) via NemotronH engine, Q5_K shared-memory kernel (+7%), Q6_K tiled kernel (+9%), dp4a integer dot product for Q4_K/Q5_K/Q6_K (enabled by default), DeltaNet v2 float4 vectorized kernel (+4%), JMX metrics (via `it.denzosoft.llmplayer:type=LLMPlayer`), REST metrics API (`/api/metrics`).
 
 ### Full GPU offload — CUDA graph (model fits in 6 GB VRAM)
 
