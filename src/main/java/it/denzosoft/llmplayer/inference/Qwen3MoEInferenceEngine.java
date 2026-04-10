@@ -376,7 +376,10 @@ public class Qwen3MoEInferenceEngine {
             for (int k = 0; k < expertUsedCount; k++) {
                 weightSum += state.selectedWeights[k];
             }
-            if (weightSum > 0f) {
+            // E18: clamp to smallest F16 normal (6.103515625e-5) to guard against NaN when
+            // the routing distribution has collapsed to near-zero — matches llama.cpp
+            // ggml_clamp in build_moe_ffn (llama-graph.cpp:1325).
+            if (weightSum > 6.103515625e-5f) {
                 for (int k = 0; k < expertUsedCount; k++) {
                     state.selectedWeights[k] /= weightSum;
                 }

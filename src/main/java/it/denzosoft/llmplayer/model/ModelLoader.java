@@ -249,6 +249,8 @@ public class ModelLoader {
                 tryLoadTensor(gguf, ArchitectureRegistry.attnQBias(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnKBias(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnVBias(i)),
+                // E13: Wo bias (attn_output.bias) — Qwen2/SmolLM3 variants, Command-R 35B
+                tryLoadTensor(gguf, ArchitectureRegistry.attnOutputBias(i)),
                 // Qwen3/OLMo2 QK norm (null if absent)
                 tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i)),

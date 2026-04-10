@@ -233,6 +233,10 @@ public class Attention {
         // Output projection: xb = Wo * xb2 (qDim -> dim)
         Arrays.fill(state.xb, 0);
         weights.wo().matmulParallel(state.xb2, state.xb, dim, qDim);
+        // E13: Wo bias (attn_output.bias) — for Qwen2/SmolLM3 variants and Command-R
+        if (weights.woBias() != null) {
+            addBias(state.xb, weights.woBias(), dim);
+        }
     }
 
     /**
