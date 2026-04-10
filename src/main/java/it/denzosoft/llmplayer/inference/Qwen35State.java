@@ -79,8 +79,12 @@ public class Qwen35State {
         this.k = new float[kvDim];
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];
-        // KV cache only for full attention layers (every fullAttnInterval-th layer)
-        this.kvCache = new KVCache(blockCount, kvDim, maxSeqLen);
+        // KV cache only for full attention layers (every fullAttnInterval-th layer).
+        // Honors -Dkv.q8=true for 3.56× memory reduction on the attention-layer cache.
+        KVCache.Mode q35KvMode = "true".equals(System.getProperty("kv.q8"))
+            && (kvDim % KVCache.Q8_BLOCK == 0)
+            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        this.kvCache = new KVCache(blockCount, kvDim, maxSeqLen, q35KvMode);
 
         // DeltaNet buffers
         this.qkv = new float[qkvDim];

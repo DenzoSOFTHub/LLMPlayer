@@ -61,7 +61,11 @@ public class Qwen3MoEState {
         this.k = new float[kvDim];
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];
-        this.kvCache = new KVCache(config.blockCount(), kvDim, maxSeqLen);
+        // KV cache mode: FLOAT32 (default) or Q8_0 (-Dkv.q8=true)
+        KVCache.Mode kvMode = "true".equals(System.getProperty("kv.q8"))
+            && (kvDim % KVCache.Q8_BLOCK == 0)
+            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        this.kvCache = new KVCache(config.blockCount(), kvDim, maxSeqLen, kvMode);
 
         // Dense FFN
         this.hb = new float[ffnDim];

@@ -253,16 +253,14 @@ public class Qwen3MoEInferenceEngine {
             rope.applyAllHeads(state.k, headCountKV, position);
         }
 
-        // Store K and V in cache
-        float[] keyCache = state.kvCache.keyLayer(layer);
-        float[] valueCache = state.kvCache.valueLayer(layer);
-        System.arraycopy(state.k, 0, keyCache, state.kvCache.offset(position), kvDim);
-        System.arraycopy(state.v, 0, valueCache, state.kvCache.offset(position), kvDim);
+        // Store K and V in cache (quantized transparently if KV cache is in Q8 mode)
+        state.kvCache.storeK(layer, position, state.k, kvDim);
+        state.kvCache.storeV(layer, position, state.v, kvDim);
 
         // Attention computation - parallel over heads
         // Include YaRN mscale^2 for attention magnitude correction
         float mscale = rope.getMscale();
-        float scaleFactor = mscale * mscale / (float) Math.sqrt(headSize);
+        final float scaleFactor = mscale * mscale / (float) Math.sqrt(headSize);
 
         // ISWA: even layers use sliding window, odd layers use full attention
         // startPos is the first position to attend to
@@ -272,43 +270,38 @@ public class Qwen3MoEInferenceEngine {
         } else {
             startPos = 0;
         }
-        final int attLen = position - startPos + 1; // number of positions to attend to
+        final int attLen = position - startPos + 1;
+        final int positionFinal = position;
 
         Arrays.fill(state.xb2, 0, qDim, 0f);
 
         // Capture for use in lambda
         final float[] sinks = cachedAttnSinks[layer];
+        final KVCache kv = state.kvCache;
+        final int layerFinal = layer;
 
         IntStream.range(0, headCount).parallel().forEach(new java.util.function.IntConsumer() {
             @Override
             public void accept(int h) {
                 int kvHead = h / kvMul;
+                int kvHeadOff = kvHead * headSize;
+                int qOffset = h * headSize;
                 int attOffset = h * attLen;
-                for (int t = startPos; t <= position; t++) {
-                    float score = 0f;
-                    int qOffset = h * headSize;
-                    int kOffset = state.kvCache.offset(t) + kvHead * headSize;
-                    for (int i = 0; i < headSize; i++) {
-                        score += state.q[qOffset + i] * keyCache[kOffset + i];
-                    }
+                for (int t = startPos; t <= positionFinal; t++) {
+                    float score = kv.dotK(layerFinal, t, kvHeadOff, headSize, state.q, qOffset);
                     state.att[attOffset + (t - startPos)] = score * scaleFactor;
                 }
 
                 if (sinks != null) {
-                    // Attention sinks (GPT-OSS): include sink in softmax denominator
-                    // but don't multiply with any V vector
                     softmaxWithSink(state.att, attOffset, attLen, sinks[h]);
                 } else {
                     VectorOpsFactory.get().softmax(state.att, attOffset, attLen);
                 }
 
                 int outOffset = h * headSize;
-                for (int t = startPos; t <= position; t++) {
+                for (int t = startPos; t <= positionFinal; t++) {
                     float a = state.att[attOffset + (t - startPos)];
-                    int vOffset = state.kvCache.offset(t) + kvHead * headSize;
-                    for (int i = 0; i < headSize; i++) {
-                        state.xb2[outOffset + i] += a * valueCache[vOffset + i];
-                    }
+                    kv.saxpyV(layerFinal, t, kvHeadOff, headSize, a, state.xb2, outOffset);
                 }
             }
         });
