@@ -65,22 +65,39 @@ public class SpecialTokens {
         // Load additional EOS token IDs from metadata array
         int[] additionalEos = metadata.getIntArray("tokenizer.ggml.eos_token_ids");
 
-        // If no explicit additional EOS, scan vocabulary for common end-of-message tokens
-        if (additionalEos == null) {
-            String[] tokens = metadata.getStringArray("tokenizer.ggml.tokens");
-            if (tokens != null) {
-                java.util.List<Integer> found = new java.util.ArrayList<>();
+        // Augment with explicit-EOT lookups: many GGUFs only set eos_token_id to <eos> but
+        // their chat template emits a different turn-terminator (e.g. Gemma's <end_of_turn>,
+        // GPT-OSS's <|end|>, Llama 3's <|eot_id|>). Without scanning the vocab for these,
+        // generation runs past the model's actual end-of-response and loops into garbage.
+        // We always scan, then merge with whatever the metadata array provided.
+        String[] tokens = metadata.getStringArray("tokenizer.ggml.tokens");
+        if (tokens != null) {
+            java.util.LinkedHashSet<Integer> stopSet = new java.util.LinkedHashSet<>();
+            if (additionalEos != null) {
+                for (int id : additionalEos) stopSet.add(id);
+            }
+            // Known turn-terminator tokens across families. Each is added if found and
+            // distinct from the primary eos/eot we already track.
+            String[] candidates = {
+                "<end_of_turn>",      // Gemma 2 / 3 / 3n / 4
+                "<|end_of_turn|>",    // some Gemma variants
+                "<|end|>",            // GPT-OSS / Phi
+                "<|eot_id|>",         // Llama 3 / SmolLM3
+                "<|im_end|>",         // Qwen / ChatML
+                "<|endoftext|>"       // GPT-2 family fallback
+            };
+            for (String name : candidates) {
                 for (int i = 0; i < tokens.length; i++) {
-                    if ("<|end|>".equals(tokens[i]) && i != eosId && i != eotId) {
-                        found.add(i);
+                    if (name.equals(tokens[i]) && i != eosId && i != eotId) {
+                        stopSet.add(i);
+                        break;
                     }
                 }
-                if (!found.isEmpty()) {
-                    additionalEos = new int[found.size()];
-                    for (int i = 0; i < found.size(); i++) {
-                        additionalEos[i] = found.get(i);
-                    }
-                }
+            }
+            if (!stopSet.isEmpty()) {
+                additionalEos = new int[stopSet.size()];
+                int j = 0;
+                for (int id : stopSet) additionalEos[j++] = id;
             }
         }
 

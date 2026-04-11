@@ -57,9 +57,15 @@ public class InferenceEngine {
 
         int ropeDimCount = config.ropeDimensionCount();
         ModelArchitecture arch = config.architecture();
+        // Linear RoPE scaling factor (Gemma 3 4B has rope.scaling.type=linear, factor=8.0).
+        // For yarn-scaled models, ropeScalingFactor is consumed via YarnParams instead.
+        float linearFreqScale = (config.ropeScalingFactor() > 1.0f && config.yarnLogMultiplier() == 0)
+            ? config.ropeScalingFactor() : 1.0f;
         RoPE rope = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, config.ropeFreqBase(),
-            config.ropeType(), ropeFreqFactors);
-        // Gemma 3: local (sliding window) layers use theta=10000, global layers use the main theta
+            config.ropeType(), ropeFreqFactors, null, linearFreqScale);
+        // Gemma 3: local (sliding window) layers use theta=10000, global layers use the main theta.
+        // Linear scale is NOT applied to the SWA local rope per llama.cpp behavior — short SWA
+        // doesn't need rope scaling.
         RoPE ropeLocal = null;
         if (arch == ModelArchitecture.GEMMA3 && config.slidingWindow() > 0) {
             ropeLocal = new RoPE(config.headSize(), ropeDimCount, maxSeqLen, 10000f,
