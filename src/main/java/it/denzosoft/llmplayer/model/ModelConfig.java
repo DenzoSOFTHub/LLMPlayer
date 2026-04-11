@@ -366,7 +366,11 @@ public final class ModelConfig {
         int defaultDenseBlocks = (expertCount > 0) ? 0 : blockCount;
         int leadingDenseBlockCount = metadata.getInt(prefix + "leading_dense_block_count", defaultDenseBlocks);
 
-        // YaRN scaling parameters
+        // RoPE scaling parameters. Supported types:
+        //   "yarn"   — YaRN extension (DeepSeek-V2, etc.) with log-multiplier
+        //   "linear" — linear position downscaling (Gemma 3 4B, Llama-2 long-context, etc.)
+        // For linear, RoPE positions are divided by the factor (effectively stretching the
+        // pretrained context window). For yarn, the additional yarn parameters apply.
         String ropeScalingType = metadata.getString(prefix + "rope.scaling.type", "none");
         float ropeScalingFactor = 0;
         int ropeOrigContextLength = 0;
@@ -375,6 +379,12 @@ public final class ModelConfig {
             ropeScalingFactor = metadata.getFloat(prefix + "rope.scaling.factor", 1.0f);
             ropeOrigContextLength = metadata.getInt(prefix + "rope.scaling.original_context_length", contextLength);
             yarnLogMultiplier = metadata.getFloat(prefix + "rope.scaling.yarn_log_multiplier", 0.0f);
+        } else if ("linear".equals(ropeScalingType)) {
+            // Linear scaling: position[i] used in RoPE becomes i / factor.
+            // Stored in ropeScalingFactor; consumer (RoPE) interprets it as a divisor when
+            // yarnLogMultiplier == 0 (i.e. non-yarn mode). This matches llama.cpp's
+            // f_freq_scale = 1.0f / factor for linear scaling.
+            ropeScalingFactor = metadata.getFloat(prefix + "rope.scaling.factor", 1.0f);
         }
 
         // Gemma2/3 logit soft-capping

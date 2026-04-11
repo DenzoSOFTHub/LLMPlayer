@@ -26,15 +26,24 @@ public class RoPE {
     private final float mscale;    // YaRN attention magnitude correction (1.0 if no YaRN)
 
     public RoPE(int headSize, int ropeDimCount, int maxSeqLen, float theta, int ropeType, float[] freqFactors) {
-        this(headSize, ropeDimCount, maxSeqLen, theta, ropeType, freqFactors, null);
+        this(headSize, ropeDimCount, maxSeqLen, theta, ropeType, freqFactors, null, 1.0f);
+    }
+
+    public RoPE(int headSize, int ropeDimCount, int maxSeqLen, float theta, int ropeType,
+                float[] freqFactors, YarnParams yarnParams) {
+        this(headSize, ropeDimCount, maxSeqLen, theta, ropeType, freqFactors, yarnParams, 1.0f);
     }
 
     /**
-     * Full constructor with optional YaRN parameters.
+     * Full constructor with optional YaRN parameters AND linear scale.
      * @param yarnParams YaRN scaling parameters, or null for standard RoPE.
+     * @param linearFreqScale Linear position downscaling factor (≥1.0). 1.0 = no scaling.
+     *                        For Gemma 3 4B with rope.scaling.type=linear, factor=8 → linearFreqScale=8.
+     *                        Equivalent to llama.cpp's f_freq_scale = 1/factor applied to all frequencies.
+     *                        Ignored when yarnParams is provided (yarn handles its own freq scaling).
      */
     public RoPE(int headSize, int ropeDimCount, int maxSeqLen, float theta, int ropeType,
-                float[] freqFactors, YarnParams yarnParams) {
+                float[] freqFactors, YarnParams yarnParams, float linearFreqScale) {
         this.headSize = headSize;
         this.ropeDimCount = ropeDimCount;
         this.ropeType = ropeType;
@@ -57,14 +66,14 @@ public class RoPE {
             corrHigh = Math.min(ropeDimCount / 2.0f - 1, (float) Math.ceil(corrHigh));
 
             // mscale: attention magnitude correction
-            // From llama.cpp: attn_factor_org = attn_factor * (1 + 0.1 * log(1/freq_scale))
-            //                  mscale = attn_factor_org * (1 + 0.1 * yarn_log_mul * log(1/freq_scale))
-            // mscale is NOT baked into cos/sin tables - it's applied as attention scale: mscale^2/sqrt(d)
             float attnFactor = 1.0f;
             if (yarnParams.yarnLogMul > 0) {
                 attnFactor = 0.1f * yarnParams.yarnLogMul * (float) Math.log(yarnParams.scalingFactor) + 1.0f;
             }
             computedMscale = attnFactor * (1.0f + 0.1f * (float) Math.log(1.0f / freqScale));
+        } else if (linearFreqScale > 1.0f) {
+            // Pure linear scaling (Gemma 3 4B, Llama-2 long-context, etc.)
+            freqScale = 1.0f / linearFreqScale;
         }
         this.mscale = computedMscale;
 
@@ -82,11 +91,11 @@ public class RoPE {
                     // YaRN NTK-by-parts blending
                     float thetaExtrap = baseFreq;                  // original frequency
                     float thetaInterp = freqScale * baseFreq;     // interpolated frequency
-                    // ramp: 1.0 for high-freq (keep original), 0.0 for low-freq (interpolate)
                     float rampMix = yarnRamp(corrLow, corrHigh, i);
                     freq = thetaInterp * (1.0f - rampMix) + thetaExtrap * rampMix;
                 } else {
-                    freq = baseFreq;
+                    // Apply linear scale (1.0 for non-scaled models, <1.0 for linear-scaled)
+                    freq = baseFreq * freqScale;
                 }
 
                 float angle = pos * freq;
