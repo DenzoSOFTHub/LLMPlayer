@@ -454,10 +454,13 @@ public final class ModelConfig {
             config.setAttentionScale(1.0f);
         }
 
-        // Gemma 3n: same PLE config as Gemma 4
+        // Gemma 3n: same PLE config as Gemma 4 + AltUp/Laurel-specific config
         if (arch == ModelArchitecture.GEMMA3N) {
             config.setEmbeddingLengthPerLayer(metadata.getInt(prefix + "embedding_length_per_layer_input", 0));
             config.setEmbeddingScale((float) Math.sqrt(embeddingLength));
+            // For Gemma 3n E4B: 15 of 35 layers reuse earlier layers' KV cache
+            // (n_layer_kv_from_start = blockCount - shared_kv_layers = 35 - 15 = 20)
+            config.setSharedKvLayers(metadata.getInt(prefix + "attention.shared_kv_layers", 0));
             // Parse sliding window pattern
             Object swpObj = metadata.get(prefix + "attention.sliding_window_pattern");
             if (swpObj instanceof Object[] swpArr) {
