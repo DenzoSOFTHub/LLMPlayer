@@ -28,7 +28,26 @@ public class Gemma4State extends InferenceState {
     public final float[] vLarge;
     public final float[] xb2Large;
 
+    // H10: AltUp 4-stream activation buffers + scratch.
+    // streams[s][d] = stream s of dim d. nAltup typically 4 for Gemma 3n.
+    public final float[][] altupStreams;        // [nAltup][dim]
+    public final float[][] altupPredictions;    // [nAltup][dim] — output of altup_predict
+    public final float[][] altupCorrected;      // [nAltup][dim] — output of altup_correct
+    public final float[] altupRouterInput;      // [dim] — RMSNorm of active stream for router
+    public final float[] altupModalities;       // [nAltup] — tanh(router @ active_normed)
+    public final float[] altupAllCoefs;         // [nAltup * nAltup] — predict OR correct coefs
+    public final float[] altupInnovation;       // [dim] — actual - active_prediction
+    public final float[] laurelTmpRank;         // [laurel_rank] — intermediate of laurel_l @ x
+    public final float[] laurelOut;             // [dim] — laurel(x)
+    public final float[] firstPredAltup;        // [pleDim] — first_prediction in altup space
+    public final float[] firstPredFullDim;      // [dim]    — first_prediction back-projected
+
     public Gemma4State(ModelConfig config, int maxSeqLen, int pleDim, int maxQDim, int maxKvDim) {
+        this(config, maxSeqLen, pleDim, maxQDim, maxKvDim, 0, 0);
+    }
+
+    public Gemma4State(ModelConfig config, int maxSeqLen, int pleDim, int maxQDim, int maxKvDim,
+                       int nAltup, int laurelRank) {
         super(config, maxSeqLen);
         int dim = config.embeddingLength();
         int blockCount = config.blockCount();
@@ -49,6 +68,33 @@ public class Gemma4State extends InferenceState {
 
         // Create per-layer KV cache with variable dimensions
         this.gemma4KvCache = new Gemma4KVCache(config, maxSeqLen);
+
+        // H10: AltUp + Laurel buffers (allocated only when nAltup > 0)
+        if (nAltup > 0) {
+            this.altupStreams     = new float[nAltup][dim];
+            this.altupPredictions = new float[nAltup][dim];
+            this.altupCorrected   = new float[nAltup][dim];
+            this.altupRouterInput = new float[dim];
+            this.altupModalities  = new float[nAltup];
+            this.altupAllCoefs    = new float[nAltup * nAltup];
+            this.altupInnovation  = new float[dim];
+            this.laurelTmpRank    = laurelRank > 0 ? new float[laurelRank] : new float[0];
+            this.laurelOut        = new float[dim];
+            this.firstPredAltup   = pleDim > 0 ? new float[pleDim] : new float[0];
+            this.firstPredFullDim = new float[dim];
+        } else {
+            this.altupStreams = null;
+            this.altupPredictions = null;
+            this.altupCorrected = null;
+            this.altupRouterInput = null;
+            this.altupModalities = null;
+            this.altupAllCoefs = null;
+            this.altupInnovation = null;
+            this.laurelTmpRank = null;
+            this.laurelOut = null;
+            this.firstPredAltup = null;
+            this.firstPredFullDim = null;
+        }
     }
 
     /**

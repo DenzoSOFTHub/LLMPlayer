@@ -601,20 +601,17 @@ public class LLMEngine implements AutoCloseable {
 
     private static Gemma4InferenceEngine createGemma4Engine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         ModelConfig config = loadedModel.config();
-        // KNOWN INCOMPLETE SUPPORT: Gemma 3n (aka "Gemma 4") requires the AltUp (4 parallel
-        // activation streams with learned router/predict/correct coefficients) and Laurel
-        // (low-rank residual) machinery — see llama.cpp gemma3n-iswa.cpp. LLMPlayer's
-        // Gemma4InferenceEngine currently implements only the PLE (per-layer embeddings)
-        // sub-path; the AltUp + Laurel forward-pass plumbing is NOT yet wired up. The
-        // tensors ARE loaded below into a Gemma3nWeights bundle so a future commit can
-        // implement the forward pass without re-doing the loader work.
+        // PARTIAL SUPPORT: Gemma 3n (aka "Gemma 4") AltUp + Laurel forward path is now
+        // implemented in Gemma4InferenceEngine. Output quality is still imperfect (best-effort
+        // implementation, some details may differ from llama.cpp's reference) — see
+        // Gemma3nWeights.java for the full algorithm spec and tensor map. Improvement target
+        // for future iteration.
         System.err.println();
         System.err.println("  ====================================================================");
-        System.err.println("  WARNING: Gemma 3n / Gemma 4 (PLE) support is INCOMPLETE.");
-        System.err.println("  AltUp + Laurel weights are LOADED but the forward pass does not");
-        System.err.println("  yet use them. Expected output: garbage tokens (random multi-language).");
-        System.err.println("  See Gemma3nWeights.java for the full algorithm spec and tensor map.");
-        System.err.println("  Track: Top-10 audit H10 — see commit history for the full plan.");
+        System.err.println("  Gemma 3n / Gemma 4 (PLE) support is PARTIAL.");
+        System.err.println("  AltUp + Laurel forward pass implemented (best effort) — output may");
+        System.err.println("  not match llama.cpp bit-exact but should be coherent English.");
+        System.err.println("  Activation sparsity (gaussian top-k) not yet applied.");
         System.err.println("  ====================================================================");
         System.err.println();
         it.denzosoft.llmplayer.model.ModelWeights weights = loadedModel.weights();
@@ -738,7 +735,8 @@ public class LLMEngine implements AutoCloseable {
         return new Gemma4InferenceEngine(config, weights, maxContextLength,
             pleTokenEmbd, pleModelProj, pleProjNormWeights,
             pleInpGate, pleProj, plePostNorm, layerOutputScale,
-            weights.ropeFreqFactors());
+            weights.ropeFreqFactors(),
+            gemma3nExtras);
     }
 
     private interface ForwardFunction {

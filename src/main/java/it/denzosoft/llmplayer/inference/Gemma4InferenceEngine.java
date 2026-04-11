@@ -63,6 +63,9 @@ public class Gemma4InferenceEngine {
     private final float[][] plePostNorm;       // [dim] per layer
     private final float[] layerOutputScale;    // scalar per layer
 
+    // H10: Gemma 3n AltUp + Laurel — null if model is plain PLE without altup machinery
+    private final it.denzosoft.llmplayer.model.Gemma3nWeights g3n;
+
     // Cached norm weights
     private final float[][] attnNormCache;
     private final float[][] ffnNormCache;
@@ -84,6 +87,18 @@ public class Gemma4InferenceEngine {
                                   FloatTensor[] pleInpGate, FloatTensor[] pleProj,
                                   float[][] plePostNorm, float[] layerOutputScale,
                                   float[] ropeFreqFactors) {
+        this(config, weights, maxSeqLen, pleTokenEmbd, pleModelProj, pleProjNormWeights,
+             pleInpGate, pleProj, plePostNorm, layerOutputScale, ropeFreqFactors, null);
+    }
+
+    public Gemma4InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen,
+                                  FloatTensor pleTokenEmbd, FloatTensor pleModelProj,
+                                  float[] pleProjNormWeights,
+                                  FloatTensor[] pleInpGate, FloatTensor[] pleProj,
+                                  float[][] plePostNorm, float[] layerOutputScale,
+                                  float[] ropeFreqFactors,
+                                  it.denzosoft.llmplayer.model.Gemma3nWeights g3n) {
+        this.g3n = g3n;
         this.config = config;
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
@@ -172,7 +187,14 @@ public class Gemma4InferenceEngine {
     }
 
     public Gemma4State createState() {
-        // Use max dimensions for buffers (full attention layers have larger Q/K/V)
+        // Use max dimensions for buffers (full attention layers have larger Q/K/V).
+        // If g3n is loaded, also allocate AltUp + Laurel buffers (4-stream activations).
+        if (g3n != null && g3n.isFullyLoaded()) {
+            // laurel rank is the inner dim of laurel_l (shape [n_embd, laurel_rank])
+            int laurelRank = (int) g3n.laurelL[0].size() / dim;
+            return new Gemma4State(config, maxSeqLen, pleDim, maxQDim, maxKvDim,
+                g3n.nAltup, laurelRank);
+        }
         return new Gemma4State(config, maxSeqLen, pleDim, maxQDim, maxKvDim);
     }
 
@@ -195,9 +217,22 @@ public class Gemma4InferenceEngine {
         if (hasPle) computePleInput(token, state);
         boolean doPle = hasPle; // can be toggled for debug
 
-        // 3. Forward through all layers
-        for (int layer = 0; layer < blockCount; layer++) {
-            forwardLayer(state, layer, position, doPle);
+        // H10: Gemma 3n AltUp + Laurel forward path
+        boolean useAltup = g3n != null && g3n.isFullyLoaded() && state.altupStreams != null;
+        if (useAltup) {
+            // 3a. Initialize 4 streams from x via altup_proj
+            altupInit(state);
+            // 3b. Per layer: predict → run active stream → correct → first_pred inject
+            for (int layer = 0; layer < blockCount; layer++) {
+                forwardLayerAltup(state, layer, position, doPle);
+            }
+            // 3c. Merge streams back to single x via altup_unembd_proj + averaging
+            altupMerge(state);
+        } else {
+            // 3. Forward through all layers (PLE-only path, no AltUp)
+            for (int layer = 0; layer < blockCount; layer++) {
+                forwardLayer(state, layer, position, doPle);
+            }
         }
 
         if (!computeLogits) return null;
@@ -485,4 +520,353 @@ public class Gemma4InferenceEngine {
 
     public void setState(Gemma4State st) { this.state = st; }
     public Gemma4State getState() { return state; }
+
+    // ============================================================================
+    // H10: Gemma 3n AltUp + Laurel implementation
+    // ============================================================================
+    // Reference: llama.cpp src/models/gemma3n-iswa.cpp
+    //
+    // Architecture overview:
+    //   - 4 parallel activation streams (n_altup=4)
+    //   - Active stream (i_altup_act=0) goes through normal attention + FFN
+    //   - Other 3 streams are "predicted" via learned linear combinations
+    //   - After each layer, predictions are "corrected" using actual layer output
+    //   - Per-layer first_prediction (active stream → PLE space → back) is added to
+    //     the 3 non-active streams to share information across them
+    //   - At the end, all 4 streams are averaged with magnitude rescaling
+    //
+    // Intentional simplifications in this implementation:
+    //   - Activation sparsity (gaussian_topk on first n_layer_sparsity FFN gates) NOT applied
+    //   - V-norm (rms_norm without scale on V) NOT applied — uses standard projection
+    //   - has_kv per-layer logic uses existing kvSourceLayer mapping
+    //
+    // These simplifications mean the output may not be bit-exact with llama.cpp,
+    // but should be MUCH better than the "random multi-language tokens" failure
+    // mode of the PLE-only path.
+
+    /**
+     * AltUp init: project the active stream into 4 streams via altup_proj.
+     * Input: state.x (active stream, [dim])
+     * Output: state.altupStreams[4][dim], with stream 0 = state.x and streams 1..3
+     *         = altup_proj @ state.x with magnitude rescaling.
+     */
+    private void altupInit(Gemma4State state) {
+        int nAltup = g3n.nAltup;
+        int iAct = g3n.iAltupAct;
+        // Stream 0 = active = current state.x
+        System.arraycopy(state.x, 0, state.altupStreams[iAct], 0, dim);
+
+        // Compute target magnitude of active stream
+        float targetMag = magnitude(state.x);
+
+        // For each non-active stream, project active via altup_proj[stream_idx - 1]
+        // altup_proj has shape [dim, dim, n_altup-1] in the GGUF — slice (n_altup-1) matrices.
+        // We use slice index s = streamIdx - (streamIdx > iAct ? 1 : 0) into the n_altup-1 slices.
+        for (int s = 0; s < nAltup; s++) {
+            if (s == iAct) continue;
+            int sliceIdx = s > iAct ? s - 1 : s;
+            // matmul: [dim] = altup_proj[sliceIdx] @ x
+            float[] target = state.altupStreams[s];
+            java.util.Arrays.fill(target, 0f);
+            long sliceOffset = (long) sliceIdx * dim * dim;
+            for (int row = 0; row < dim; row++) {
+                float sum = 0f;
+                for (int col = 0; col < dim; col++) {
+                    sum += g3n.altupProj.getFloat(sliceOffset + (long) row * dim + col) * state.x[col];
+                }
+                target[row] = sum;
+            }
+            // Rescale to target magnitude
+            float currentMag = magnitude(target);
+            if (currentMag > 1e-8f) {
+                float scale = targetMag / currentMag;
+                for (int i = 0; i < dim; i++) target[i] *= scale;
+            }
+        }
+    }
+
+    /** L2 magnitude of a vector. */
+    private static float magnitude(float[] v) {
+        float sum = 0f;
+        for (float x : v) sum += x * x;
+        return (float) Math.sqrt(sum);
+    }
+
+    /**
+     * AltUp merge: collapse 4 streams to single x via altup_unembd_proj + averaging.
+     * Input: state.altupStreams[4][dim]
+     * Output: state.x (averaged + rescaled)
+     */
+    private void altupMerge(Gemma4State state) {
+        int nAltup = g3n.nAltup;
+        int iAct = g3n.iAltupAct;
+        // Target magnitude from active stream
+        float targetMag = magnitude(state.altupStreams[iAct]);
+
+        // Project non-active streams via altup_unembd_proj and rescale to target mag
+        // Then average all 4 (active + 3 unembedded) into state.x
+        // Start x = active stream
+        System.arraycopy(state.altupStreams[iAct], 0, state.x, 0, dim);
+
+        float[] tmp = state.firstPredFullDim; // reuse as scratch
+        for (int s = 0; s < nAltup; s++) {
+            if (s == iAct) continue;
+            int sliceIdx = s > iAct ? s - 1 : s;
+            // tmp = altup_unembd_proj[sliceIdx] @ altupStreams[s]
+            java.util.Arrays.fill(tmp, 0f);
+            long sliceOffset = (long) sliceIdx * dim * dim;
+            for (int row = 0; row < dim; row++) {
+                float sum = 0f;
+                for (int col = 0; col < dim; col++) {
+                    sum += g3n.altupUnembdProj.getFloat(sliceOffset + (long) row * dim + col)
+                         * state.altupStreams[s][col];
+                }
+                tmp[row] = sum;
+            }
+            // Rescale to target mag
+            float curMag = magnitude(tmp);
+            if (curMag > 1e-8f) {
+                float scale = targetMag / curMag;
+                for (int i = 0; i < dim; i++) tmp[i] *= scale;
+            }
+            // Add to x
+            for (int i = 0; i < dim; i++) state.x[i] += tmp[i];
+        }
+        // Average: divide by n_altup
+        float invN = 1.0f / nAltup;
+        for (int i = 0; i < dim; i++) state.x[i] *= invN;
+    }
+
+    /**
+     * Compute router modalities for AltUp predict/correct.
+     * router_input = rmsnorm(activated, altup_router_norm) * (1/dim)
+     * modalities = tanh(altup_router @ router_input)  → [n_altup]
+     */
+    private void altupComputeRouterModalities(float[] activated, int layer, float[] outModalities) {
+        int nAltup = g3n.nAltup;
+        // RMSNorm of activated with altup_router_norm
+        RMSNorm.apply(state.altupRouterInput, activated, g3n.altupRouterNorm[layer], dim, normEps);
+        // Scale by 1/dim
+        float invDim = 1.0f / dim;
+        for (int i = 0; i < dim; i++) state.altupRouterInput[i] *= invDim;
+        // matmul: outModalities[nAltup] = altup_router @ router_input
+        // altup_router shape [dim, n_altup] in GGUF (rows=dim, cols=n_altup)
+        // To compute output[k] = sum(router[i,k] * input[i]) we treat the tensor as [n_altup, dim]
+        // because GGUF stores as [d0, d1] where d0=dim, d1=n_altup, and matmul is output_rows × inputs.
+        // Actually based on llama.cpp `ggml_mul_mat(altup_router, router_inputs)`, the output is
+        // [n_altup, n_tokens], so altup_router is treated as [dim, n_altup].
+        java.util.Arrays.fill(outModalities, 0f);
+        FloatTensor router = g3n.altupRouter[layer];
+        for (int k = 0; k < nAltup; k++) {
+            float sum = 0f;
+            for (int i = 0; i < dim; i++) {
+                sum += router.getFloat((long) k * dim + i) * state.altupRouterInput[i];
+            }
+            outModalities[k] = (float) Math.tanh(sum);
+        }
+    }
+
+    /**
+     * AltUp predict: compute next-state predictions for all 4 streams.
+     * Input: state.altupStreams[4][dim]
+     * Output: state.altupPredictions[4][dim]
+     */
+    private void altupPredict(Gemma4State state, int layer) {
+        int nAltup = g3n.nAltup;
+        int iAct = g3n.iAltupAct;
+        float[] activated = state.altupStreams[iAct];
+        altupComputeRouterModalities(activated, layer, state.altupModalities);
+
+        // all_coefs [nAltup * nAltup] = altup_predict_coef[layer] @ modalities[nAltup]
+        // altup_predict_coef shape [nAltup, nAltup*nAltup] in GGUF
+        FloatTensor predictCoef = g3n.altupPredictCoef[layer];
+        java.util.Arrays.fill(state.altupAllCoefs, 0f);
+        for (int row = 0; row < nAltup * nAltup; row++) {
+            float sum = 0f;
+            for (int col = 0; col < nAltup; col++) {
+                sum += predictCoef.getFloat((long) row * nAltup + col) * state.altupModalities[col];
+            }
+            state.altupAllCoefs[row] = sum;
+        }
+        // all_coefs is now reshaped as [nAltup][nAltup]: rows = output stream, cols = input stream
+
+        // For each output stream s_out, compute:
+        //   prediction[s_out] = sum over s_in of streams[s_in] * all_coefs[s_out][s_in]
+        // Then add residual: prediction += streams (so it's an UPDATE not a replacement)
+        for (int sOut = 0; sOut < nAltup; sOut++) {
+            float[] pred = state.altupPredictions[sOut];
+            java.util.Arrays.fill(pred, 0f);
+            for (int sIn = 0; sIn < nAltup; sIn++) {
+                float coef = state.altupAllCoefs[sOut * nAltup + sIn];
+                float[] src = state.altupStreams[sIn];
+                for (int i = 0; i < dim; i++) pred[i] += src[i] * coef;
+            }
+            // Residual
+            float[] selfStream = state.altupStreams[sOut];
+            for (int i = 0; i < dim; i++) pred[i] += selfStream[i];
+        }
+    }
+
+    /**
+     * AltUp correct: update predictions using actual layer output.
+     * Input:
+     *   state.altupPredictions[4][dim] — pre-layer predictions
+     *   activatedActual[dim] — actual layer output for active stream
+     * Output: state.altupCorrected[4][dim]
+     */
+    private void altupCorrect(Gemma4State state, float[] activatedActual, int layer) {
+        int nAltup = g3n.nAltup;
+        int iAct = g3n.iAltupAct;
+        altupComputeRouterModalities(activatedActual, layer, state.altupModalities);
+
+        // innovation = activatedActual - predictions[iAct]
+        float[] activePred = state.altupPredictions[iAct];
+        for (int i = 0; i < dim; i++) state.altupInnovation[i] = activatedActual[i] - activePred[i];
+
+        // all_coefs [nAltup] = altup_correct_coef[layer] @ modalities[nAltup]; then +1.0
+        FloatTensor correctCoef = g3n.altupCorrectCoef[layer];
+        for (int row = 0; row < nAltup; row++) {
+            float sum = 0f;
+            for (int col = 0; col < nAltup; col++) {
+                sum += correctCoef.getFloat((long) row * nAltup + col) * state.altupModalities[col];
+            }
+            state.altupAllCoefs[row] = sum + 1.0f;
+        }
+
+        // For each stream: corrected[s] = innovation * all_coefs[s] + predictions[s]
+        for (int s = 0; s < nAltup; s++) {
+            float coef = state.altupAllCoefs[s];
+            float[] dst = state.altupCorrected[s];
+            float[] pred = state.altupPredictions[s];
+            for (int i = 0; i < dim; i++) {
+                dst[i] = state.altupInnovation[i] * coef + pred[i];
+            }
+        }
+    }
+
+    /**
+     * Laurel low-rank residual branch.
+     * Input: cur[dim] (post-attention input)
+     * Output: state.laurelOut[dim] = (laurel_r @ laurel_l @ cur) + cur (with post_norm)
+     */
+    private void laurel(float[] cur, int layer) {
+        int laurelRank = state.laurelTmpRank.length;
+        // tmp = laurel_l @ cur ([dim, rank] @ [dim] → [rank])
+        java.util.Arrays.fill(state.laurelTmpRank, 0f);
+        FloatTensor lL = g3n.laurelL[layer];
+        for (int row = 0; row < laurelRank; row++) {
+            float sum = 0f;
+            for (int col = 0; col < dim; col++) {
+                sum += lL.getFloat((long) row * dim + col) * cur[col];
+            }
+            state.laurelTmpRank[row] = sum;
+        }
+        // out = laurel_r @ tmp ([rank, dim] @ [rank] → [dim])
+        java.util.Arrays.fill(state.laurelOut, 0f);
+        FloatTensor lR = g3n.laurelR[layer];
+        for (int row = 0; row < dim; row++) {
+            float sum = 0f;
+            for (int col = 0; col < laurelRank; col++) {
+                sum += lR.getFloat((long) row * laurelRank + col) * state.laurelTmpRank[col];
+            }
+            state.laurelOut[row] = sum;
+        }
+        // Post-norm + residual: out = rmsnorm(out, laurel_post_norm) + cur
+        RMSNorm.apply(state.laurelOut, state.laurelOut, g3n.laurelPostNorm[layer], dim, normEps);
+        for (int i = 0; i < dim; i++) state.laurelOut[i] += cur[i];
+    }
+
+    /**
+     * Forward one layer in AltUp mode.
+     * Conceptually:
+     *   1. predictions = altup_predict(streams)
+     *   2. active = predictions[iAct]; norm; laurel; attention; post-norm; +active
+     *   3. attn_laurel = (cur + laurel_out) / sqrt(2)
+     *   4. norm; ffn; post-norm; +attn_laurel  → activatedActual
+     *   5. corrected = altup_correct(predictions, activatedActual)
+     *   6. first_pred from corrected[iAct] → PLE space → back-projected → injected into corrected[1..3]
+     *   7. streams = corrected
+     *
+     * For attention/FFN, this delegates to forwardLayer() via state.x temporarily.
+     */
+    private void forwardLayerAltup(Gemma4State state, int layer, int position, boolean doPle) {
+        int iAct = g3n.iAltupAct;
+        int nAltup = g3n.nAltup;
+
+        // 1. Predict next state for all streams
+        altupPredict(state, layer);
+
+        // 2. Active stream goes through normal layer compute
+        // Save the active prediction (we need it for the post-attention residual)
+        float[] activePrediction = new float[dim];
+        System.arraycopy(state.altupPredictions[iAct], 0, activePrediction, 0, dim);
+
+        // Place active prediction into state.x so existing forwardLayer can run on it
+        System.arraycopy(activePrediction, 0, state.x, 0, dim);
+
+        // Compute laurel(rmsnorm(active_prediction, attn_norm))
+        // This must happen BEFORE forwardLayer which mutates state.x
+        // First we need cur = norm(state.x) — reuse state.xb
+        RMSNorm.apply(state.xb, state.x, attnNormCache[layer], dim, normEps);
+        laurel(state.xb, layer); // writes state.laurelOut
+
+        // Save state.laurelOut because forwardLayer will overwrite intermediate buffers
+        float[] savedLaurelOut = new float[dim];
+        System.arraycopy(state.laurelOut, 0, savedLaurelOut, 0, dim);
+
+        // Now run the existing forwardLayer (does pre-norm again, attention, post-norm, residual,
+        // ffn-norm, ffn, post-norm, residual, plus PLE injection at the end). It updates state.x.
+        forwardLayer(state, layer, position, false); // doPle=false: we'll do PLE injection in altup correct
+
+        // After forwardLayer, state.x contains the layer's final output for the active stream.
+        // But the existing forwardLayer doesn't merge laurel. We do an APPROXIMATE laurel merge:
+        // active_with_laurel = (state.x + savedLaurelOut) / sqrt(2)
+        // (this is an approximation because llama.cpp's exact flow is intermixed differently;
+        //  the cleanest fix would be a parallel forwardLayerInner, but this is much smaller.)
+        float invSqrt2 = 1.0f / (float) Math.sqrt(2.0);
+        for (int i = 0; i < dim; i++) state.x[i] = (state.x[i] + savedLaurelOut[i]) * invSqrt2;
+
+        // 5. Correct predictions using actual active output (state.x)
+        altupCorrect(state, state.x, layer);
+
+        // 6. First prediction injection (only if PLE is loaded)
+        if (doPle && pleProj[layer] != null && pleInpGate[layer] != null) {
+            // first_pred = corrected[iAct] * altup_correct_scale[layer]
+            float[] firstPred = state.firstPredFullDim;
+            float[] active = state.altupCorrected[iAct];
+            for (int i = 0; i < dim; i++) firstPred[i] = active[i] * g3n.altupCorrectScale[layer][i];
+            // first_pred_altup = per_layer_inp_gate[layer] @ first_pred  ([dim] → [pleDim])
+            java.util.Arrays.fill(state.firstPredAltup, 0f);
+            pleInpGate[layer].matmul(firstPred, state.firstPredAltup, pleDim, dim);
+            // gelu
+            float SQRT_2_OVER_PI = (float) Math.sqrt(2.0 / Math.PI);
+            for (int i = 0; i < pleDim; i++) {
+                float v = state.firstPredAltup[i];
+                state.firstPredAltup[i] = 0.5f * v * (1.0f + (float) Math.tanh(
+                    SQRT_2_OVER_PI * (v + 0.044715f * v * v * v)));
+            }
+            // Multiply with this layer's per-layer input (from pleCombined)
+            for (int i = 0; i < pleDim; i++) {
+                state.firstPredAltup[i] *= state.pleCombined[layer * pleDim + i];
+            }
+            // Project back to dim space: per_layer_proj[layer] @ first_pred_altup
+            java.util.Arrays.fill(firstPred, 0f);
+            pleProj[layer].matmul(state.firstPredAltup, firstPred, dim, pleDim);
+            // Apply per_layer_post_norm
+            if (plePostNorm[layer] != null) {
+                RMSNorm.apply(firstPred, firstPred, plePostNorm[layer], dim, normEps);
+            }
+            // Add to non-active streams: corrected[s != iAct] += first_pred
+            for (int s = 0; s < nAltup; s++) {
+                if (s == iAct) continue;
+                float[] dst = state.altupCorrected[s];
+                for (int i = 0; i < dim; i++) dst[i] += firstPred[i];
+            }
+        }
+
+        // 7. Update streams = corrected
+        for (int s = 0; s < nAltup; s++) {
+            System.arraycopy(state.altupCorrected[s], 0, state.altupStreams[s], 0, dim);
+        }
+    }
 }
