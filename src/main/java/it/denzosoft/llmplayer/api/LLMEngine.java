@@ -603,18 +603,18 @@ public class LLMEngine implements AutoCloseable {
         ModelConfig config = loadedModel.config();
         // KNOWN INCOMPLETE SUPPORT: Gemma 3n (aka "Gemma 4") requires the AltUp (4 parallel
         // activation streams with learned router/predict/correct coefficients) and Laurel
-        // (low-rank residual) machinery — see llama.cpp gemma3n-iswa.cpp. LLMPlayer currently
-        // implements only the PLE (per-layer embeddings) sub-path; altup/laurel are absent.
-        // Empirically verified on gemma-3n-E4B-it-Q4_K_M: output is random multi-language
-        // tokens ("gill თ NN Sna Sho Sangio…"). Warn the user so they don't mistake the
-        // output for a working model. See Top-10 audit H10 for full implementation plan.
+        // (low-rank residual) machinery — see llama.cpp gemma3n-iswa.cpp. LLMPlayer's
+        // Gemma4InferenceEngine currently implements only the PLE (per-layer embeddings)
+        // sub-path; the AltUp + Laurel forward-pass plumbing is NOT yet wired up. The
+        // tensors ARE loaded below into a Gemma3nWeights bundle so a future commit can
+        // implement the forward pass without re-doing the loader work.
         System.err.println();
         System.err.println("  ====================================================================");
         System.err.println("  WARNING: Gemma 3n / Gemma 4 (PLE) support is INCOMPLETE.");
-        System.err.println("  Missing: AltUp (4-stream activations) and Laurel (low-rank residual).");
-        System.err.println("  Expected output: garbage tokens (random words, multiple languages).");
-        System.err.println("  This is an architectural gap, not a quantization issue.");
-        System.err.println("  Track: Top-10 audit H10 in commit history.");
+        System.err.println("  AltUp + Laurel weights are LOADED but the forward pass does not");
+        System.err.println("  yet use them. Expected output: garbage tokens (random multi-language).");
+        System.err.println("  See Gemma3nWeights.java for the full algorithm spec and tensor map.");
+        System.err.println("  Track: Top-10 audit H10 — see commit history for the full plan.");
         System.err.println("  ====================================================================");
         System.err.println();
         it.denzosoft.llmplayer.model.ModelWeights weights = loadedModel.weights();
@@ -657,6 +657,82 @@ public class LLMEngine implements AutoCloseable {
                 it.denzosoft.llmplayer.tensor.FloatTensor s = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.layerOutputScale(i));
                 if (s != null) layerOutputScale[i] = s.getFloat(0);
             }
+        }
+
+        // === H10: AltUp + Laurel tensor loading ===
+        // Loaded into a Gemma3nWeights bundle so the forward pass implementation
+        // (future commit) can access them via a single field. Currently the bundle
+        // is built but Gemma4InferenceEngine doesn't consume it (the warning above
+        // explains the limitation). Per llama.cpp gemma3n-iswa.cpp, n_altup=4 and
+        // i_altup_act=0 are constants for Gemma 3n.
+        it.denzosoft.llmplayer.tensor.FloatTensor altupProj =
+            ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.ALTUP_PROJ);
+        it.denzosoft.llmplayer.tensor.FloatTensor altupUnembdProj =
+            ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.ALTUP_UNEMBD_PROJ);
+        it.denzosoft.llmplayer.tensor.FloatTensor[] altupRouter =
+            new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        float[][] altupRouterNorm = new float[blockCount][];
+        it.denzosoft.llmplayer.tensor.FloatTensor[] altupPredictCoef =
+            new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        it.denzosoft.llmplayer.tensor.FloatTensor[] altupCorrectCoef =
+            new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        float[][] altupCorrectScale = new float[blockCount][];
+        it.denzosoft.llmplayer.tensor.FloatTensor[] laurelL =
+            new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        it.denzosoft.llmplayer.tensor.FloatTensor[] laurelR =
+            new it.denzosoft.llmplayer.tensor.FloatTensor[blockCount];
+        float[][] laurelPostNorm = new float[blockCount][];
+        for (int i = 0; i < blockCount; i++) {
+            altupRouter[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.altupRouter(i));
+            it.denzosoft.llmplayer.tensor.FloatTensor arn =
+                ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.altupRouterNorm(i));
+            if (arn != null) {
+                altupRouterNorm[i] = new float[config.embeddingLength()];
+                for (int j = 0; j < config.embeddingLength(); j++) altupRouterNorm[i][j] = arn.getFloat(j);
+            }
+            altupPredictCoef[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.altupPredictCoef(i));
+            altupCorrectCoef[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.altupCorrectCoef(i));
+            it.denzosoft.llmplayer.tensor.FloatTensor acs =
+                ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.altupCorrectScale(i));
+            if (acs != null) {
+                altupCorrectScale[i] = new float[config.embeddingLength()];
+                for (int j = 0; j < config.embeddingLength(); j++) altupCorrectScale[i][j] = acs.getFloat(j);
+            }
+            laurelL[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.laurelL(i));
+            laurelR[i] = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.laurelR(i));
+            it.denzosoft.llmplayer.tensor.FloatTensor lpn =
+                ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.laurelPostNorm(i));
+            if (lpn != null) {
+                laurelPostNorm[i] = new float[config.embeddingLength()];
+                for (int j = 0; j < config.embeddingLength(); j++) laurelPostNorm[i][j] = lpn.getFloat(j);
+            }
+        }
+        // Per-layer hasKv: Gemma 3n uses n_layer_kv_from_start=20 (E4B), so layers
+        // 0..19 have own KV and layers 20..34 reuse earlier KV. This is currently
+        // approximated by ModelConfig.sharedKvLayers but the proper value comes from
+        // gemma3n.attention.shared_kv_layers metadata or the n_layer_kv_from_start
+        // hparam. Build the boolean array here.
+        boolean[] hasKv = new boolean[blockCount];
+        int firstShared = blockCount - config.sharedKvLayers();
+        for (int i = 0; i < blockCount; i++) hasKv[i] = i < firstShared;
+
+        it.denzosoft.llmplayer.model.Gemma3nWeights gemma3nExtras = new it.denzosoft.llmplayer.model.Gemma3nWeights(
+            pleTokenEmbd, pleModelProj, pleProjNormWeights,
+            pleInpGate, pleProj, plePostNorm,
+            altupProj, altupUnembdProj,
+            altupRouter, altupRouterNorm,
+            altupPredictCoef, altupCorrectCoef, altupCorrectScale,
+            laurelL, laurelR, laurelPostNorm,
+            /*nAltup=*/ 4, /*iAltupAct=*/ 0,
+            /*nLayerSparsity=*/ 10, /*fSparsityStdMul=*/ 1.6448536f,
+            hasKv);
+
+        if (gemma3nExtras.isFullyLoaded()) {
+            System.err.println("  Gemma3n extras loaded: AltUp(" + (altupProj != null ? "✓" : "✗")
+                + " unembd=" + (altupUnembdProj != null ? "✓" : "✗")
+                + " router=" + (altupRouter[0] != null ? "✓" : "✗") + ") "
+                + "Laurel(" + (laurelL[0] != null ? "✓" : "✗") + ")");
+            System.err.println("  Note: weights loaded but forward pass does NOT yet use them (H10 pending).");
         }
 
         return new Gemma4InferenceEngine(config, weights, maxContextLength,
