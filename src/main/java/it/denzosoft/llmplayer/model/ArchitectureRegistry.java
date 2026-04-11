@@ -96,7 +96,7 @@ public final class ArchitectureRegistry {
     public static String ssmD(int layer) { return "blk." + layer + ".ssm_d"; }
     public static String ssmConv1dBias(int layer) { return "blk." + layer + ".ssm_conv1d.bias"; }
 
-    // Gemma 4 PLE (Per-Layer Embeddings)
+    // Gemma 4 / Gemma 3n PLE (Per-Layer Embeddings)
     public static final String PER_LAYER_TOKEN_EMBD = "per_layer_token_embd.weight";
     public static final String PER_LAYER_MODEL_PROJ = "per_layer_model_proj.weight";
     public static final String PER_LAYER_PROJ_NORM = "per_layer_proj_norm.weight";
@@ -104,4 +104,18 @@ public final class ArchitectureRegistry {
     public static String pleProj(int layer) { return "blk." + layer + ".proj.weight"; }
     public static String plePostNorm(int layer) { return "blk." + layer + ".post_norm.weight"; }
     public static String layerOutputScale(int layer) { return "blk." + layer + ".layer_output_scale.weight"; }
+
+    // Gemma 3n AltUp (multi-stream activations)
+    public static final String ALTUP_PROJ = "altup_proj.weight";
+    public static final String ALTUP_UNEMBD_PROJ = "altup_unembd_proj.weight";
+    public static String altupRouter(int layer) { return "blk." + layer + ".altup_router.weight"; }
+    public static String altupRouterNorm(int layer) { return "blk." + layer + ".altup_router_norm.weight"; }
+    public static String altupPredictCoef(int layer) { return "blk." + layer + ".altup_predict_coef.weight"; }
+    public static String altupCorrectCoef(int layer) { return "blk." + layer + ".altup_correct_coef.weight"; }
+    public static String altupCorrectScale(int layer) { return "blk." + layer + ".altup_correct_scale.weight"; }
+
+    // Gemma 3n Laurel (low-rank residual)
+    public static String laurelL(int layer) { return "blk." + layer + ".laurel_l.weight"; }
+    public static String laurelR(int layer) { return "blk." + layer + ".laurel_r.weight"; }
+    public static String laurelPostNorm(int layer) { return "blk." + layer + ".laurel_post_norm.weight"; }
 }
