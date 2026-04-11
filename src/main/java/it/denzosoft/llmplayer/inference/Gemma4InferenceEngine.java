@@ -793,41 +793,21 @@ public class Gemma4InferenceEngine {
         int iAct = g3n.iAltupAct;
         int nAltup = g3n.nAltup;
 
-        // 1. Predict next state for all streams
+        // 1. Predict next state for all streams (uses current state.altupStreams[*])
         altupPredict(state, layer);
 
-        // 2. Active stream goes through normal layer compute
-        // Save the active prediction (we need it for the post-attention residual)
-        float[] activePrediction = new float[dim];
-        System.arraycopy(state.altupPredictions[iAct], 0, activePrediction, 0, dim);
+        // 2. Active stream goes through dedicated Gemma 3n layer compute, in the
+        //    correct order: laurel branched off pre-attention, merged BETWEEN
+        //    attention and FFN. Result is the "activatedActual" used by altupCorrect.
+        float[] activePrediction = state.altupPredictions[iAct];
 
-        // Place active prediction into state.x so existing forwardLayer can run on it
-        System.arraycopy(activePrediction, 0, state.x, 0, dim);
+        // forwardLayerGemma3nInner writes the layer output into state.xb3 (so it doesn't
+        // disturb the residual stream state.x of the standard path).
+        forwardLayerGemma3nInner(state, layer, activePrediction, position);
+        // state.xb3 now contains the activatedActual
 
-        // Compute laurel(rmsnorm(active_prediction, attn_norm))
-        // This must happen BEFORE forwardLayer which mutates state.x
-        // First we need cur = norm(state.x) — reuse state.xb
-        RMSNorm.apply(state.xb, state.x, attnNormCache[layer], dim, normEps);
-        laurel(state.xb, layer); // writes state.laurelOut
-
-        // Save state.laurelOut because forwardLayer will overwrite intermediate buffers
-        float[] savedLaurelOut = new float[dim];
-        System.arraycopy(state.laurelOut, 0, savedLaurelOut, 0, dim);
-
-        // Now run the existing forwardLayer (does pre-norm again, attention, post-norm, residual,
-        // ffn-norm, ffn, post-norm, residual, plus PLE injection at the end). It updates state.x.
-        forwardLayer(state, layer, position, false); // doPle=false: we'll do PLE injection in altup correct
-
-        // After forwardLayer, state.x contains the layer's final output for the active stream.
-        // But the existing forwardLayer doesn't merge laurel. We do an APPROXIMATE laurel merge:
-        // active_with_laurel = (state.x + savedLaurelOut) / sqrt(2)
-        // (this is an approximation because llama.cpp's exact flow is intermixed differently;
-        //  the cleanest fix would be a parallel forwardLayerInner, but this is much smaller.)
-        float invSqrt2 = 1.0f / (float) Math.sqrt(2.0);
-        for (int i = 0; i < dim; i++) state.x[i] = (state.x[i] + savedLaurelOut[i]) * invSqrt2;
-
-        // 5. Correct predictions using actual active output (state.x)
-        altupCorrect(state, state.x, layer);
+        // 5. Correct predictions using actual active output
+        altupCorrect(state, state.xb3, layer);
 
         // 6. First prediction injection (only if PLE is loaded)
         if (doPle && pleProj[layer] != null && pleInpGate[layer] != null) {
@@ -867,6 +847,232 @@ public class Gemma4InferenceEngine {
         // 7. Update streams = corrected
         for (int s = 0; s < nAltup; s++) {
             System.arraycopy(state.altupCorrected[s], 0, state.altupStreams[s], 0, dim);
+        }
+    }
+
+    /**
+     * Dedicated single-layer forward for Gemma 3n active stream.
+     *
+     * <p>Correct order per llama.cpp gemma3n-iswa.cpp:
+     * <pre>
+     *   cur = norm(active_prediction, attn_norm)
+     *   laurel_out = laurel(cur)         ← computed on the SAME pre-norm output
+     *   Q,K,V = wq/wk/wv @ cur (or shared KV if !has_kv)
+     *   Q = q_norm(Q) per-head
+     *   K = k_norm(K) per-head
+     *   V = rms_norm(V, no scale) per-head    ← V-norm (NEW)
+     *   apply RoPE to Q,K
+     *   attention(Q,K,V) → attn_out
+     *   attn_out = wo @ attn_out
+     *   attn_out = post_attn_norm(attn_out)
+     *   cur = attn_out + active_prediction         ← residual with PREDICTION not state.x
+     *   attn_laurel = (cur + laurel_out) / sqrt(2) ← laurel merged HERE
+     *   cur = norm(attn_laurel, ffn_norm)          ← FFN takes attn_laurel as input
+     *   gate = wGate @ cur
+     *   if (layer &lt; n_layer_sparsity) gate = gaussianTopK(gate)  ← activation sparsity
+     *   gate = gelu(gate)
+     *   up = wUp @ cur
+     *   h = gate * up
+     *   cur = wDown @ h
+     *   cur = post_ffn_norm(cur)
+     *   activatedActual = cur + attn_laurel        ← residual with attn_laurel
+     * </pre>
+     *
+     * <p>Output is written to {@code state.xb3} (so the standard {@code state.x}
+     * residual stream is not touched).
+     */
+    private void forwardLayerGemma3nInner(Gemma4State state, int layer, float[] activePrediction, int position) {
+        TransformerLayerWeights lw = weights.layers()[layer];
+        boolean hasOwnKv = g3n.hasKv != null ? g3n.hasKv[layer] : (layer < blockCount - sharedKvLayers);
+        boolean isSwa = isSwaLayer(layer);
+        RoPE rope = isSwa ? ropeSwa : ropeFull;
+        int headSize = isSwa ? headSizeSwa : headSizeFull;
+        int qDim = headCount * headSize;
+        int kvDim = headCountKV * headSize;
+
+        // === 1. Pre-attention norm of active prediction (into state.xb) ===
+        RMSNorm.apply(state.xb, activePrediction, attnNormCache[layer], dim, normEps);
+
+        // === 2. Laurel branch (computed on the same pre-norm output) ===
+        // Writes to state.laurelOut. Must happen BEFORE attention because attention reuses xb buffers.
+        laurel(state.xb, layer);
+        // Save laurel out to a stable buffer (state.firstPredFullDim is unused at this point)
+        float[] savedLaurel = state.firstPredFullDim;
+        System.arraycopy(state.laurelOut, 0, savedLaurel, 0, dim);
+
+        // === 3. Q projection ===
+        final float[] qBuf = state.qLarge;
+        final float[] kBuf = state.kLarge;
+        final float[] vBuf = state.vLarge;
+        final float[] xb2Buf = state.xb2Large;
+        Arrays.fill(qBuf, 0, qDim, 0f);
+        lw.wq().matmulParallel(state.xb, qBuf, qDim, dim);
+
+        // QK-norm on Q (per-head)
+        if (qNormCache[layer] != null) {
+            for (int h = 0; h < headCount; h++) {
+                RMSNorm.apply(qBuf, h * headSize, qBuf, h * headSize, qNormCache[layer], headSize, normEps);
+            }
+        }
+        rope.applyAllHeads(qBuf, headCount, position);
+
+        // === 4. K/V projection (conditional on hasOwnKv) ===
+        int kvLayer = kvSourceLayer[layer];
+        if (hasOwnKv) {
+            Arrays.fill(kBuf, 0, kvDim, 0f);
+            Arrays.fill(vBuf, 0, kvDim, 0f);
+            lw.wk().matmulParallel(state.xb, kBuf, kvDim, dim);
+            lw.wv().matmulParallel(state.xb, vBuf, kvDim, dim);
+
+            // QK-norm on K
+            if (kNormCache[layer] != null) {
+                for (int h = 0; h < headCountKV; h++) {
+                    RMSNorm.apply(kBuf, h * headSize, kBuf, h * headSize, kNormCache[layer], headSize, normEps);
+                }
+            }
+            // V-norm: rms_norm without learnable scale (Gemma 3n specific)
+            for (int h = 0; h < headCountKV; h++) {
+                RMSNorm.applyNoScale(vBuf, h * headSize, headSize, normEps);
+            }
+            rope.applyAllHeads(kBuf, headCountKV, position);
+
+            // Store K/V in per-layer cache
+            int kvCacheDim = state.gemma4KvCache.kvDim(layer);
+            System.arraycopy(kBuf, 0, state.gemma4KvCache.keyLayer(layer), position * kvCacheDim, kvDim);
+            System.arraycopy(vBuf, 0, state.gemma4KvCache.valueLayer(layer), position * kvCacheDim, kvDim);
+        }
+
+        // === 5. Attention ===
+        final int hs = headSize;
+        final int startPos = (isSwa && slidingWindow > 0) ? Math.max(0, position - slidingWindow + 1) : 0;
+        final int seqLen = position + 1;
+        final int kvCacheDim = state.gemma4KvCache.kvDim(kvLayer);
+        final float[] keyCache = state.gemma4KvCache.keyLayer(kvLayer);
+        final float[] valueCache = state.gemma4KvCache.valueLayer(kvLayer);
+
+        java.util.stream.IntStream.range(0, headCount).parallel().forEach(h -> {
+            int kvHead = h / kvMul;
+            int qOffset = h * hs;
+            for (int t = startPos; t < seqLen; t++) {
+                float score = 0f;
+                int kOffset = t * kvCacheDim + kvHead * hs;
+                for (int i = 0; i < hs; i++) {
+                    score += qBuf[qOffset + i] * keyCache[kOffset + i];
+                }
+                state.att[h * maxSeqLen + t] = score;
+            }
+            // Softmax
+            float maxVal = Float.NEGATIVE_INFINITY;
+            for (int t = startPos; t < seqLen; t++) {
+                if (state.att[h * maxSeqLen + t] > maxVal) maxVal = state.att[h * maxSeqLen + t];
+            }
+            float sum = 0f;
+            for (int t = startPos; t < seqLen; t++) {
+                float v = (float) Math.exp(state.att[h * maxSeqLen + t] - maxVal);
+                state.att[h * maxSeqLen + t] = v;
+                sum += v;
+            }
+            float invSum = 1.0f / sum;
+            for (int t = startPos; t < seqLen; t++) state.att[h * maxSeqLen + t] *= invSum;
+            // Weighted V sum
+            int outOffset = h * hs;
+            for (int i = 0; i < hs; i++) {
+                float val = 0f;
+                for (int t = startPos; t < seqLen; t++) {
+                    val += state.att[h * maxSeqLen + t] * valueCache[t * kvCacheDim + kvHead * hs + i];
+                }
+                xb2Buf[outOffset + i] = val;
+            }
+        });
+
+        // === 6. Wo projection (into state.xb) ===
+        Arrays.fill(state.xb, 0);
+        lw.wo().matmulParallel(xb2Buf, state.xb, dim, qDim);
+
+        // === 7. Post-attention norm ===
+        if (postAttnNormCache[layer] != null) {
+            RMSNorm.apply(state.xb, state.xb, postAttnNormCache[layer], dim, normEps);
+        }
+
+        // === 8. Residual with active_prediction ===
+        // cur = post_attn_norm(attn_out) + active_prediction
+        for (int i = 0; i < dim; i++) state.xb[i] += activePrediction[i];
+
+        // === 9. Laurel merge: attn_laurel = (cur + laurel_out) / sqrt(2) ===
+        // Stash attn_laurel in state.xb3 — we need it both as FFN input and as final residual.
+        float invSqrt2 = 1.0f / (float) Math.sqrt(2.0);
+        for (int i = 0; i < dim; i++) state.xb3[i] = (state.xb[i] + savedLaurel[i]) * invSqrt2;
+
+        // === 10. Pre-FFN norm (norm of attn_laurel into state.xb) ===
+        RMSNorm.apply(state.xb, state.xb3, ffnNormCache[layer], dim, normEps);
+
+        // === 11. GeGLU FFN with optional activation sparsity ===
+        Arrays.fill(state.hb, 0, ffnDim, 0f);
+        Arrays.fill(state.hb2, 0, ffnDim, 0f);
+        if (lw.wGate() != null) {
+            lw.wGate().matmulParallel(state.xb, state.hb, ffnDim, dim);
+        }
+        lw.wUp().matmulParallel(state.xb, state.hb2, ffnDim, dim);
+
+        // Activation sparsity (gaussian top-k) on the gate, only for the first n_layer_sparsity layers
+        if (layer < g3n.nLayerSparsity) {
+            gaussianTopK(state.hb, ffnDim, g3n.fSparsityStdMul);
+        }
+
+        // GELU on gate then element-wise multiply with up
+        for (int i = 0; i < ffnDim; i++) {
+            float xv = state.hb[i];
+            state.hb[i] = 0.5f * xv * (1.0f + (float) Math.tanh(
+                0.7978845608028654f * (xv + 0.044715f * xv * xv * xv)));
+            state.hb[i] *= state.hb2[i];
+        }
+
+        // Down projection (into state.xb)
+        Arrays.fill(state.xb, 0);
+        lw.wDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
+
+        // === 12. Post-FFN norm ===
+        if (postFfnNormCache[layer] != null) {
+            RMSNorm.apply(state.xb, state.xb, postFfnNormCache[layer], dim, normEps);
+        }
+
+        // === 13. Final residual: activatedActual = post_ffn_norm(ffn_out) + attn_laurel ===
+        // attn_laurel is in state.xb3; we want activatedActual in state.xb3 too.
+        for (int i = 0; i < dim; i++) state.xb3[i] += state.xb[i];
+        // state.xb3 now contains activatedActual — caller (forwardLayerAltup) reads from here.
+    }
+
+    /**
+     * Gaussian top-k activation sparsity (Gemma 3n FFN).
+     *
+     * <p>For a vector {@code x} of length n:
+     * <pre>
+     *   mean = sum(x) / n
+     *   variance = sum((x - mean)^2) / (n - 1)   // Bessel's correction
+     *   std = sqrt(variance)
+     *   cutoff = mean + std * f_sparsity_std_mul
+     *   x[i] = max(0, x[i] - cutoff)             // ReLU
+     * </pre>
+     * Effectively keeps only neurons in the top tail of the Gaussian.
+     */
+    private static void gaussianTopK(float[] x, int n, float fSparsityStdMul) {
+        // 1. mean
+        float sum = 0f;
+        for (int i = 0; i < n; i++) sum += x[i];
+        float mean = sum / n;
+        // 2. variance with Bessel's correction (n-1)
+        float varSum = 0f;
+        for (int i = 0; i < n; i++) {
+            float d = x[i] - mean;
+            varSum += d * d;
+        }
+        float std = (float) Math.sqrt(varSum / (n - 1));
+        // 3. cutoff
+        float cutoff = mean + std * fSparsityStdMul;
+        // 4. relu(x - cutoff)
+        for (int i = 0; i < n; i++) {
+            float v = x[i] - cutoff;
+            x[i] = v > 0f ? v : 0f;
         }
     }
 }
