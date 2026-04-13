@@ -93,12 +93,11 @@ public abstract class CudaFloatTensor extends FloatTensor {
             MemorySegment.copy(out, 0, outputHost, ValueLayout.JAVA_FLOAT, 0, rows);
             cudaContext.writeBuffer(outputPtr, outputHost, outputBytes);
 
-            // Build kernel params and launch (warp-per-row: 32 threads per row)
+            // Build kernel params and launch
             MemorySegment params = buildKernelParams(tempArena, weightPtr, inputPtr, outputPtr, rows, cols, 1);
-            long maxBlockSize = Math.min(256, cudaContext.getDeviceInfo().maxWorkGroupSize());
-            long blockSize = computeEffectiveCudaBlockSize(cols, maxBlockSize);
-            long rowsPerBlock = blockSize / 32;
-            long globalSize = ((rows + rowsPerBlock - 1) / rowsPerBlock) * blockSize;
+            long blockSize = getMatmulBlockDim(cols);
+            int gridDim = getMatmulGridDim(rows, cols);
+            long globalSize = (long) gridDim * blockSize;
             int smBytes = computeSharedMemBytes(cols, blockSize);
             cudaContext.launchKernel1D(function, globalSize, blockSize, smBytes, params);
             cudaContext.finish();
@@ -161,10 +160,10 @@ public abstract class CudaFloatTensor extends FloatTensor {
         long weightPtr = getGpuWeights();
 
         MemorySegment params = buildKernelParams(tempArena, weightPtr, gpuInput, gpuOutput, rows, cols, addToOutput ? 1 : 0);
-        long maxBlockSize = Math.min(256, cudaContext.getDeviceInfo().maxWorkGroupSize());
-        long blockSize = computeEffectiveCudaBlockSize(cols, maxBlockSize);
-        long rowsPerBlock = blockSize / 32;
-        long globalSize = ((rows + rowsPerBlock - 1) / rowsPerBlock) * blockSize;
+        long blockSize = getMatmulBlockDim(cols);
+        // gridDim count via override (allows multi-warp-per-row kernels like Q4_K 2warp)
+        int gridDim = getMatmulGridDim(rows, cols);
+        long globalSize = (long) gridDim * blockSize;
         int smBytes = computeSharedMemBytes(cols, blockSize);
         if (onStream != null) {
             cudaContext.launchKernel1DOnStream(function, globalSize, blockSize, smBytes, params, onStream);

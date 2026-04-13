@@ -22,8 +22,6 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
         "true".equals(System.getProperty("cuda.q4k.smem", "false"));
     private static final boolean USE_2WARP =
         "true".equals(System.getProperty("cuda.q4k.2warp", "false"));
-    private static final boolean USE_MULTIBLOCK =
-        "true".equals(System.getProperty("cuda.q4k.multiblock", "false"));
 
     public Q4_KCudaTensor(TensorData data, long size, CudaBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -35,7 +33,6 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
     @Override
     protected String kernelResourcePath() {
         if (USE_2WARP) return "kernels/cuda/matmul_q4_k_2warp.cu";
-        if (USE_MULTIBLOCK) return "kernels/cuda/matmul_q4_k_multiblock.cu";
         if (USE_SMEM) return "kernels/cuda/matmul_q4_k_smem.cu";
         return USE_COALESCED ? "kernels/cuda/matmul_q4_k_coalesced.cu" : "kernels/cuda/matmul_q4_k.cu";
     }
@@ -43,7 +40,6 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
     @Override
     protected String kernelName() {
         if (USE_2WARP) return "matmul_q4_k_2warp";
-        if (USE_MULTIBLOCK) return "matmul_q4_k_multiblock";
         if (USE_SMEM) return "matmul_q4_k_smem";
         return USE_COALESCED ? "matmul_q4_k_coalesced" : "matmul_q4_k";
     }

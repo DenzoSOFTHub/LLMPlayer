@@ -375,6 +375,8 @@ public class ApiHandler {
         gen.put("totalPromptTokens", m.getTotalPromptTokens());
         gen.put("lastTokensPerSecond", Math.round(m.getLastTokensPerSecond() * 10.0) / 10.0);
         gen.put("averageTokensPerSecond", Math.round(m.getAverageTokensPerSecond() * 10.0) / 10.0);
+        gen.put("recentTokensPerSecond", Math.round(m.getRecentTokensPerSecond() * 10.0) / 10.0);
+        gen.put("recentSampleCount", m.getRecentSampleCount());
         gen.put("lastGenerationTimeMs", m.getLastGenerationTimeMs());
         gen.put("totalGenerationTimeMs", m.getTotalGenerationTimeMs());
         result.put("generation", gen);

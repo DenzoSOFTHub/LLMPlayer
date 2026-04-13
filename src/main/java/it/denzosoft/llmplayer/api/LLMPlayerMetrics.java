@@ -44,6 +44,12 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
     private final AtomicReference<Double> lastTokPerSec = new AtomicReference<>(0.0);
     private final AtomicLong lastGenerationTimeMs = new AtomicLong();
 
+    // Rolling window for recent tok/s (60 second window)
+    private static final long ROLLING_WINDOW_MS = 60_000L;
+    private static final int MAX_SAMPLES = 256;
+    private final java.util.ArrayDeque<long[]> recentSamples = new java.util.ArrayDeque<>(); // [timestampMs, tokens, durationMs]
+    private final Object samplesLock = new Object();
+
     // Singleton per JVM
     private static volatile LLMPlayerMetrics instance;
 
@@ -110,6 +116,21 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         totalGenerationTimeMs.addAndGet(timeMs);
         lastTokPerSec.set(tokPerSec);
         lastGenerationTimeMs.set(timeMs);
+
+        // Add to rolling window
+        long now = System.currentTimeMillis();
+        synchronized (samplesLock) {
+            recentSamples.addLast(new long[]{now, genTokens, timeMs});
+            // Drop samples older than the window or beyond capacity
+            while (!recentSamples.isEmpty()) {
+                long[] head = recentSamples.peekFirst();
+                if (now - head[0] > ROLLING_WINDOW_MS || recentSamples.size() > MAX_SAMPLES) {
+                    recentSamples.removeFirst();
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /** Called when model is unloaded. */
@@ -128,6 +149,7 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         lastTokPerSec.set(0.0);
         lastGenerationTimeMs.set(0);
         cudaContext = null;
+        synchronized (samplesLock) { recentSamples.clear(); }
     }
 
     // --- Model info ---
@@ -153,6 +175,34 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         long tokens = totalTokensGenerated.get();
         long timeMs = totalGenerationTimeMs.get();
         return timeMs > 0 ? tokens * 1000.0 / timeMs : 0.0;
+    }
+
+    @Override
+    public double getRecentTokensPerSecond() {
+        long now = System.currentTimeMillis();
+        long totalTokens = 0;
+        long totalDurMs = 0;
+        synchronized (samplesLock) {
+            for (long[] s : recentSamples) {
+                if (now - s[0] <= ROLLING_WINDOW_MS) {
+                    totalTokens += s[1];
+                    totalDurMs += s[2];
+                }
+            }
+        }
+        return totalDurMs > 0 ? totalTokens * 1000.0 / totalDurMs : 0.0;
+    }
+
+    @Override
+    public int getRecentSampleCount() {
+        long now = System.currentTimeMillis();
+        int count = 0;
+        synchronized (samplesLock) {
+            for (long[] s : recentSamples) {
+                if (now - s[0] <= ROLLING_WINDOW_MS) count++;
+            }
+        }
+        return count;
     }
 
     // --- Memory ---

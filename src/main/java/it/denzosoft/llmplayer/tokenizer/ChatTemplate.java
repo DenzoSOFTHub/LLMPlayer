@@ -11,6 +11,8 @@ public class ChatTemplate {
     private final String chatTemplate;
     // GLM-4.7-Flash uses DEEPSEEK2 GGUF architecture but needs GLM4 chat format
     private final boolean isGlmVariant;
+    // Olmo 3 uses olmo2 GGUF architecture but ships a ChatML-style chat template
+    private final boolean isOlmo3ChatML;
     // Thinking/reasoning mode: when true, models with <think> support will reason before answering.
     // Affects SmolLM3 (/think system msg), Qwen3 (no suppressor), Qwen3.5 (remove suppressor).
     private boolean thinkingEnabled;
@@ -22,6 +24,10 @@ public class ChatTemplate {
         this.isGlmVariant = architecture == ModelArchitecture.DEEPSEEK2
                 && chatTemplate != null
                 && (chatTemplate.contains("[gMASK]") || chatTemplate.contains("<|user|>"));
+        // Detect Olmo 3 (uses olmo2 GGUF arch but ChatML-style template with <|im_start|>)
+        this.isOlmo3ChatML = architecture == ModelArchitecture.OLMO2
+                && chatTemplate != null
+                && chatTemplate.contains("<|im_start|>");
     }
 
     public void setThinkingEnabled(boolean enabled) { this.thinkingEnabled = enabled; }
@@ -368,17 +374,36 @@ public class ChatTemplate {
         return sb.toString();
     }
 
-    // OLMo2 format
+    // OLMo2 format (Olmo 3 uses ChatML — see isOlmo3ChatML)
     private String formatOLMo2(String userMessage) {
+        if (isOlmo3ChatML) {
+            // Olmo 3's Jinja template injects a default system prompt when none is given.
+            // We replicate it verbatim so the model sees the same context it was trained on.
+            return "<|im_start|>system\nYou are a helpful function-calling AI assistant. You do not currently have access to any functions. <functions></functions><|im_end|>\n"
+                    + "<|im_start|>user\n" + userMessage + "<|im_end|>\n"
+                    + "<|im_start|>assistant\n";
+        }
         return "<|user|>\n" + userMessage + "\n<|assistant|>\n";
     }
 
     private String formatOLMo2Chat(String systemMessage, String userMessage) {
+        if (isOlmo3ChatML) {
+            return "<|im_start|>system\n" + systemMessage + "<|im_end|>\n<|im_start|>user\n"
+                    + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
+        }
         return "<|system|>\n" + systemMessage + "\n<|user|>\n" + userMessage + "\n<|assistant|>\n";
     }
 
     private String formatOLMo2Conversation(List<String[]> messages) {
         StringBuilder sb = new StringBuilder();
+        if (isOlmo3ChatML) {
+            for (String[] msg : messages) {
+                sb.append("<|im_start|>").append(msg[0]).append("\n");
+                sb.append(msg[1]).append("<|im_end|>\n");
+            }
+            sb.append("<|im_start|>assistant\n");
+            return sb.toString();
+        }
         for (String[] msg : messages) {
             sb.append("<|").append(msg[0]).append("|>\n");
             sb.append(msg[1]).append("\n");

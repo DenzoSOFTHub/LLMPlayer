@@ -24,6 +24,8 @@ public interface LLMPlayerMXBean {
     long getTotalPromptTokens();
     double getLastTokensPerSecond();
     double getAverageTokensPerSecond();
+    double getRecentTokensPerSecond();   // 60-second rolling window
+    int getRecentSampleCount();           // generations counted in rolling window
     long getLastGenerationTimeMs();
     long getTotalGenerationTimeMs();
 

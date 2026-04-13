@@ -356,6 +356,12 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     public static boolean isSupported(ModelConfig config, NemotronHWeights weights) {
         if (weights.layers().length == 0) return false;
+        // Granite Hybrid uses embeddingScale/attentionScale/residualScale/logitScale
+        // which are NOT applied in this CUDA forward pass — would produce wrong output.
+        // Fall back to CPU until the scaling is wired through the GPU kernels.
+        if (config.embeddingScale() > 0f || config.residualScale() > 0f || config.attentionScale() > 0f) {
+            return false;
+        }
         for (int i = 0; i < Math.min(3, weights.layers().length); i++) {
             NemotronHLayerWeights lw = weights.layers()[i];
             FloatTensor t = lw.isMamba() ? lw.ssmIn() : lw.isAttention() ? lw.wq() : lw.ffnUp();

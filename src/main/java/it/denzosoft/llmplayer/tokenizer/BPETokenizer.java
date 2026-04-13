@@ -243,6 +243,34 @@ public class BPETokenizer implements Tokenizer {
     @Override
     public String decode(int[] tokens) {
         StringBuilder sb = new StringBuilder();
+        // SentencePiece-mode (Gemma 4): coalesce consecutive <0xHH> byte tokens so multi-byte
+        // UTF-8 chars (e.g. 'é' = 0xC3 0xA9) decode correctly.
+        if (!useGpt2ByteMapping) {
+            java.util.ArrayList<Byte> pendingBytes = new java.util.ArrayList<>();
+            for (int token : tokens) {
+                if (token < 0 || token >= vocab.length) continue;
+                String piece = vocab[token];
+                if (piece.length() == 6 && piece.startsWith("<0x") && piece.charAt(5) == '>') {
+                    try {
+                        pendingBytes.add((byte) Integer.parseInt(piece.substring(3, 5), 16));
+                        continue;
+                    } catch (NumberFormatException ignored) { }
+                }
+                if (!pendingBytes.isEmpty()) {
+                    byte[] arr = new byte[pendingBytes.size()];
+                    for (int i = 0; i < arr.length; i++) arr[i] = pendingBytes.get(i);
+                    sb.append(new String(arr, StandardCharsets.UTF_8));
+                    pendingBytes.clear();
+                }
+                sb.append(decodeTokenPiece(piece));
+            }
+            if (!pendingBytes.isEmpty()) {
+                byte[] arr = new byte[pendingBytes.size()];
+                for (int i = 0; i < arr.length; i++) arr[i] = pendingBytes.get(i);
+                sb.append(new String(arr, StandardCharsets.UTF_8));
+            }
+            return sb.toString();
+        }
         for (int token : tokens) {
             sb.append(decode(token));
         }
@@ -260,7 +288,19 @@ public class BPETokenizer implements Tokenizer {
     private String decodeTokenPiece(String piece) {
         // Check if it's a special token
         if (piece.startsWith("<") && piece.endsWith(">")) {
+            // SentencePiece byte fallback token <0xHH>
+            if (!useGpt2ByteMapping && piece.length() == 6 && piece.startsWith("<0x")) {
+                try {
+                    int byteVal = Integer.parseInt(piece.substring(3, 5), 16);
+                    return new String(new byte[]{(byte) byteVal}, StandardCharsets.ISO_8859_1);
+                } catch (NumberFormatException ignored) { }
+            }
             return piece;
+        }
+        // Gemma 4 / SentencePiece-style tokens: vocab strings are already UTF-8.
+        // Just replace U+2581 (▁) with space.
+        if (!useGpt2ByteMapping) {
+            return piece.replace('\u2581', ' ');
         }
         // Convert byte-level BPE back to actual bytes
         // Allocate extra space since chars may produce multi-byte UTF-8
