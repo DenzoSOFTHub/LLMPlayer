@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2, Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine (v1.10.2) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -34,6 +34,8 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --ena
 Unit test directory exists but is empty (no JUnit dependency to preserve zero-deps). Test scripts:
 - `test-architectures.sh` — smoke test that loads each supported architecture (Llama, Qwen2/3/3.5, Gemma 2/3/3n/4, Phi-3/4, Mistral3, OLMo2, Falcon3, Granite 3.3, Granite Hybrid, Nemotron-H, SmolLM3, DeepSeek2, Qwen3MoE) and verifies it can generate at least one token. Auto-detects Java 21+. Run with `./test-architectures.sh` for CPU-only or `./test-architectures.sh --gpu` for GPU mode. Set `INCLUDE_LARGE=1` to include 30B+ MoE models.
 - `test-openai-api.sh` — integration tests for the OpenAI-compatible API (requires a running server: `./run.sh --web`, then `bash test-openai-api.sh`). Tests cover 6 architectures with streaming, non-streaming, multi-turn, system messages, CORS, error handling, and Bearer token acceptance.
+- `autosearch.sh <model.gguf> [runs] [min_ppl]` — Karpathy-style automated kernel-config search. Greedy coordinate ascent over all `-D` flags (CUDA kernel variants, KV cache quant, matmul mode, etc.). Two KPIs: tok/s and PPL. Writes a Pareto-optimal config to `autosearch-results.txt`.
+- `test-ppl-sweep.sh` / `test-cpu-sweep.sh` — quality regression sweeps. Loads a list of GGUF models, runs them through a canonical prompt, prints aggregate PPL per model. Use to detect quality regressions across a release.
 
 `run.sh` (Linux/macOS) and `run.bat` (Windows) are launcher scripts with all required JVM flags for Java 25, but they are **not checked into the repo** (excluded via `.gitignore`). Create them locally — see README.md for the script contents.
 
@@ -108,8 +110,11 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 2. **DeepSeek2** (`DeepSeek2InferenceEngine`): DeepSeek2 and GLM-4.7-Flash (also uses `deepseek2` GGUF arch). Uses MLA (Multi-Head Latent Attention) + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 3. **Qwen3 MoE** (`Qwen3MoEInferenceEngine`): Qwen3-Coder-30B-A3B and similar. Standard GQA attention with QK-norm + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 4. **Qwen3.5** (`Qwen35InferenceEngine`): Hybrid DeltaNet + full attention architecture. Alternates Gated DeltaNet (linear attention/SSM) and standard GQA layers in a 3:1 ratio (`full_attention_interval=4`). DeltaNet layers use recurrent state `S` with update rule `S_new = alpha*S + beta*outer(k, v - alpha*S^T@k)`, output `o = S^T_new @ q`. Full attention layers use a packed Q+gate projection where `wq` outputs interleaved `[Q_h0, gate_h0, Q_h1, gate_h1, ...]` — these must be deinterleaved into separate Q and gate arrays before use. Gate is applied as `sigmoid(gate) * attn_output`. Both layer types include short conv1d (width 4) on Q/K and use QK-norm. State is maintained per-layer in `Qwen35State`.
-5. **Nemotron-H / Granite Hybrid** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Granite Hybrid adds embedding/attention/residual/logit scaling and integrated SwiGLU FFN (with separate ffn_norm) inside Mamba and Attention layers.
-6. **Gemma 4 / Gemma 3n** (`Gemma4InferenceEngine`): For PLE (Per-Layer Embeddings) models (E2B/E4B). Features: per-layer token embedding/projection tensors, dual headSize (SWA=256, full=512 per-layer), shared KV cache (layers 24-41 reuse KV from layers 6-23), V-norm (RMSNorm without learnable scale on V), dual RoPE (SWA theta=10K, full theta=1M with proportional frequency factors), K-norm with (1+w) weight adjustment, attention scale=1.0, logit soft-capping, layer output scaling. Uses `Gemma4State` with variable-size buffers per layer.
+5. **Nemotron-H / Granite Hybrid** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Granite Hybrid adds embedding/attention/residual/logit scaling and integrated SwiGLU FFN (with separate ffn_norm) inside Mamba and Attention layers. **Note**: GPU forward pass is currently disabled for Granite Hybrid (CPU fallback) because the scaling factors aren't propagated to the GPU kernels — `isSupported()` returns `false` when any of `embeddingScale/residualScale/attentionScale > 0`.
+6. **Gemma 4 / Gemma 3n** (`Gemma4InferenceEngine`): For PLE (Per-Layer Embeddings) models (E2B/E4B). Two sub-paths in one engine, dispatched by whether `Gemma3nWeights` has AltUp tensors loaded:
+   - **Gemma 3n** (arch=GEMMA3N): full **AltUp** (4 parallel activation streams with learned router/predict/correct coefficients) + **Laurel** (low-rank residual branch) + **Gaussian top-k activation sparsity** (first 10 FFN layers) + PLE in `forwardLayerGemma3nInner` + `forwardLayerAltup`. K-norm uses `(1+w)` adjustment.
+   - **Gemma 4** (arch=GEMMA4): simpler PLE-only path in `forwardLayer` (no AltUp/Laurel/sparsity). Per llama.cpp `gemma4-iswa.cpp`: **V-norm** (`ggml_rms_norm` on V, no learnable scale), **`layer_output_scale.weight`** per-layer scalar applied as final `cur *= scale` multiplication. K-norm stored as final values (no `(1+w)`).
+   - Common to both: per-layer token embedding/projection tensors, dual headSize (SWA=256, full=512 per-layer), shared KV cache (layers ≥ blockCount-sharedKvLayers reuse earlier layers' KV), dual RoPE (SWA theta=10K, full theta=1M with proportional frequency factors), attention scale=1.0, logit soft-capping. Uses `Gemma4State` with variable-size buffers per layer.
 
 ### Tensor system
 
@@ -117,7 +122,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 
 ### Tokenizer dispatch
 
-`TokenizerFactory` reads `tokenizer.ggml.model` from GGUF metadata: `"gpt2"` or `"bpe"` → `BPETokenizer` (uses merge table, Llama 3 style pre-tokenization regex), anything else → `SentencePieceTokenizer` (score-based). Chat formatting is architecture-specific in `ChatTemplate`, with distinct templates for Llama (`<|start_header_id|>`), Qwen2/3/Qwen3MoE (`<|im_start|>`), GLM4 (`[gMASK]<sop>`), DeepSeek2 (`User: ... Assistant:`), Phi-3/4 (`<|user|>`), and Mistral3 (`[INST]`).
+`TokenizerFactory` reads `tokenizer.ggml.model` from GGUF metadata: `"gpt2"` or `"bpe"` → `BPETokenizer` (uses merge table, Llama 3 style pre-tokenization regex). The string `"gemma4"` also dispatches to `BPETokenizer` but with `useGpt2ByteMapping=false` — Gemma 4 vocab uses SentencePiece-style `▁` (U+2581) for spaces and `<0xHH>` byte fallback tokens, NOT GPT-2 byte mapping. Anything else → `SentencePieceTokenizer` (score-based). Chat formatting is architecture-specific in `ChatTemplate`, with distinct templates for Llama (`<|start_header_id|>`), Qwen2/3/Qwen3MoE (`<|im_start|>`), GLM4 (`[gMASK]<sop>`), DeepSeek2 (`User: ... Assistant:`), Phi-3/4 (`<|user|>`), Mistral3 (`[INST]`), Gemma 4 (`<|turn>...<turn|>`), and OLMo2 (`<|user|>...<|assistant|>`). **Olmo 3 detection**: when the chat_template metadata contains `<|im_start|>`, `ChatTemplate.isOlmo3ChatML` is set to true and the OLMo2 format method switches to ChatML output (`<|im_start|>user\n...<|im_end|>`).
 
 ### Launch modes
 
@@ -292,7 +297,7 @@ Two modes for keeping activations on GPU between transformer layers, reducing CP
 
 Key design: **zero-allocation hot paths** — all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Falcon3, OLMo2, Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`), Granite 3.3 (with scaling factors). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported**: MoE architectures, Gemma 4/3n (PLE).
+**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Falcon3, OLMo2 (incl. Olmo 3), Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`), Granite 3.3 (with scaling factors). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported on GPU**: MoE architectures, Gemma 4/3n (PLE — runs on CPU via `Gemma4InferenceEngine`), Granite Hybrid (scaling factors not propagated to GPU kernels — auto-falls back to CPU). Standard architectures still get full GPU acceleration.
 
 #### Qwen3.5 CUDA forward pass (`Qwen35CudaForwardPass`)
 
@@ -381,8 +386,16 @@ All properties are set via `-Dproperty=value` on the Java command line.
 | `cuda.q5k.smem` | `true` | Use shared-memory input kernel for Q5_K (+7% throughput) |
 | `cuda.q6k.tiled` | `true` | Use tiled shared-memory kernel for Q6_K (256-element tiles, +9% throughput) |
 | `cuda.deltanet.v2` | `true` | Use float4-vectorized DeltaNet kernel (+4% throughput) |
+| `cuda.q6k.smem` | `false` | Use shared-memory input kernel for Q6_K (alternative to tiled variant) |
 | `cuda.profile` | `false` | Enable CUDA per-section timing (adds `finish()` barriers; ~15-25% overhead) |
 | `cpu.profile` | `false` | Enable CPU per-layer timing (standard InferenceEngine only) |
 | `matmul.tiled` | `false` | Enable cache-friendly tiled matmul on CPU (Java 21+) |
+| `kv.q8` | `false` | Use Q8_0 block-quantized KV cache (1.125 vs 4 bytes/elem; **+28% faster** for DeepSeek2 MLA) |
+| `attn.flash` | `false` | Enable FlashAttention online-softmax (single-pass; ~10% slower on Java/CPU; opt-in) |
+| `gemma4.nople` | `false` | Disable PLE pre-computation in Gemma 4 forward pass (debug flag) |
 
 **GPU profiling**: `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. Note: only instrumented in `CudaForwardPass` (standard architectures), not `Qwen35CudaForwardPass`. **CPU profiling**: `-Dcpu.profile=true` (standard `TransformerBlock` only).
+
+### Automated kernel autosearch (`autosearch.sh`)
+
+`./autosearch.sh <model.gguf> [runs_per_config] [min_ppl]` runs a Karpathy-style greedy coordinate-ascent search over the entire `-D` flag matrix above. For each flag, it toggles the value, runs N benchmarks (best tok/s wins), accepts the change only if **tok/s improves AND PPL ≥ min_ppl**, otherwise reverts. Output: optimal config + speedup vs baseline. Empirically on RTX 4050 + Qwen3-4B Q4_K_M: defaults are already Pareto-optimal (no flag toggle improves tok/s without degrading PPL). The CUDA-graph baseline is critical — disabling it crashes PPL from 1.00 to 0.07 even though tok/s changes by only ~10%.

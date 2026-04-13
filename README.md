@@ -1,6 +1,19 @@
-# LLMPlayer v1.10.1
+# LLMPlayer v1.10.2
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 20 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, and **Nemotron-H** (hybrid Mamba-2 + Transformer). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.10.2 — Gemma 4 fully working + Granite Hybrid GPU fix + Olmo 3 + autosearch
+
+This release closes the long-standing **Gemma 4 / Gemma 3n** correctness gap (PPL 0.00 → 1.00 on canonical Q&A), fixes a GPU-only bug for **Granite Hybrid**, adds **Olmo 3** support, and ships an automated kernel-tuning tool.
+
+- **Gemma 4 (PLE) — fully working at PPL 1.00** ✓ — root cause was two missing pieces vs `llama.cpp gemma4-iswa.cpp`: (1) **V-norm** (`ggml_rms_norm` without learnable scale on V projections) was disabled for Gemma 4; (2) **`layer_output_scale.weight`** per-layer scalar must be applied as a final multiplication of the residual stream (`cur *= out_scale`). Together these fixes turn semantically-related multilingual gibberish into coherent answers like *"The capital of France is **Paris**."*
+- **Gemma 3n — also confirmed working at PPL 0.97-1.00** ✓ via the existing `forwardLayerGemma3nInner` AltUp + Laurel + sparsity path. K-norm `(1+w)` adjustment is now architecture-conditional (Gemma 3n only — Gemma 4 stores final values).
+- **BPE decode bug fixed for Gemma 4 SentencePiece-mode tokens** — `BPETokenizer.decodeTokenPiece` was applying GPT-2 byte mapping unconditionally, leaving `▁` (U+2581) literal in output. Now: when `useGpt2ByteMapping=false` (gemma4 mode), `▁` is replaced with space and `<0xHH>` byte fallback tokens decode via UTF-8 byte coalescing.
+- **Granite Hybrid GPU fix** — `NemotronHCudaForwardPass` was producing PPL 0.20 (junk output) for Granite Hybrid models because it didn't apply `embeddingScale`/`attentionScale`/`residualScale` on GPU. Now the GPU path is skipped (CPU fallback) when scaling is enabled — output goes back to PPL 1.00.
+- **Olmo 3 ChatML detection** — Olmo 3 ships under the `olmo2` GGUF architecture but uses ChatML (`<|im_start|>...<|im_end|>`) instead of the legacy `<|user|>` format. `ChatTemplate` now auto-detects this from the chat_template metadata and switches format.
+- **`autosearch.sh`** — Karpathy-style greedy coordinate-ascent over the full `-D` flag matrix (`cuda.dp4a`, `cuda.q4k.smem`, `cuda.q5k.smem`, `cuda.q6k.tiled`, `cuda.deltanet.v2`, `cuda.cublas`, `kv.q8`, `matmul.tiled`, `attn.flash`, etc.). Two KPIs: **tok/s** (max) and **PPL** (≥ threshold). Auto-discovers Pareto-optimal configurations per model.
+- **22 models in CUDA-graph benchmark** including the new **Qwen3.6-Plus-Distill-4B-Thinking** community LoRA distillation (16.6 tok/s Q8_0).
+- **Q4_1 documented as unsupported** at the tensor layer (no `Q4_1FloatTensor` implementation; community Qwen3.6 distill uses Q4_1 → use Q8_0 variant instead).
 
 ### What's new in v1.10.1 — Top-10 audit vs llama.cpp
 
@@ -13,7 +26,7 @@ Six commit's worth of correctness fixes, sampler additions, and a major memory o
 - **Wo bias / output bias loading** — `attn_output.bias` and top-level `output.bias` now loaded and applied for Qwen2 / SmolLM3 / Command-R variants that ship them.
 - **GC churn reduction** — Qwen3.5 and Nemotron-H pre-cache all per-layer norm weights and pre-allocate conv1d output buffers.
 - **MoE routing safety** — F16-epsilon clamp on weight-sum normalization in `Qwen3MoEInferenceEngine.moeFFN` (anti-NaN guardrail, matches llama.cpp `ggml_clamp`).
-- **Gemma 3n / Gemma 4 broken-support warning** — empirically confirmed that PLE-only path (without AltUp + Laurel) produces random multi-language tokens. Loud WARNING banner at engine creation so users know the model is not yet usable.
+- **Gemma 3n / Gemma 4 broken-support warning** — at the time, PLE-only path produced random multi-language tokens. ~~Loud WARNING banner at engine creation~~ **Resolved in v1.10.2** (see above).
 - **Documented but not enabled by default**: `-Dattn.flash=true` (FlashAttention online-softmax — bit-identical but ~10% slower on Java/CPU because the SIMD `VectorOps.softmax` is already fast); Nemotron-H CUDA graph (was hard-disabled, re-enabled but gives 0% speedup on this workload because Mamba-2 scan is compute-bound, not launch-bound).
 
 ### What's new in v1.10.0

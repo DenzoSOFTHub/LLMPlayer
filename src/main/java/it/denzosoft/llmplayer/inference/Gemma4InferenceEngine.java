@@ -158,9 +158,11 @@ public class Gemma4InferenceEngine {
             }
             if (lw.kNorm() != null) {
                 kNormCache[i] = RMSNorm.cacheWeights(lw.kNorm(), layerHeadSize);
-                // Gemma 4 K-norm weights in GGUF are raw w (NOT pre-computed 1+w)
-                // The Gemma4RMSNorm class uses (1 + self.weight) * norm(x)
-                for (int j = 0; j < layerHeadSize; j++) kNormCache[i][j] += 1.0f;
+                // Gemma 3n: K-norm weights in GGUF are raw w (NOT pre-computed 1+w).
+                // Gemma 4: weights are stored as final values (Q≈0.98, K≈0.13). Don't adjust.
+                if (config.architecture() == it.denzosoft.llmplayer.model.ModelArchitecture.GEMMA3N) {
+                    for (int j = 0; j < layerHeadSize; j++) kNormCache[i][j] += 1.0f;
+                }
             }
         }
         outputNormCache = RMSNorm.cacheWeights(weights.outputNorm(), dim);
@@ -215,7 +217,7 @@ public class Gemma4InferenceEngine {
         // 2. PLE pre-computation
         boolean hasPle = pleTokenEmbd != null && pleDim > 0;
         if (hasPle) computePleInput(token, state);
-        boolean doPle = hasPle; // can be toggled for debug
+        boolean doPle = hasPle && !Boolean.getBoolean("gemma4.nople"); // can be toggled for debug
 
         // H10: Gemma 3n AltUp + Laurel forward path
         boolean useAltup = g3n != null && g3n.isFullyLoaded() && state.altupStreams != null;
@@ -345,7 +347,8 @@ public class Gemma4InferenceEngine {
                 }
             }
 
-            // V-norm (no learnable scale — raw RMSNorm)
+            // V-norm: rms_norm without learnable scale (both Gemma 3n and Gemma 4
+            // per llama.cpp gemma4-iswa.cpp: Vcur = ggml_rms_norm(ctx0, Vcur, eps)).
             for (int h = 0; h < headCountKV; h++) {
                 RMSNorm.applyNoScale(vBuf, h * headSize, headSize, normEps);
             }
@@ -366,6 +369,7 @@ public class Gemma4InferenceEngine {
         final int hs = headSize; // capture for lambda
         final int kvd = kvDim;
         // Gemma 4: attention scale = 1.0 (model handles scaling via QK-norm internally)
+        final float attnScale = 1.0f;
         final int startPos = (isSwa && slidingWindow > 0)
                 ? Math.max(0, position - slidingWindow + 1) : 0;
         final int seqLen = position + 1;
@@ -385,7 +389,7 @@ public class Gemma4InferenceEngine {
                 for (int i = 0; i < hs; i++) {
                     score += qBuf[qOffset + i] * keyCache[kOffset + i];
                 }
-                state.att[h * maxSeqLen + t] = score; // scale=1.0
+                state.att[h * maxSeqLen + t] = score * attnScale;
             }
 
             // Softmax
@@ -490,11 +494,13 @@ public class Gemma4InferenceEngine {
                 RMSNorm.apply(pleOut, pleOut, plePostNorm[layer], dim, normEps);
             }
 
-            // PLE residual
+            // PLE residual: cur = pe_in + post_norm(per_layer_proj @ ...)
             for (int i = 0; i < dim; i++) state.x[i] += pleOut[i];
         }
 
-        // === 13. Layer output scaling ===
+        // === 13. Layer output scale: cur *= out_scale ===
+        // Per llama.cpp gemma4-iswa.cpp, the entire layer output is multiplied by
+        // a learned per-layer scalar before being passed to the next layer.
         if (layerOutputScale != null && layer < layerOutputScale.length) {
             float scale = layerOutputScale[layer];
             if (scale != 1.0f && scale != 0f) {

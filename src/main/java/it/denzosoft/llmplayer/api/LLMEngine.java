@@ -601,19 +601,10 @@ public class LLMEngine implements AutoCloseable {
 
     private static Gemma4InferenceEngine createGemma4Engine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         ModelConfig config = loadedModel.config();
-        // PARTIAL SUPPORT: Gemma 3n (aka "Gemma 4") AltUp + Laurel forward path is now
-        // implemented in Gemma4InferenceEngine. Output quality is still imperfect (best-effort
-        // implementation, some details may differ from llama.cpp's reference) — see
-        // Gemma3nWeights.java for the full algorithm spec and tensor map. Improvement target
-        // for future iteration.
-        System.err.println();
-        System.err.println("  ====================================================================");
-        System.err.println("  Gemma 3n / Gemma 4 (PLE) support is PARTIAL.");
-        System.err.println("  AltUp + Laurel forward pass implemented (best effort) — output may");
-        System.err.println("  not match llama.cpp bit-exact but should be coherent English.");
-        System.err.println("  Activation sparsity (gaussian top-k) not yet applied.");
-        System.err.println("  ====================================================================");
-        System.err.println();
+        // Gemma 3n: full AltUp + Laurel + activation sparsity + PLE.
+        // Gemma 4:  PLE + dual headSize + shared KV + per-layer output scale, no AltUp/Laurel.
+        // Both routed through Gemma4InferenceEngine which dispatches based on whether the
+        // Gemma3nWeights bundle has AltUp tensors loaded.
         it.denzosoft.llmplayer.model.ModelWeights weights = loadedModel.weights();
         it.denzosoft.llmplayer.gguf.GGUFFile gguf = loadedModel.ggufFile();
         int blockCount = config.blockCount();
@@ -725,11 +716,7 @@ public class LLMEngine implements AutoCloseable {
             hasKv);
 
         if (gemma3nExtras.isFullyLoaded()) {
-            System.err.println("  Gemma3n extras loaded: AltUp(" + (altupProj != null ? "✓" : "✗")
-                + " unembd=" + (altupUnembdProj != null ? "✓" : "✗")
-                + " router=" + (altupRouter[0] != null ? "✓" : "✗") + ") "
-                + "Laurel(" + (laurelL[0] != null ? "✓" : "✗") + ")");
-            System.err.println("  Note: weights loaded but forward pass does NOT yet use them (H10 pending).");
+            System.err.println("  Gemma3n extras loaded: AltUp + Laurel + sparsity + PLE active");
         }
 
         return new Gemma4InferenceEngine(config, weights, maxContextLength,

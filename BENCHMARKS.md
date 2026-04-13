@@ -6,9 +6,21 @@
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
 - **Prompt:** `"Write a Java class that calculates factorial recursively"` — `--max-tokens 60 --context-length 512`
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
-- **Date:** 2026-04-09 (updated)
+- **Date:** 2026-04-13 (updated)
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## Results v1.10.2
+
+**New in v1.10.2 — correctness fixes + Olmo 3 + autosearch:**
+- **Gemma 4 (PLE) — fully working at PPL 1.00** ✓ — V-norm + `layer_output_scale.weight` final multiplication restored per `llama.cpp gemma4-iswa.cpp`. K-norm `(1+w)` made Gemma 3n-only.
+- **Gemma 3n confirmed at PPL 0.97-1.00** ✓ — full AltUp + Laurel + sparsity + PLE in `forwardLayerGemma3nInner`.
+- **BPE decode fix for Gemma 4 SentencePiece tokens** — `▁` → space and `<0xHH>` byte fallback decoding when `useGpt2ByteMapping=false`.
+- **Granite Hybrid GPU bug fixed via CPU fallback** — `NemotronHCudaForwardPass.isSupported()` now returns false when scaling factors are non-zero. `granite-4.0-h-micro` goes from PPL 0.20 (junk) → 1.00 (correct answer) on GPU runs.
+- **Olmo 3 ChatML detection** — auto-switches OLMo2 chat template to ChatML when `<|im_start|>` is in the metadata.
+- **`autosearch.sh`** — Karpathy-style coordinate-ascent over the entire `-D` flag matrix. Two KPIs: tok/s (max) and PPL (≥ threshold).
+- **Quality sweep across 39 GPU-fittable models** — 25 pass at PPL ≥ 0.98. Failures are split between (now-fixed) real bugs, inherent model behavior (reasoning/thinking models, 1B-scale quality limits), and unsupported architectures (Granite Hybrid Tiny MoE, Bonsai Q1_0).
+- **New benchmark entry**: Qwen3.6-Plus-Distill-4B-Thinking (Q8_0) — community LoRA distillation of proprietary Qwen3.6-Plus reasoning, 16.6 tok/s with PPL 0.91 (lower than direct-answer models because output is always chain-of-thought).
 
 ## Results v1.10.1
 
@@ -23,7 +35,7 @@
 - **E18** Routing weight sum F16-epsilon clamp in `Qwen3MoEInferenceEngine.moeFFN` (anti-NaN guardrail).
 - **E21** Pre-allocated conv1d output buffer in Qwen3.5 / Nemotron-H state classes.
 - **M2** **Q8_0 KV cache** (`-Dkv.q8=true`) — block-quantized int8 + FP32 scales per 32-elem block, **3.56× memory reduction**. Wired to all 5 inference engines: `InferenceEngine`, `Qwen3MoEInferenceEngine`, `Qwen35InferenceEngine` (full-attention layers), `NemotronHInferenceEngine` (attention layers), and **`DeepSeek2InferenceEngine` (asymmetric MLA via separate K/V dims)**.
-- **Gemma 3n / Gemma 4 broken-support warning** — confirmed empirically that AltUp + Laurel are missing → output is random multi-language tokens. Loud WARNING banner at engine creation.
+- **Gemma 3n / Gemma 4 broken-support warning** — confirmed empirically that AltUp + Laurel are missing → output is random multi-language tokens. Loud WARNING banner at engine creation. **Resolved in v1.10.2** — both architectures now work at PPL 0.97-1.00.
 
 Documented but **not enabled by default**:
 - **M1** FlashAttention online-softmax (`-Dattn.flash=true`) — bit-identical to legacy 2-pass but 6-15% slower on Java/CPU because the SIMD `VectorOps.softmax` is already fast. Kept opt-in for future GPU HBM-bound implementation.
@@ -125,15 +137,18 @@ Benchmarked 2026-04-09 with v1.9.0. All optimizations enabled by default.
 | 10 | Qwen3-4B | 4B | Q4_K_M | 2.4G | **18.5** | 18.5 | CUDA graph (36/36) |
 | 11 | Qwen3.5-4B | 4B | Q4_K_M | 2.6G | **18.0** | 11.3 | **+59%** | CUDA graph (32/32) |
 | 12 | Granite-3.3-8B-Instruct | 8B | Q4_K_M | 4.6G | **17.0** | 1.0† | **+17x** | CUDA graph (40/40) ★ |
-| 13 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **13.7** | 13.7 | CUDA graph (32/32) |
-| 14 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | 2.5G | **12.3** | 12.3 | CUDA graph (32/32) |
-| 15 | Mistral-7B-Instruct-v0.3 | 7B | Q4_K_M | 4.1G | **11.8** | 11.8 | CUDA graph (32/32) |
-| 16 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **10.8** | 10.8 | CUDA graph (28/28) |
-| 17 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | **10.2** | 10.2 | CUDA graph (36/36) |
-| 18 | Llama-3.1-8B-Instruct | 8B | Q4_K_M | 4.6G | **10.0** | 10.0 | CUDA graph (32/32) |
-| 19 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **9.2** | 9.2 | CUDA graph (48/48) |
-| 20 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | 5.2G | **7.0** | 7.0 | CUDA graph (32/32) |
-| 21 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **6.5** | 6.5 | CUDA graph (32/32) |
+| 13 | Qwen3.6-Plus-Distill-4B-Thinking ‡ | 4B | Q8_0 | 4.0G | **16.6** | new | CUDA graph (36/36) |
+| 14 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | 2.4G | **13.7** | 13.7 | CUDA graph (32/32) |
+| 15 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | 2.5G | **12.3** | 12.3 | CUDA graph (32/32) |
+| 16 | Mistral-7B-Instruct-v0.3 | 7B | Q4_K_M | 4.1G | **11.8** | 11.8 | CUDA graph (32/32) |
+| 17 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | 4.4G | **10.8** | 10.8 | CUDA graph (28/28) |
+| 18 | DeepSeek-R1-Qwen3-8B | 8B | Q4_K_M | 4.7G | **10.2** | 10.2 | CUDA graph (36/36) |
+| 19 | Llama-3.1-8B-Instruct | 8B | Q4_K_M | 4.6G | **10.0** | 10.0 | CUDA graph (32/32) |
+| 20 | Yi-Coder-9B-Chat | 9B | Q4_K_M | 5.0G | **9.2** | 9.2 | CUDA graph (48/48) |
+| 21 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | 5.2G | **7.0** | 7.0 | CUDA graph (32/32) |
+| 22 | Qwen3.5-9B | 9B | Q4_K_M | 5.3G | **6.5** | 6.5 | CUDA graph (32/32) |
+
+‡ **Qwen3.6-Plus-Distill-4B-Thinking**: community LoRA distillation of proprietary Qwen3.6-Plus reasoning into `Qwen3-4B-Thinking-2507` base. No official Qwen3.6 open-weight exists — this is the only public GGUF. Thinking/reasoning model: emits chain-of-thought before final answer, so PPL=0.91 reflects the reasoning-chain distribution (lower than direct-answer models). Repo: [khazarai/Qwen3-4B-Qwen3.6-plus-Reasoning-Distilled-GGUF](https://huggingface.co/khazarai/Qwen3-4B-Qwen3.6-plus-Reasoning-Distilled-GGUF). Q4_1 variant is NOT loadable (Q4_1 tensor type unsupported in LLMPlayer).
 
 ### GPU-resident forward pass — per-layer (no CUDA graph)
 

@@ -1,5 +1,50 @@
 # LLMPlayer — What's New
 
+## v1.10.2 (2026-04-13)
+
+### Gemma 4 / Gemma 3n — Fully Working
+
+Closes the long-standing PPL gap on Gemma 4 (PLE) models. Root cause vs `llama.cpp gemma4-iswa.cpp`:
+
+1. **V-norm** — V projection requires `Vcur = ggml_rms_norm(ctx0, Vcur, eps)` (RMSNorm without learnable scale). Was disabled for Gemma 4.
+2. **`layer_output_scale.weight`** — per-layer scalar applied as final residual-stream multiplication: `cur = ggml_mul(cur, out_scale); inpL = cur;`. Values are 0.06–0.88, do compound across 42 layers, but the model was trained with these scales — this IS the correct algorithm.
+3. **K-norm conditional** — K-norm `(1+w)` adjustment is now Gemma 3n-only. Gemma 4 stores final values (Q≈0.98, K≈0.13).
+
+Result: `gemma-4-E4B-it Q4_K_M` goes from PPL 0.00 (random multilingual) → PPL 1.00 (correct answers). `gemma-3n-E4B-it Q4_K_M` confirmed at PPL 0.97-1.00. Reference: [llama.cpp gemma4-iswa.cpp](https://github.com/ggml-org/llama.cpp/blob/master/src/models/gemma4-iswa.cpp).
+
+### BPETokenizer — Decode Bug for Gemma 4 SentencePiece Tokens
+
+`BPETokenizer.decodeTokenPiece` was applying GPT-2 byte mapping unconditionally, which left `▁` (U+2581) and `<0xHH>` byte tokens in literal form when decoding Gemma 4 outputs. Now: when `useGpt2ByteMapping=false`, replace `▁` with space and decode `<0xHH>` as raw UTF-8 bytes. `decode(int[])` coalesces consecutive byte tokens so multi-byte UTF-8 chars (e.g. `é` = `<0xC3><0xA9>`) decode correctly as a single character.
+
+### Granite Hybrid — GPU Forward Pass Disabled (CPU Fallback)
+
+`NemotronHCudaForwardPass` did not propagate Granite's `embeddingScale`/`attentionScale`/`residualScale`/`logitScale` to its kernels, producing PPL 0.20 garbage on GPU. `isSupported()` now returns `false` for any model with non-zero scaling factors, forcing CPU fallback. Output goes back to PPL 1.00 (`granite-4.0-h-micro` answers correctly with "The capital of France is Paris."). Implementing scaling on the GPU path is future work.
+
+### Olmo 3 — ChatML Detection
+
+Olmo 3 ships under `general.architecture = olmo2` GGUF arch but uses ChatML (`<|im_start|>...<|im_end|>`) instead of legacy `<|user|>`. `ChatTemplate` now sets `isOlmo3ChatML = true` when the chat_template metadata contains `<|im_start|>`, and the `formatOLMo2` family of methods switches output format. Includes a default system message replicating the Unsloth template's function-calling assistant prompt, since the model expects one.
+
+### `autosearch.sh` — Karpathy-Style Kernel Autosearch
+
+New tool: `./autosearch.sh <model.gguf> [runs] [min_ppl]`. Greedy coordinate ascent over the entire `-D` flag matrix:
+- `cuda.nograph`, `cuda.dp4a`, `cuda.q4k.{coalesced,smem,2warp}`, `cuda.q5k.smem`, `cuda.q6k.{tiled,smem}`, `cuda.deltanet.v2`, `cuda.cublas`
+- `kv.q8`, `matmul.tiled`, `attn.flash`
+
+For each flag, toggles the value, runs N benchmarks (best tok/s wins), accepts the change only if **tok/s improves AND PPL ≥ min_ppl**, otherwise reverts. Empirically on RTX 4050 + Qwen3-4B Q4_K_M: defaults are already Pareto-optimal — no flag toggle improves tok/s without crashing PPL.
+
+### Benchmark — Qwen3.6-Plus-Distill-4B-Thinking
+
+Added new entry to BENCHMARKS.md (#13 in CUDA-graph table): community LoRA distillation of proprietary Qwen3.6-Plus reasoning into Qwen3-4B-Thinking-2507 base. Q8_0 only (Q4_1 not supported by LLMPlayer at the tensor layer — no `Q4_1FloatTensor`). 16.6 tok/s, PPL 0.91 (lower than direct-answer models because output is always a chain-of-thought).
+
+### Quality Sweep — 39 GPU-Fittable Models
+
+Ran a quality regression sweep across all 39 GPU-fittable models in the `gguf/` directory. Results: **25 pass with PPL ≥ 0.98**. Failures categorized as:
+- Real bugs (now fixed): Gemma 4 (was 0.00 → 1.00), Granite Hybrid micro on GPU (was 0.20 → 1.00 via CPU fallback), Olmo 3 ChatML format
+- Inherent model behavior (not bugs): reasoning models (DeepSeek-R1, Phi-4-mini-reasoning) emit `<think>` blocks, so PPL naturally lower; small models (1B) have inherent quality limits
+- Architecture not yet supported: Granite Hybrid Tiny (MoE variant), Bonsai 8B (custom Q1_0 format)
+
+---
+
 ## v1.6.0 (2026-03-09)
 
 ### CPU Performance — Prefill Skip

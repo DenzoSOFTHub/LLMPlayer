@@ -551,6 +551,8 @@ Returns runtime metrics including model info, generation statistics, memory usag
     "totalPromptTokens": 100,
     "lastTokensPerSecond": 18.0,
     "averageTokensPerSecond": 15.5,
+    "recentTokensPerSecond": 17.2,
+    "recentSampleCount": 4,
     "lastGenerationTimeMs": 3333,
     "totalGenerationTimeMs": 19354
   },
@@ -571,6 +573,12 @@ Returns runtime metrics including model info, generation statistics, memory usag
   }
 }
 ```
+
+**Field notes:**
+- `lastTokensPerSecond` — speed of the most recent generation
+- `averageTokensPerSecond` — cumulative average since model load (or last `reset()`)
+- `recentTokensPerSecond` — 60-second rolling window over recent generations (live monitoring; 0.0 if no samples in window)
+- `recentSampleCount` — number of generations counted in the rolling window (max 256)
 
 These same metrics are also available via JMX MXBean at `it.denzosoft.llmplayer:type=LLMPlayer`.
 
