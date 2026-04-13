@@ -463,10 +463,13 @@ public final class ModelConfig {
             config.setSharedKvLayers(metadata.getInt(prefix + "attention.shared_kv_layers", 0));
             // Parse sliding window pattern
             Object swpObj = metadata.get(prefix + "attention.sliding_window_pattern");
-            if (swpObj instanceof Object[] swpArr) {
+            if (swpObj instanceof Object[]) {
+                Object[] swpArr = (Object[]) swpObj;
                 boolean[] pattern = new boolean[swpArr.length];
                 for (int i = 0; i < swpArr.length; i++) {
-                    pattern[i] = swpArr[i] instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(swpArr[i]));
+                    pattern[i] = swpArr[i] instanceof Boolean
+                            ? ((Boolean) swpArr[i]).booleanValue()
+                            : Boolean.parseBoolean(String.valueOf(swpArr[i]));
                 }
                 config.setSlidingWindowPattern(pattern);
             }
@@ -480,10 +483,13 @@ public final class ModelConfig {
             config.setRopeDimCountSwa(metadata.getInt(prefix + "rope.dimension_count_swa", ropeDimensionCount));
             // Parse sliding window pattern (boolean array from GGUF)
             Object swpObj = metadata.get(prefix + "attention.sliding_window_pattern");
-            if (swpObj instanceof Object[] swpArr) {
+            if (swpObj instanceof Object[]) {
+                Object[] swpArr = (Object[]) swpObj;
                 boolean[] pattern = new boolean[swpArr.length];
                 for (int i = 0; i < swpArr.length; i++) {
-                    pattern[i] = swpArr[i] instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(swpArr[i]));
+                    pattern[i] = swpArr[i] instanceof Boolean
+                            ? ((Boolean) swpArr[i]).booleanValue()
+                            : Boolean.parseBoolean(String.valueOf(swpArr[i]));
                 }
                 config.setSlidingWindowPattern(pattern);
             }
