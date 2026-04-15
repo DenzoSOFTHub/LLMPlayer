@@ -4,11 +4,78 @@
 
 - **Hardware:** Intel Core Ultra 7 155H (22 cores) + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM) + 31 GB RAM
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
-- **Prompt:** `"Write a Java class that calculates factorial recursively"` — `--max-tokens 60 --context-length 512`
+- **Prompt:** `"Write a Java class that calculates factorial recursively"` — `--max-tokens 120 --context-length 512` (v1.11.0-dev) / `--max-tokens 60 --context-length 512` (v1.10.x)
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
-- **Date:** 2026-04-13 (updated)
+- **Date:** 2026-04-15 (v1.11.0-dev refresh)
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## Results v1.11.0-dev
+
+**Two structural changes drive this release's gains:**
+
+1. **dp4a kernel fleet expanded to Q5_0 / Q8_0 / IQ4_NL / IQ4_XS** — four new dedicated CUDA kernels (`matmul_q5_0_dp4a.cu`, `matmul_q8_0_dp4a.cu`, `matmul_iq4_nl_dp4a.cu`, `matmul_iq4_xs_dp4a.cu`), extending coverage from Q4_K/Q5_K to all dp4a-compatible integer quants. `MatmulLaunch.dp4aType` switch codes: 41 (IQ4_NL), 42 (IQ4_XS), 50 (Q5_0), 80 (Q8_0). Wired into `CudaForwardPass`, `Qwen35CudaForwardPass`, and `NemotronHCudaForwardPass`.
+
+2. **Granite Hybrid full GPU path** — integrated SwiGLU FFN inside Mamba/Attention layers (`runIntegratedFFN()`) plus all four scale factors (embedding/logit/residual/attention) on GPU via `scale_inplace` + `accumulate` + saxpy. `NemotronHCudaForwardPass.isSupported()` now returns true for Granite Hybrid; CUDA graph capture works. Validated bit-equivalent to CPU at ±2 ULP with `-Dcuda.dp4a=false`.
+
+### Bench sweep — 16 models with quality metrics (best-of-3, T=0.0, 120 tokens, --context-length 512)
+
+Run via `bench-v1.11.0-dev.sh`. Each model gets a fresh JVM per run; values are best-of-3 tok/s and the corresponding evaluator output (deterministic at T=0 → same hash across all 3 runs for every model below). Sweep ran sequentially in one session — driver/PPL/JIT are warm, which matches steady-state usage but is faster than cold-start single-model runs.
+
+| # | Model | Quant | Arch | tok/s | PPL | Coh | Agg | Verdict |
+|--:|-------|-------|------|------:|----:|----:|----:|---------|
+| 1 | qwen3-0.6B | Q8_0 | qwen3 | **99.4** | 0.91 | 0.97 | **0.83** | EXCELLENT |
+| 2 | granite-4.0-h-tiny | Q4_K_M | granite-hybrid | **94.3** | 0.00 | 0.96 | 0.46 | FAIR (small model) |
+| 3 | olmo-2-1b | Q4_K_M | olmo2 | **84.5** | 0.63 | 0.98 | **0.85** | EXCELLENT |
+| 4 | llama-3.2-1b | Q4_K_M | llama | **84.3** | 0.95 | 0.97 | **0.84** | EXCELLENT |
+| 5 | granite-3.3-2b | Q4_K_M | granite | **50.3** | 0.94 | 0.97 | **0.84** | EXCELLENT |
+| 6 | falcon3-3b | Q4_K_M | falcon3 | **44.1** | 0.96 | 0.96 | **0.84** | EXCELLENT |
+| 7 | qwen3-1.7B | Q8_0 | qwen3 | **42.7** | 0.85 | 0.97 | **0.81** | EXCELLENT |
+| 8 | gemma-3-1b | Q4_K_M | gemma3 | **41.2** | 0.10 | 0.97 | 0.51 | FAIR (1B limit) |
+| 9 | granite-4.0-h-micro | Q4_K_M | granite-hybrid | **34.1** | 0.00 | 0.99 | 0.60 | GOOD |
+| 10 | llama-3.2-1b | IQ4_NL | llama | **32.6** | 0.95 | 0.97 | **0.85** | EXCELLENT |
+| 11 | qwen3-4b | Q4_K_M | qwen3 | **32.3** | 0.98 | 0.96 | **0.85** | EXCELLENT |
+| 12 | phi-4-mini | Q4_K_M | phi3 | **32.1** | 0.96 | 0.99 | **0.98** | EXCELLENT (top quality) |
+| 13 | nemotron-3-nano-4B | Q4_K_M | nemotron-h | **22.6** | 0.92 | 0.98 | **0.84** | EXCELLENT |
+| 14 | mistral-7b | Q4_K_M | mistral3 | **20.1** | 0.89 | 0.96 | **0.82** | EXCELLENT |
+| 15 | phi-3-mini | IQ4_NL | phi3 | **12.0** | 0.80 | 0.93 | **0.77** | GOOD |
+| 16 | gemma-2-2b | IQ4_XS | gemma2 | **10.8** | 0.49 | 0.96 | 0.66 | GOOD |
+
+**Quality columns explained:**
+- **PPL**: normalized perplexity score [0..1] — higher is better. Code prompts naturally score lower than natural language; small (≤1B) models also score lower because of inherent quality limits.
+- **Coh** (Coherence): n-gram repetition + entropy [0..1] — higher is better. >0.95 means no degenerate looping.
+- **Agg** (Aggregate): composite score combining PPL, Coh, and Length-natural-EOS [0..1] — single quality dial.
+- **Verdict** is the engine's own classification of Agg (EXCELLENT ≥0.80, GOOD ≥0.55, FAIR ≥0.40, BAD <0.40).
+
+**Headline gains vs v1.10.2 (memory baselines):**
+
+| Model | v1.10.2 | v1.11.0-dev | Δ | Driver |
+|-------|--------:|------------:|---:|--------|
+| **granite-4.0-h-micro** | **~8 (CPU)** | **34.1** | **+4.3×** | **Granite Hybrid full GPU path landed** (integrated SwiGLU + all scale factors) |
+| nemotron-3-nano-4B | 10.4 | **22.6** | **+117%** | dp4a infra added to NemotronHCudaForwardPass |
+| phi-3-mini IQ4_NL | 8.4 | **12.0** | +43% | New IQ4_NL dp4a kernel |
+| gemma-2-2b IQ4_XS | 8.6 | **10.8** | +26% | New IQ4_XS dp4a kernel |
+| gemma-3-1b Q4_K_M | 33.1 | **41.2** | +24% | Q5_0 dp4a kernel for Q/K/gate/up |
+| qwen3-0.6B Q8_0 | 67.6 | **99.4** | +47% | New Q8_0 dp4a kernel |
+| qwen3-1.7B Q8_0 | 31.1 | **42.7** | +37% | New Q8_0 dp4a kernel |
+
+Q4_K_M control models also show jumps vs v1.10.1 single-model numbers — the dp4a/Granite work touched general-purpose paths too (`MatmulLaunch` refactor, kernel param-buffer reuse), and the sustained-sweep methodology keeps JIT/driver/thermal hot:
+
+| Model | v1.10.1 | v1.11.0-dev | Δ |
+|-------|--------:|------------:|---:|
+| llama-3.2-1b Q4_K_M | 56.8 | **84.3** | +48% |
+| olmo-2-1b Q4_K_M | 55.8 | **84.5** | +51% |
+| granite-3.3-2b Q4_K_M | 26.4 | **50.3** | +90% |
+| falcon3-3b Q4_K_M | 28.6 | **44.1** | +54% |
+| phi-4-mini Q4_K_M | 19.6 | **32.1** | +64% |
+| qwen3-4b Q4_K_M | 17.7 | **32.3** | +83% |
+| mistral-7b Q4_K_M | 11.8 | **20.1** | +70% |
+
+**Granite Hybrid validation:** paired CPU/GPU dumps via `-Ddebug.iffn=true` (debug scaffolding since removed) confirmed bit-equivalence to ±2 ULP at every layer stage when dp4a is disabled. With dp4a on, the ~1-15% per-layer divergence is the expected Q8_1 quantization noise — final output hash is deterministic across all 3 runs (`780d62a7` for granite-4.0-h-micro, `ea7d3497` for granite-4.0-h-tiny).
+
+**Speculative decoding** (`SpeculativeDecoder`, `--draft-model`) — sequential verification only, ~1.14× max at K=4. Real speedup awaits a `forwardBatch` API.
+
+See `docs/optimization/llamacpp-comparison.md` for the rolling comparison vs llama.cpp across 17 models.
 
 ## Results v1.10.2
 

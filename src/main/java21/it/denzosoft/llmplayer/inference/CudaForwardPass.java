@@ -184,9 +184,18 @@ public class CudaForwardPass implements AutoCloseable {
         final int rows;
         final int cols;
         final int addToOutput;
+        // dp4a path: type code (0=ineligible, 4=Q4_K, 5=Q5_K, 6=Q6_K) and the
+        // Q8_1 input buffer corresponding to inputPtr (0 if not dp4a-eligible).
+        final int dp4aType;
+        final long q8InputPtr;
 
         MatmulLaunch(CudaFloatTensor tensor, long inputPtr, long outputPtr,
                      int rows, int cols, int addToOutput) {
+            this(tensor, inputPtr, outputPtr, rows, cols, addToOutput, 0L);
+        }
+
+        MatmulLaunch(CudaFloatTensor tensor, long inputPtr, long outputPtr,
+                     int rows, int cols, int addToOutput, long q8InputPtr) {
             this.function = tensor.getCudaFunction();
             this.weightPtr = tensor.getGpuWeights();
             this.blockDim = tensor.getMatmulBlockDim(cols);
@@ -197,6 +206,17 @@ public class CudaForwardPass implements AutoCloseable {
             this.rows = rows;
             this.cols = cols;
             this.addToOutput = addToOutput;
+            // Derive dp4a type from tensor's GGML type
+            it.denzosoft.llmplayer.tensor.GGMLType t = tensor.type();
+            if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) this.dp4aType = 4;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K) this.dp4aType = 5;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K) this.dp4aType = 6;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q5_0) this.dp4aType = 50;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q8_0) this.dp4aType = 80;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_NL) this.dp4aType = 41;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_XS) this.dp4aType = 42;
+            else this.dp4aType = 0;
+            this.q8InputPtr = q8InputPtr;
         }
     }
 
@@ -242,6 +262,51 @@ public class CudaForwardPass implements AutoCloseable {
 
     // Output projection launch descriptor
     private final MatmulLaunch outputMatmul; // null if output not on GPU
+
+    // dp4a (llama.cpp-style int8 dot product) — opt-in via -Dcuda.dp4a=true.
+    // After each FP32 buffer is produced (post attn/ffn norm, post attention, post silu),
+    // a quantize_q8 kernel converts it to Q8_1 in a scratch buffer, then matmuls whose
+    // weight type is Q4_K/Q5_K/Q6_K read the Q8_1 input and use __dp4a int8x4 dot product.
+    private final boolean useDp4a;
+    private final long gpuXbQ8;        // Q8_1 buffer for gpuXb input (size: dim/32 * 40)
+    private final long gpuXb2Q8;       // Q8_1 buffer for gpuXb2 input (size: qDim/32 * 40)
+    private final long gpuHbQ8;        // Q8_1 buffer for gpuHb input (size: ffnDim/32 * 40)
+    private final MemorySegment quantizeFunc;
+    private final MemorySegment dp4aQ4kFunc;
+    private final MemorySegment dp4aQ4kMwFunc;  // multi-warp Q4_K (4 warps/row) — llama.cpp-style
+    private final boolean useDp4aMw;
+    // Port of llama.cpp's mul_mat_vec_q template specialized for Q4_K (mmvq).
+    // Uses 4 warps × 32 lanes per row, vdr=2, sum-via-dp4a-trick. Reads our 40-byte Q8_1 format.
+    private final MemorySegment mmvqQ4kFunc;
+    private final boolean useMmvqQ4k;
+    private final MemorySegment dp4aQ5kFunc;
+    private final MemorySegment dp4aQ6kFunc;
+    // Extended dp4a kernels for non-K-quant types (Q5_0, Q8_0, IQ4_NL, IQ4_XS).
+    // These types fall through to FP32 in the original wiring; adding dp4a unlocks
+    // major models like Gemma-3-1B (Q5_0), Phi-3-mini (IQ4_NL), Gemma-2 (IQ4_XS),
+    // Qwen3-0.6B/1.7B (Q8_0).
+    private final MemorySegment dp4aQ50Func;
+    private final MemorySegment dp4aQ80Func;
+    private final MemorySegment dp4aIq4nlFunc;
+    private final MemorySegment dp4aIq4xsFunc;
+    private final MemorySegment dp4aIq4xsMwFunc;  // multi-warp (4 warps × row, 1 row/block)
+    // Fused RMSNorm + Q8_1 quantize (single kernel replaces 2-kernel pre-norm sequence).
+    // Saves 1 launch + 1 HBM round-trip per layer (~2-3% measured on Llama-1B).
+    private final MemorySegment rmsnormQuantizeFunc;
+    private final ParamBuffer rmsnormQuantizePB;   // 6 args: normOut, qOut, in, w, size, eps
+    private final boolean useFusedNormQuantize;
+    // Fused gate+up dp4a: single kernel writes both gate and up outputs from one input read.
+    // Halves input-vector reads and per-launch overhead. Q4_K-only.
+    private final MemorySegment dp4aFusedGateUpFunc;
+    private final ParamBuffer dp4aFusedGateUpPB;   // 7 args: gateW, upW, input, gateOut, upOut, rows, cols
+    private final boolean useDp4aFusedGateUp;
+    private final ParamBuffer quantizeXbPB;   // 3 args: gpuXb, gpuXbQ8, dim
+    private final ParamBuffer quantizeXb2PB;  // 3 args: gpuXb2, gpuXb2Q8, qDim
+    private final ParamBuffer quantizeHbPB;   // 3 args: gpuHb, gpuHbQ8, ffnDim
+    private final ParamBuffer dp4aPB;         // 6 args: weights, q8Input, output, rows, cols, addToOutput
+    private final int quantizeXbGridDim;
+    private final int quantizeXb2GridDim;
+    private final int quantizeHbGridDim;
 
     // Packed FFN support (Phi-3/4): wGate is null, wUp outputs 2*ffnDim, split into gate+up
     private final boolean hasPackedFFN;
@@ -636,6 +701,178 @@ public class CudaForwardPass implements AutoCloseable {
         this.perHeadNormBlockDim = hasQKNorm ? (int) Math.min(Math.max(32, ((headSize + 31) / 32) * 32), blockSize) : 0;
         this.perHeadNormSharedMem = hasQKNorm ? ((perHeadNormBlockDim / 32) + 1) * Float.BYTES : 0;
 
+        // === dp4a path setup (llama.cpp-style int8 dot product) ===
+        // Opt-in via -Dcuda.dp4a=true (default false to preserve current behavior).
+        // Pre-quantize FP32 inputs to Q8_1 once per buffer per layer, then matmuls
+        // whose tensor type is Q4_K/Q5_K/Q6_K read int8 from the Q8_1 buffer and use
+        // __dp4a (4× int8 muladd in 1 instruction). Typically 1.5-2× faster than FP32 input.
+        // dp4a defaults to ON — empirically +33% on Llama-1B (53→70 tok/s) on RTX 4050.
+        // Disable with -Dcuda.dp4a=false. Q6_K dp4a is opt-in via cuda.dp4a.q6=true (known buggy).
+        boolean dp4aReq = !"false".equals(System.getProperty("cuda.dp4a", "true"));
+        boolean dp4aMwReq = "true".equals(System.getProperty("cuda.dp4a.mw", "false"));
+        MemorySegment qFunc = null, dQ4kFunc = null, dQ4kMwFunc = null, dQ5kFunc = null, dQ6kFunc = null;
+        MemorySegment dQ50Func = null, dQ80Func = null, dIq4nlFunc = null, dIq4xsFunc = null, dIq4xsMwFunc = null;
+        boolean dp4aAvail = false;
+        boolean dp4aMwAvail = false;
+        if (dp4aReq) {
+            try {
+                qFunc = cudaContext.compileKernel("kernels/cuda/quantize_q8.cu", "quantize_q8");
+                dQ4kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q4_k_dp4a.cu", "matmul_q4_k_dp4a");
+                dp4aAvail = true;
+                try { dQ5kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q5_k_dp4a.cu", "matmul_q5_k_dp4a"); }
+                catch (Exception ignored) {}
+                try { dQ6kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q6_k_dp4a.cu", "matmul_q6_k_dp4a"); }
+                catch (Exception ignored) {}
+                // Extended dp4a kernels (best-effort)
+                try { dQ50Func   = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a.cu",   "matmul_q5_0_dp4a"); }
+                catch (Exception e) { System.err.println("CUDA: Q5_0 dp4a unavailable: " + e.getMessage()); }
+                try { dQ80Func   = cudaContext.compileKernel("kernels/cuda/matmul_q8_0_dp4a.cu",   "matmul_q8_0_dp4a"); }
+                catch (Exception e) { System.err.println("CUDA: Q8_0 dp4a unavailable: " + e.getMessage()); }
+                try { dIq4nlFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_nl_dp4a.cu", "matmul_iq4_nl_dp4a"); }
+                catch (Exception e) { /* not yet written */ }
+                try { dIq4xsFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_xs_dp4a.cu", "matmul_iq4_xs_dp4a"); }
+                catch (Exception e) { /* not yet written */ }
+                try { dIq4xsMwFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_xs_dp4a_mw.cu", "matmul_iq4_xs_dp4a_mw"); }
+                catch (Exception e) { /* optional multi-warp variant */ }
+                if (dp4aMwReq) {
+                    try {
+                        dQ4kMwFunc = cudaContext.compileKernel("kernels/cuda/matmul_q4_k_dp4a_mw.cu", "matmul_q4_k_dp4a_mw");
+                        dp4aMwAvail = true;
+                    } catch (Exception e) {
+                        System.err.println("CUDA: Q4_K multi-warp dp4a unavailable: " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("CUDA: dp4a kernels unavailable — " + e.getMessage());
+            }
+        }
+        useDp4a = dp4aAvail;
+        useDp4aMw = dp4aMwAvail;
+        dp4aQ4kMwFunc = dQ4kMwFunc;
+
+        // Port of llama.cpp's mul_mat_vec_q for Q4_K (opt-in via -Dcuda.dp4a.mmvq=true)
+        boolean mmvqReq = "true".equals(System.getProperty("cuda.dp4a.mmvq", "false"));
+        MemorySegment dQ4kMmvqFunc = null;
+        if (dp4aAvail && mmvqReq) {
+            try {
+                dQ4kMmvqFunc = cudaContext.compileKernel("kernels/cuda/matmul_q4_k_mmvq.cu", "matmul_q4_k_mmvq");
+                System.err.println("CUDA: Q4_K mmvq kernel enabled (llama.cpp port — 4 warps/row, vdr=2)");
+            } catch (Exception e) {
+                System.err.println("CUDA: Q4_K mmvq kernel unavailable: " + e.getMessage());
+            }
+        }
+        mmvqQ4kFunc = dQ4kMmvqFunc;
+        useMmvqQ4k = dQ4kMmvqFunc != null;
+
+        // Fused dp4a gate+up — opt-in via -Dcuda.dp4a.fused_gate_up=true.
+        // Measured marginal/regression on Llama-1B (70.9 vs 73.5 separate-dp4a) because
+        // input was already L1-cached and the fused kernel adds register pressure.
+        // Kept available for future experimentation on architectures with different ratios.
+        MemorySegment dFusedFunc = null;
+        boolean dFusedReq = "true".equals(System.getProperty("cuda.dp4a.fused_gate_up", "false"));
+        if (dp4aAvail && dFusedReq) {
+            try {
+                dFusedFunc = cudaContext.compileKernel(
+                    "kernels/cuda/matmul_q4_k_dp4a_fused_gate_up.cu",
+                    "matmul_q4_k_dp4a_fused_gate_up");
+                System.err.println("CUDA: dp4a fused gate+up kernel enabled (opt-in)");
+            } catch (Exception e) {
+                System.err.println("CUDA: dp4a fused gate+up kernel unavailable: " + e.getMessage());
+            }
+        }
+        dp4aFusedGateUpFunc = dFusedFunc;
+        useDp4aFusedGateUp = dFusedFunc != null;
+        // ParamBuffer constructed here, but slots that need gpuXbQ8 are set AFTER the buffer alloc below.
+        dp4aFusedGateUpPB = useDp4aFusedGateUp ? new ParamBuffer(arena, 7) : null;
+        quantizeFunc = qFunc;
+        dp4aQ4kFunc = dQ4kFunc;
+        dp4aQ5kFunc = dQ5kFunc;
+        dp4aQ6kFunc = dQ6kFunc;
+        dp4aQ50Func = dQ50Func;
+        dp4aQ80Func = dQ80Func;
+        dp4aIq4nlFunc = dIq4nlFunc;
+        dp4aIq4xsFunc = dIq4xsFunc;
+        dp4aIq4xsMwFunc = dIq4xsMwFunc;
+        if (useDp4a) {
+            // Q8_1 layout: per 32-element block, 4-byte scale + 4-byte sum + 32 bytes int8 = 40 bytes.
+            int xbQ8Bytes  = ((dim    + 31) / 32) * 40;
+            int xb2Q8Bytes = ((qDim   + 31) / 32) * 40;
+            int hbQ8Bytes  = ((ffnDim + 31) / 32) * 40;
+            gpuXbQ8  = bufferManager.createBuffer(xbQ8Bytes);
+            gpuXb2Q8 = bufferManager.createBuffer(xb2Q8Bytes);
+            gpuHbQ8  = bufferManager.createBuffer(hbQ8Bytes);
+
+            // 8 warps per block (256 threads); each warp handles one Q8_1 block (32 elems).
+            int xbBlocks  = (dim    + 31) / 32;
+            int xb2Blocks = (qDim   + 31) / 32;
+            int hbBlocks  = (ffnDim + 31) / 32;
+            quantizeXbGridDim  = (xbBlocks  + 7) / 8;
+            quantizeXb2GridDim = (xb2Blocks + 7) / 8;
+            quantizeHbGridDim  = (hbBlocks  + 7) / 8;
+
+            quantizeXbPB  = new ParamBuffer(arena, 3);
+            quantizeXbPB.setLong(0, gpuXb);
+            quantizeXbPB.setLong(1, gpuXbQ8);
+            quantizeXbPB.setInt(2, dim);
+
+            quantizeXb2PB = new ParamBuffer(arena, 3);
+            quantizeXb2PB.setLong(0, gpuXb2);
+            quantizeXb2PB.setLong(1, gpuXb2Q8);
+            quantizeXb2PB.setInt(2, qDim);
+
+            // Wire fused dp4a gate+up params now that gpuXbQ8 exists
+            if (useDp4aFusedGateUp) {
+                dp4aFusedGateUpPB.setLong(2, gpuXbQ8);   // input (Q8_1 quantized)
+                dp4aFusedGateUpPB.setLong(3, gpuHb);     // gateOutput
+                dp4aFusedGateUpPB.setLong(4, gpuHb2);    // upOutput
+                dp4aFusedGateUpPB.setInt(5, ffnDim);     // rows
+                dp4aFusedGateUpPB.setInt(6, dim);        // cols
+            }
+
+            quantizeHbPB  = new ParamBuffer(arena, 3);
+            quantizeHbPB.setLong(0, gpuHb);
+            quantizeHbPB.setLong(1, gpuHbQ8);
+            quantizeHbPB.setInt(2, ffnDim);
+
+            dp4aPB = new ParamBuffer(arena, 6);
+
+            String dp4aTypes = "Q4_K";
+            if (dp4aQ5kFunc != null) dp4aTypes += "+Q5_K";
+            if (dp4aQ6kFunc != null) dp4aTypes += "+Q6_K";
+            System.err.println("CUDA: dp4a enabled (" + dp4aTypes + " × Q8_1, scratch="
+                + (xbQ8Bytes + xb2Q8Bytes + hbQ8Bytes) + " bytes)");
+        } else {
+            gpuXbQ8 = 0; gpuXb2Q8 = 0; gpuHbQ8 = 0;
+            quantizeXbGridDim = 0; quantizeXb2GridDim = 0; quantizeHbGridDim = 0;
+            quantizeXbPB = null; quantizeXb2PB = null; quantizeHbPB = null; dp4aPB = null;
+        }
+
+        // === Fused RMSNorm + Q8_1 quantize (saves 1 launch + 1 HBM round-trip per layer) ===
+        // Default ON when dp4a is on. Disable with -Dcuda.fused_norm_quantize=false.
+        MemorySegment rnqFunc = null;
+        if (useDp4a && !"false".equals(System.getProperty("cuda.fused_norm_quantize", "true"))) {
+            try {
+                rnqFunc = cudaContext.compileKernel(
+                    "kernels/cuda/rmsnorm_quantize.cu", "rmsnorm_quantize_fused");
+                System.err.println("CUDA: fused RMSNorm+Quantize enabled");
+            } catch (Exception e) {
+                System.err.println("CUDA: fused RMSNorm+Quantize unavailable: " + e.getMessage());
+            }
+        }
+        rmsnormQuantizeFunc = rnqFunc;
+        useFusedNormQuantize = (rnqFunc != null);
+        if (useFusedNormQuantize) {
+            // 6 args: normOut, qOut, in, w, size, eps. Slots 0,1,2,4,5 fixed; slot 3 = w (per-layer)
+            rmsnormQuantizePB = new ParamBuffer(arena, 6);
+            rmsnormQuantizePB.setLong(0, gpuXb);          // normOut
+            rmsnormQuantizePB.setLong(1, gpuXbQ8);        // qOut
+            rmsnormQuantizePB.setLong(2, gpuX);           // in
+            rmsnormQuantizePB.setInt(4, dim);             // size
+            rmsnormQuantizePB.setFloat(5, normEps);       // eps
+        } else {
+            rmsnormQuantizePB = null;
+        }
+
         // === Pre-compute per-layer matmul launch descriptors (only GPU layers) ===
         layerMatmuls = new MatmulLaunch[gpuLayerCount][7];
         boolean canFuseGateUp = fusedGateUpFunc != null;
@@ -645,31 +882,31 @@ public class CudaForwardPass implements AutoCloseable {
             TransformerLayerWeights layer = weights.layers()[i];
             if (hasMergedQKV) {
                 // Merged QKV: single matmul wqkv → gpuQKV, then split kernel
-                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wqkv(), gpuXb, gpuQKV, qkvDim, dim, 0);
+                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wqkv(), gpuXb, gpuQKV, qkvDim, dim, 0, gpuXbQ8);
                 layerMatmuls[i][1] = null; // unused — split kernel handles K
                 layerMatmuls[i][2] = null; // unused — split kernel handles V
             } else {
-                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wq(), gpuXb, gpuQ, qDim, dim, 0);
-                layerMatmuls[i][1] = new MatmulLaunch((CudaFloatTensor) layer.wk(), gpuXb, gpuK, kvDim, dim, 0);
-                layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) layer.wv(), gpuXb, gpuV, kvDim, dim, 0);
+                layerMatmuls[i][0] = new MatmulLaunch((CudaFloatTensor) layer.wq(), gpuXb, gpuQ, qDim, dim, 0, gpuXbQ8);
+                layerMatmuls[i][1] = new MatmulLaunch((CudaFloatTensor) layer.wk(), gpuXb, gpuK, kvDim, dim, 0, gpuXbQ8);
+                layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) layer.wv(), gpuXb, gpuV, kvDim, dim, 0, gpuXbQ8);
             }
             // Post-norm: Wo/Down write to gpuXb, post-norm then accumulate
             // Granite residual: Wo/Down write to gpuXb, scale, then accumulate (saxpy)
             // Pre-norm: Wo/Down accumulate directly to gpuX (addToOutput=1)
             boolean woWriteMode = hasPostNorm || graniteResidualScale > 0;
             layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) layer.wo(), gpuXb2,
-                    woWriteMode ? gpuXb : gpuX, dim, qDim, woWriteMode ? 0 : 1);
+                    woWriteMode ? gpuXb : gpuX, dim, qDim, woWriteMode ? 0 : 1, gpuXb2Q8);
             if (hasPackedFFN) {
                 // Packed FFN: no gate weight, wUp outputs 2*ffnDim → gpuHbPacked, then split kernel
                 layerMatmuls[i][4] = null;
-                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHbPacked, ffnDim * 2, dim, 0);
+                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHbPacked, ffnDim * 2, dim, 0, gpuXbQ8);
             } else {
-                layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0);
-                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
+                layerMatmuls[i][4] = new MatmulLaunch((CudaFloatTensor) layer.wGate(), gpuXb, gpuHb, ffnDim, dim, 0, gpuXbQ8);
+                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) layer.wUp(), gpuXb, gpuHb2, ffnDim, dim, 0, gpuXbQ8);
             }
             boolean downWriteMode = hasPostNorm || graniteResidualScale > 0;
             layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) layer.wDown(), gpuHb,
-                    downWriteMode ? gpuXb : gpuX, dim, ffnDim, downWriteMode ? 0 : 1);
+                    downWriteMode ? gpuXb : gpuX, dim, ffnDim, downWriteMode ? 0 : 1, gpuHbQ8);
 
             // Check if gate and up are both Q4_K for fused kernel (not applicable for packed FFN)
             if (canFuseGateUp && !hasPackedFFN && layer.wGate() instanceof CudaFloatTensor && layer.wUp() instanceof CudaFloatTensor) {
@@ -936,7 +1173,7 @@ public class CudaForwardPass implements AutoCloseable {
                 cublasMatmul.sgemv(cublasF32Output, gpuXb, gpuLogits, vocabSize, dim, false);
             }
         } else {
-            launchMatmul(outputMatmul);
+            launchOutputMatmul();
         }
 
         // Granite logit scaling: divide logits by logitScale (on GPU)
@@ -971,7 +1208,7 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
 
         // Output projection
-        launchMatmul(outputMatmul);
+        launchOutputMatmul();
 
         // GPU-side argmax (two-phase: partial → final)
         argmaxPartialPB.setLong(0, gpuLogits);
@@ -1006,7 +1243,7 @@ public class CudaForwardPass implements AutoCloseable {
 
                 normPB.setLong(2, gpuOutputNormWeights);
                 launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-                launchMatmul(outputMatmul);
+                launchOutputMatmul();
 
                 MemorySegment graph = cudaContext.endCapture();
                 capturing = false;
@@ -1084,21 +1321,22 @@ public class CudaForwardPass implements AutoCloseable {
         // === Attention Phase ===
 
         // 1. RMSNorm (attnNorm): gpuX → gpuXb  (or plain copy for post-norm-only models like OLMo2)
+        // dp4a path: fused norm+quantize when both are needed (1 launch instead of 2).
         if (hasPreNorm) {
-            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuAttnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();
         }
 
         // 2. Q/K/V projections (write mode)
         if (hasMergedQKV) {
-            launchMatmulCublas(ml[0], layerIdx, 0); // wqkv → gpuQKV
+            launchMatmulCublasOrDp4a(ml[0], layerIdx, 0); // wqkv → gpuQKV
             launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
         } else {
-            launchMatmulCublas(ml[0], layerIdx, 0); // wq
-            launchMatmulCublas(ml[1], layerIdx, 1); // wk
-            launchMatmulCublas(ml[2], layerIdx, 2); // wv
+            launchMatmulCublasOrDp4a(ml[0], layerIdx, 0); // wq
+            launchMatmulCublasOrDp4a(ml[1], layerIdx, 1); // wk
+            launchMatmulCublasOrDp4a(ml[2], layerIdx, 2); // wv
         }
 
 
@@ -1145,8 +1383,10 @@ public class CudaForwardPass implements AutoCloseable {
 
         // === FFN Phase ===
 
+        // dp4a: pre-quantize gpuXb2 → gpuXb2Q8 for the Wo projection
+        quantizeXb2();
         // 6. Wo matmul
-        launchMatmulCublas(ml[3], layerIdx, 3); // wo
+        launchMatmulCublasOrDp4a(ml[3], layerIdx, 3); // wo
 
         // 6b. Granite residual scaling: gpuX += residualScale * gpuXb (saxpy)
         if (graniteResidualScale > 0) {
@@ -1162,16 +1402,24 @@ public class CudaForwardPass implements AutoCloseable {
 
         // 7. FFN RMSNorm: gpuX → gpuXb  (or plain copy for post-norm-only)
         if (hasPreNorm) {
-            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuFfnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();  // bug-fix 2026-04-14: forwardLayer non-graph was missing this
         }
 
-        // 8. Gate + Up projections (write mode) — packed FFN, fused, or separate
+        // 8. Gate + Up projections — packed FFN, dp4a-fused (preferred when both Q4_K), 2× dp4a, FP32 fused, or separate
         if (hasPackedFFN) {
-            launchMatmulCublas(ml[5], layerIdx, 5);
+            launchMatmulCublasOrDp4a(ml[5], layerIdx, 5);
             launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useDp4aFusedGateUp && useDp4a && !useCublas
+                                       && ml[4] != null && ml[4].dp4aType == 4
+                                       && ml[5] != null && ml[5].dp4aType == 4
+                                       && fusedGateWeights != null) {
+            launchDp4aFusedGateUp(layerIdx);
+        } else if (useDp4a && !useCublas && ml[4] != null && ml[4].dp4aType == 4 && ml[5] != null && ml[5].dp4aType == 4) {
+            launchMatmulDp4a(ml[4]);
+            launchMatmulDp4a(ml[5]);
         } else if (useFusedGateUp && !useCublas) {
             launchFusedGateUp(layerIdx);
         } else {
@@ -1182,8 +1430,10 @@ public class CudaForwardPass implements AutoCloseable {
         // 9. Fused SiLU + element-wise multiply (fully fixed params)
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
 
+        // dp4a: pre-quantize gpuHb (silu out) → gpuHbQ8 for the Down projection
+        quantizeHb();
         // 10. Down projection
-        launchMatmulCublas(ml[6], layerIdx, 6); // down
+        launchMatmulCublasOrDp4a(ml[6], layerIdx, 6); // down
 
         // 10b. Granite residual scaling for FFN
         if (graniteResidualScale > 0) {
@@ -1206,20 +1456,20 @@ public class CudaForwardPass implements AutoCloseable {
         long tTotal = t0;
 
         if (hasPreNorm) {
-            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuAttnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();
         }
         cudaContext.finish(); t1 = System.nanoTime(); profAttnNorm += t1 - t0; t0 = t1;
 
         if (hasMergedQKV) {
-            launchMatmul(ml[0]);
+            launchMatmulDp4a(ml[0]);
             launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
         } else {
-            launchMatmul(ml[0]);
-            launchMatmul(ml[1]);
-            launchMatmul(ml[2]);
+            launchMatmulDp4a(ml[0]);
+            launchMatmulDp4a(ml[1]);
+            launchMatmulDp4a(ml[2]);
         }
         if (hasBias) {
             launchBias(gpuQ, gpuQBias[layerIdx], qDim, biasQGridDim);
@@ -1245,7 +1495,9 @@ public class CudaForwardPass implements AutoCloseable {
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, attnSharedMem, attnPB.ptrs);
         cudaContext.finish(); t1 = System.nanoTime(); profAttn += t1 - t0; t0 = t1;
 
-        launchMatmul(ml[3]);
+        // dp4a: quantize gpuXb2 (attention output) before Wo
+        quantizeXb2();
+        launchMatmulDp4a(ml[3]);
         if (hasPostNorm) {
             postNormPB.setLong(2, gpuPostAttnNormWeights[layerIdx]);
             launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
@@ -1254,16 +1506,19 @@ public class CudaForwardPass implements AutoCloseable {
         cudaContext.finish(); t1 = System.nanoTime(); profWo += t1 - t0; t0 = t1;
 
         if (hasPreNorm) {
-            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuFfnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();
         }
         cudaContext.finish(); t1 = System.nanoTime(); profFfnNorm += t1 - t0; t0 = t1;
 
         if (hasPackedFFN) {
-            launchMatmul(ml[5]);
+            launchMatmulDp4a(ml[5]);
             launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useDp4a && ml[4] != null && ml[4].dp4aType == 4 && ml[5] != null && ml[5].dp4aType == 4) {
+            launchMatmulDp4a(ml[4]);
+            launchMatmulDp4a(ml[5]);
         } else if (useFusedGateUp) {
             launchFusedGateUp(layerIdx);
         } else {
@@ -1273,7 +1528,9 @@ public class CudaForwardPass implements AutoCloseable {
         cudaContext.finish(); t1 = System.nanoTime(); profGateUp += t1 - t0; t0 = t1;
 
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
-        launchMatmul(ml[6]);
+        // dp4a: quantize gpuHb (silu output) before Down
+        quantizeHb();
+        launchMatmulDp4a(ml[6]);
         if (hasPostNorm) {
             postNormPB.setLong(2, gpuPostFfnNormWeights[layerIdx]);
             launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, postNormPB.ptrs);
@@ -1323,7 +1580,7 @@ public class CudaForwardPass implements AutoCloseable {
                 // Final RMSNorm + output projection
                 normPB.setLong(2, gpuOutputNormWeights);
                 launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-                launchMatmul(outputMatmul);
+                launchOutputMatmul();
 
                 MemorySegment graph = cudaContext.endCapture();
                 capturing = false;
@@ -1367,22 +1624,22 @@ public class CudaForwardPass implements AutoCloseable {
     private void forwardLayerKernels(int layerIdx) {
         MatmulLaunch[] ml = layerMatmuls[layerIdx];
 
-        // Attention norm (or plain copy for post-norm-only)
+        // Attention norm (or plain copy for post-norm-only) + dp4a quantize fused if possible.
         if (hasPreNorm) {
-            normPB.setLong(2, gpuAttnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuAttnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();
         }
 
         // QKV projections
         if (hasMergedQKV) {
-            launchMatmul(ml[0]); // wqkv → gpuQKV
+            launchMatmulDp4a(ml[0]); // wqkv → gpuQKV
             launchKernel(splitQkvFunc, splitQkvGridDim, (int) blockSize, 0, splitQkvPB.ptrs);
         } else {
-            launchMatmul(ml[0]);
-            launchMatmul(ml[1]);
-            launchMatmul(ml[2]);
+            launchMatmulDp4a(ml[0]);
+            launchMatmulDp4a(ml[1]);
+            launchMatmulDp4a(ml[2]);
         }
 
         // QKV bias (Qwen2)
@@ -1432,8 +1689,9 @@ public class CudaForwardPass implements AutoCloseable {
         attnPB.setLong(3, gpuValueCache[layerIdx]);
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, graphAttnSharedMem, attnPB.ptrs);
 
-        // Wo projection
-        launchMatmul(ml[3]);
+        // dp4a: pre-quantize gpuXb2 (attention output) → gpuXb2Q8 for the Wo projection
+        quantizeXb2();
+        launchMatmulDp4a(ml[3]);
 
         // Granite residual scaling for attention output
         if (graniteResidualScale > 0) {
@@ -1447,19 +1705,27 @@ public class CudaForwardPass implements AutoCloseable {
             launchBias(gpuX, gpuXb, dim, numWorkGroups);
         }
 
-        // FFN norm (or plain copy for post-norm-only)
+        // FFN norm (or plain copy for post-norm-only) + dp4a re-quantize fused if possible.
         if (hasPreNorm) {
-            normPB.setLong(2, gpuFfnNormWeights[layerIdx]);
-            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            normAndQuantizeXb(gpuFfnNormWeights[layerIdx]);
         } else {
             cudaContext.copyBufferDtoD(gpuXb, gpuX, (long) dim * Float.BYTES);
+            quantizeXb();
         }
 
-        // Gate + Up projections — packed FFN, fused, or separate
+        // Gate + Up projections — preference order:
+        //   packed FFN (Phi-3/4) → dp4a-fused (single kernel, halved input reads) →
+        //   2× dp4a separate → FP32 fused → 2× FP32
         if (hasPackedFFN) {
-            // Single wUp matmul → gpuHbPacked (2*ffnDim), then split into gpuHb + gpuHb2
-            launchMatmul(ml[5]);
+            launchMatmulDp4a(ml[5]);
             launchKernel(splitGateUpFunc, splitGateUpGridDim, (int) blockSize, 0, splitGateUpPB.ptrs);
+        } else if (useDp4aFusedGateUp && useDp4a && ml[4] != null && ml[4].dp4aType == 4
+                                       && ml[5] != null && ml[5].dp4aType == 4
+                                       && fusedGateWeights != null) {
+            launchDp4aFusedGateUp(layerIdx);
+        } else if (useDp4a && ml[4] != null && ml[4].dp4aType == 4 && ml[5] != null && ml[5].dp4aType == 4) {
+            launchMatmulDp4a(ml[4]);
+            launchMatmulDp4a(ml[5]);
         } else if (useFusedGateUp) {
             launchFusedGateUp(layerIdx);
         } else {
@@ -1470,8 +1736,9 @@ public class CudaForwardPass implements AutoCloseable {
         // SiLU + element-wise multiply
         launchKernel(siluMulFunc, siluGridDim, (int) blockSize, 0, siluPB.ptrs);
 
-        // Down projection
-        launchMatmul(ml[6]);
+        // dp4a: pre-quantize gpuHb (silu output) → gpuHbQ8 for the Down projection
+        quantizeHb();
+        launchMatmulDp4a(ml[6]);
 
         // Granite residual scaling for FFN output
         if (graniteResidualScale > 0) {
@@ -1499,6 +1766,23 @@ public class CudaForwardPass implements AutoCloseable {
     }
 
     /**
+     * Fused dp4a gate+up: single kernel computes both projections, reading the Q8_1
+     * input ONCE (vs two separate dp4a launches that each read it). Halves input
+     * bandwidth for the FFN gate/up stage and saves one kernel-launch's worth of
+     * dispatch overhead.
+     * Uses same grid/block as the standard Q4_K dp4a kernel (ffnDim is the rows,
+     * blockDim=256, 8 rows/block).
+     */
+    private void launchDp4aFusedGateUp(int layerIdx) {
+        dp4aFusedGateUpPB.setLong(0, fusedGateWeights[layerIdx]);
+        dp4aFusedGateUpPB.setLong(1, fusedUpWeights[layerIdx]);
+        // Same grid/block layout as single dp4a Q4_K matmul over (rows=ffnDim, cols=dim)
+        int blockDim = 256;
+        int gridDim = (ffnDim + 7) / 8;
+        launchKernel(dp4aFusedGateUpFunc, gridDim, blockDim, 0, dp4aFusedGateUpPB.ptrs);
+    }
+
+    /**
      * Launch a matmul: cuBLAS sgemv if available for this tensor, otherwise custom kernel.
      */
     private void launchMatmul(MatmulLaunch ml) {
@@ -1509,6 +1793,157 @@ public class CudaForwardPass implements AutoCloseable {
         matmulPB.setInt(4, ml.cols);
         matmulPB.setInt(5, ml.addToOutput);
         launchKernel(ml.function, ml.gridDim, ml.blockDim, ml.sharedMem, matmulPB.ptrs);
+    }
+
+    /**
+     * Launch matmul via dp4a int8 kernel (Q4_K/Q5_K/Q6_K) reading pre-quantized Q8_1 input.
+     * Falls back to {@link #launchMatmul} if dp4a is disabled, the tensor type is not eligible,
+     * or the dp4a kernel for that type wasn't compiled.
+     * Caller must have already populated ml.q8InputPtr via the corresponding quantize* call.
+     */
+    private void launchMatmulDp4a(MatmulLaunch ml) {
+        if (!useDp4a || ml.dp4aType == 0 || ml.q8InputPtr == 0
+            || "true".equals(System.getProperty("cuda.dp4a.bypass", "false"))) {
+            launchMatmul(ml);
+            return;
+        }
+        MemorySegment func;
+        int gridDim = ml.gridDim;
+        int blockDim = ml.blockDim;
+        switch (ml.dp4aType) {
+            case 4:
+                if (useMmvqQ4k) {
+                    // mmvq: 4 warps × 32 lanes per row (llama.cpp pattern), 1 row per block.
+                    func = mmvqQ4kFunc;
+                    blockDim = 128;
+                    gridDim = ml.rows;
+                } else if (useDp4aMw) {
+                    func = dp4aQ4kMwFunc;
+                    blockDim = 128;       // 4 warps × 32 lanes (llama.cpp pattern)
+                    gridDim = ml.rows;    // 1 row per block
+                } else {
+                    func = dp4aQ4kFunc;
+                }
+                break;
+            case 5:
+                if ("false".equals(System.getProperty("cuda.dp4a.q5", "true"))) { launchMatmul(ml); return; }
+                func = dp4aQ5kFunc; break;
+            case 6:
+                // Q6_K dp4a kernel — rewritten 2026-04-14 with byte loads (Q6_K block is 210
+                // bytes, not 4-byte aligned). Bit-equivalent to FP32 reference but **measured
+                // SLOWER than the FP32 Q6_K kernel** on Llama-1B (70.6 vs 72.85 tok/s) because
+                // the byte-load overhead overwhelms the dp4a benefit on Q6_K's heavier format.
+                // Default OFF; opt-in via -Dcuda.dp4a.q6=true (kept for ground-truth checks).
+                if (!"true".equals(System.getProperty("cuda.dp4a.q6", "false"))) { launchMatmul(ml); return; }
+                func = dp4aQ6kFunc; break;
+            case 50:  // Q5_0 — fixes Gemma-3-1B (Q5_0 used for QKV/gate/up)
+                func = dp4aQ50Func; break;
+            case 80:  // Q8_0 — fixes Qwen3 Q8_0 models
+                func = dp4aQ80Func; break;
+            case 41:  // IQ4_NL — fixes Phi-3-mini IQ4_NL
+                func = dp4aIq4nlFunc; break;
+            case 42:  // IQ4_XS — fixes Gemma-2 IQ4_XS
+                // Multi-warp kernel is much better for small-cols matmuls where single-warp
+                // would leave most lanes idle (e.g. cols=2304: 9 of 32 lanes working).
+                // Default on; disable with -Dcuda.dp4a.iq4xs.mw=false.
+                if (dp4aIq4xsMwFunc != null
+                    && !"false".equals(System.getProperty("cuda.dp4a.iq4xs.mw", "true"))) {
+                    func = dp4aIq4xsMwFunc;
+                    blockDim = 128;
+                    gridDim = ml.rows;
+                } else {
+                    func = dp4aIq4xsFunc;
+                }
+                break;
+            default: launchMatmul(ml); return;
+        }
+        if (func == null) { launchMatmul(ml); return; }
+        dp4aPB.setLong(0, ml.weightPtr);
+        dp4aPB.setLong(1, ml.q8InputPtr);
+        dp4aPB.setLong(2, ml.outputPtr);
+        dp4aPB.setInt(3, ml.rows);
+        dp4aPB.setInt(4, ml.cols);
+        dp4aPB.setInt(5, ml.addToOutput);
+        launchKernel(func, gridDim, blockDim, 0, dp4aPB.ptrs);
+    }
+
+    /**
+     * Hybrid: prefer cuBLAS for this matmul; if unavailable, use dp4a; if also unavailable, FP32 kernel.
+     */
+    private void launchMatmulCublasOrDp4a(MatmulLaunch ml, int layerIdx, int matmulIdx) {
+        if (useCublas && cublasF32Weights[layerIdx][matmulIdx] != 0) {
+            launchMatmulCublas(ml, layerIdx, matmulIdx);
+        } else {
+            launchMatmulDp4a(ml);
+        }
+    }
+
+    /** Quantize gpuXb (FP32, dim) → gpuXbQ8 (Q8_1). No-op if dp4a disabled. */
+    private void quantizeXb() {
+        if (!useDp4a) return;
+        launchKernel(quantizeFunc, quantizeXbGridDim, 256, 0, quantizeXbPB.ptrs);
+    }
+
+    /**
+     * Fused RMSNorm(gpuX → gpuXb) + Quantize(gpuXb → gpuXbQ8) in a single kernel launch.
+     * Saves vs separate-kernel: 1 launch overhead + 1 HBM round-trip on gpuXb (size×4 bytes).
+     * Falls back to separate norm + quantize when fused kernel disabled.
+     */
+    private void normAndQuantizeXb(long normWeights) {
+        if (useFusedNormQuantize) {
+            rmsnormQuantizePB.setLong(3, normWeights);
+            launchKernel(rmsnormQuantizeFunc, 1, (int) blockSize, normSharedMem, rmsnormQuantizePB.ptrs);
+        } else {
+            normPB.setLong(2, normWeights);
+            launchKernel(rmsnormFusedFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+            quantizeXb();
+        }
+    }
+
+    /**
+     * Output-projection helper: quantize gpuXb → gpuXbQ8 then launch the (large) output
+     * matmul as dp4a. Fallback: plain FP32 matmul. The output matmul's static q8InputPtr is
+     * 0 (it was constructed before dp4a init), so we wire the buffer in here at launch time.
+     */
+    private void launchOutputMatmul() {
+        if (!useDp4a || outputMatmul.dp4aType == 0) {
+            launchMatmul(outputMatmul);
+            return;
+        }
+        // Select kernel by tensor type. Q6_K supported now (kernel rewritten 2026-04-14).
+        MemorySegment outFunc;
+        switch (outputMatmul.dp4aType) {
+            case 4: outFunc = dp4aQ4kFunc; break;
+            case 5:
+                if ("false".equals(System.getProperty("cuda.dp4a.q5", "true"))) { launchMatmul(outputMatmul); return; }
+                outFunc = dp4aQ5kFunc; break;
+            case 6:
+                if (!"true".equals(System.getProperty("cuda.dp4a.q6", "false"))) { launchMatmul(outputMatmul); return; }
+                outFunc = dp4aQ6kFunc; break;
+            default: launchMatmul(outputMatmul); return;
+        }
+        if (outFunc == null) { launchMatmul(outputMatmul); return; }
+        // Quantize freshly-normalized gpuXb (output of final RMSNorm) for dp4a output projection
+        quantizeXb();
+        dp4aPB.setLong(0, outputMatmul.weightPtr);
+        dp4aPB.setLong(1, gpuXbQ8);
+        dp4aPB.setLong(2, outputMatmul.outputPtr);
+        dp4aPB.setInt(3, outputMatmul.rows);
+        dp4aPB.setInt(4, outputMatmul.cols);
+        dp4aPB.setInt(5, outputMatmul.addToOutput);
+        launchKernel(outFunc, outputMatmul.gridDim, outputMatmul.blockDim, 0, dp4aPB.ptrs);
+    }
+
+    /** Quantize gpuXb2 (FP32, qDim) → gpuXb2Q8 (Q8_1). No-op if dp4a disabled. */
+    private void quantizeXb2() {
+        if (!useDp4a) return;
+        launchKernel(quantizeFunc, quantizeXb2GridDim, 256, 0, quantizeXb2PB.ptrs);
+    }
+
+    /** Quantize gpuHb (FP32, ffnDim) → gpuHbQ8 (Q8_1). No-op if dp4a disabled. */
+    private void quantizeHb() {
+        if (!useDp4a) return;
+        launchKernel(quantizeFunc, quantizeHbGridDim, 256, 0, quantizeHbPB.ptrs);
     }
 
     /**
@@ -1601,6 +2036,11 @@ public class CudaForwardPass implements AutoCloseable {
         try { cudaContext.freeBuffer(gpuArgmaxPartialVal); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuArgmaxPartialIdx); } catch (Exception ignored) {}
         try { cudaContext.freeBuffer(gpuArgmaxResult); } catch (Exception ignored) {}
+        if (useDp4a) {
+            try { cudaContext.freeBuffer(gpuXbQ8); } catch (Exception ignored) {}
+            try { cudaContext.freeBuffer(gpuXb2Q8); } catch (Exception ignored) {}
+            try { cudaContext.freeBuffer(gpuHbQ8); } catch (Exception ignored) {}
+        }
         if (gpuQBias != null) {
             for (long ptr : gpuQBias) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }
             for (long ptr : gpuKBias) { if (ptr != 0) try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {} }

@@ -29,6 +29,13 @@ public class CudaContext implements AutoCloseable {
     private final Map<String, MemorySegment> moduleCache = new ConcurrentHashMap<>();   // CUmodule
     private volatile boolean closed = false;
 
+    // Option A: prefer pre-compiled cubin/PTX over NVRTC JIT when available.
+    // Opt-in so default behavior is unchanged; toggled via -Dcuda.prebuilt=true.
+    private static final boolean USE_PREBUILT =
+        "true".equals(System.getProperty("cuda.prebuilt", "false"));
+    private static final boolean PREBUILT_VERBOSE =
+        "true".equals(System.getProperty("cuda.prebuilt.verbose", "false"));
+
     private CudaContext(Arena arena, int device, MemorySegment ctx, MemorySegment stream,
                         DeviceInfo deviceInfo, int ccMajor, int ccMinor) {
         this.arena = arena;
@@ -165,11 +172,18 @@ public class CudaContext implements AutoCloseable {
             // Check if module already compiled for this resource
             MemorySegment module = moduleCache.get(resourcePath);
             if (module == null) {
-                String source = loadResource(resourcePath);
-                if (source == null) {
-                    throw new RuntimeException("Kernel resource not found: " + resourcePath);
+                // Option A (PTX pre-compiled): try prebuilt cubin/ptx before NVRTC.
+                // Opt-in via -Dcuda.prebuilt=true; default falls back to NVRTC.
+                if (USE_PREBUILT) {
+                    module = tryLoadPrebuiltModule(resourcePath);
                 }
-                module = compileSourceToModule(source, resourcePath);
+                if (module == null) {
+                    String source = loadResource(resourcePath);
+                    if (source == null) {
+                        throw new RuntimeException("Kernel resource not found: " + resourcePath);
+                    }
+                    module = compileSourceToModule(source, resourcePath);
+                }
                 moduleCache.put(resourcePath, module);
             }
 
@@ -226,6 +240,70 @@ public class CudaContext implements AutoCloseable {
             } finally {
                 CudaBindings.destroyProgram(progBuf);
             }
+        }
+    }
+
+    /**
+     * Try to load a pre-compiled cubin or PTX binary from resources, avoiding NVRTC entirely.
+     * Lookup order for resource `kernels/cuda/foo.cu` on CC=8.9:
+     *   1. kernels/cuda/prebuilt/foo.sm89.cubin  (sm-matched SASS, no driver JIT)
+     *   2. kernels/cuda/prebuilt/foo.sm89.ptx    (virtual PTX, driver JITs)
+     * Returns the CUmodule pointer, or null if no prebuilt artifact is available.
+     */
+    private MemorySegment tryLoadPrebuiltModule(String resourcePath) {
+        // Derive "<dir>/prebuilt/<base>.sm<CC>.<ext>" from "<dir>/<base>.cu"
+        int slash = resourcePath.lastIndexOf('/');
+        int dot = resourcePath.lastIndexOf('.');
+        if (slash < 0 || dot < 0 || dot <= slash) return null;
+        String dir = resourcePath.substring(0, slash);
+        String base = resourcePath.substring(slash + 1, dot);
+        String cc = "sm" + computeCapabilityMajor + computeCapabilityMinor;
+        String cubinPath = dir + "/prebuilt/" + base + "." + cc + ".cubin";
+        String ptxPath   = dir + "/prebuilt/" + base + "." + cc + ".ptx";
+
+        byte[] bin = loadResourceBytes(cubinPath);
+        String chosen = cubinPath;
+        if (bin == null) {
+            bin = loadResourceBytes(ptxPath);
+            chosen = ptxPath;
+        }
+        if (bin == null) return null;
+
+        try (Arena temp = Arena.ofConfined()) {
+            // Copy bytes into a native segment. PTX is NUL-terminated text; cubin is ELF binary.
+            // Allocate +1 so PTX path is guaranteed NUL-terminated (driver expects C string for PTX).
+            MemorySegment buf = temp.allocate(bin.length + 1L);
+            MemorySegment.copy(bin, 0, buf, ValueLayout.JAVA_BYTE, 0, bin.length);
+            buf.set(ValueLayout.JAVA_BYTE, bin.length, (byte) 0);
+
+            MemorySegment moduleBuf = arena.allocate(ValueLayout.ADDRESS);
+            int err = CudaBindings.moduleLoadDataEx(moduleBuf, buf, 0,
+                MemorySegment.NULL, MemorySegment.NULL);
+            if (err != CudaBindings.CUDA_SUCCESS) {
+                if (PREBUILT_VERBOSE) {
+                    System.err.println("[cuda.prebuilt] cuModuleLoadDataEx failed (" + err
+                        + ") for " + chosen + " — falling back to NVRTC");
+                }
+                return null;
+            }
+            if (PREBUILT_VERBOSE) {
+                System.err.println("[cuda.prebuilt] loaded " + chosen + " (" + bin.length + " bytes)");
+            }
+            return moduleBuf.get(ValueLayout.ADDRESS, 0);
+        } catch (Exception e) {
+            if (PREBUILT_VERBOSE) {
+                System.err.println("[cuda.prebuilt] exception loading " + chosen + ": " + e);
+            }
+            return null;
+        }
+    }
+
+    private static byte[] loadResourceBytes(String path) {
+        try (InputStream is = CudaContext.class.getClassLoader().getResourceAsStream(path)) {
+            if (is == null) return null;
+            return is.readAllBytes();
+        } catch (IOException e) {
+            return null;
         }
     }
 

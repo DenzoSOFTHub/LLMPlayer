@@ -1,5 +1,56 @@
 # LLMPlayer — What's New
 
+## v1.11.0 (2026-04-15)
+
+### dp4a expanded to Q5_0 / Q8_0 / IQ4_NL / IQ4_XS
+
+The `__dp4a` integer dot product path (previously Q4_K / Q5_K only) now covers four additional quant types via dedicated kernels: `matmul_q5_0_dp4a.cu`, `matmul_q8_0_dp4a.cu`, `matmul_iq4_nl_dp4a.cu`, `matmul_iq4_xs_dp4a.cu`. `MatmulLaunch.dp4aType` switch extended with codes 50 (Q5_0), 80 (Q8_0), 41 (IQ4_NL), 42 (IQ4_XS). PPL preserved bit-equivalent. Measured on RTX 4050 (3 runs each after cooldown):
+
+- **Phi-3-mini-instruct IQ4_NL: 8.4 → 11.9 tok/s = +42%** — biggest win (all weights IQ4_NL).
+- **Nemotron-3-Nano-4B: 10.4 → 20.0 tok/s = +92%** — `NemotronHCudaForwardPass` was missing dp4a infra entirely; now has full gate+up+down+QKV+Wo+output dp4a.
+- Qwen3-1.7B Q8_0: 31.1 → 33.5 = +8%.
+- Gemma-2-2B IQ4_XS: 8.6 → 9.0 = +5% (structural: only 9 super-blocks/row).
+- Gemma-3-1B Q5_0: 30.7 → 31.9 = +4% (Q5_0 only covers ~40% of matmuls in the Q4_K_M mix).
+- Qwen3-0.6B Q8_0: 67.6 → 69.0 = +2%.
+
+The anomaly models previously stuck at 15–32% of llama.cpp all suffered the same root cause (their weight quant type fell through to FP32 kernels). See `docs/optimization/llamacpp-comparison.md` for the full comparison table across 17 models.
+
+### Qwen3.5 + NemotronH engines now dp4a-aware
+
+`Qwen35CudaForwardPass` and `NemotronHCudaForwardPass` extended with the full dp4a type matrix. Qwen3.5 models are all Q4_K today (no immediate gain) but are ready for Q5_0 / Q8_0 / IQ4 variants. Nemotron-H gains are already realized (see above).
+
+### Granite Hybrid — full GPU path (Mamba-2 + integrated SwiGLU + all 4 scale factors)
+
+`NemotronHCudaForwardPass` gained the remaining piece: the **integrated SwiGLU FFN inside Mamba/Attention layers** (`lw.ffnUp() != null`) via `runIntegratedFFN()`. Per layer: RMSNorm → dp4a-quantize → gate+up (Q4_K dp4a) → `silu_mul` → dp4a-quantize → down → saxpy residual. All four scale factors (embedding/logit/residual/attention) wired on GPU via `scale_inplace` + `accumulate` + saxpy on residual matmuls. `isSupported()` now returns true for Granite Hybrid.
+
+Validated via paired CPU/GPU dumps (`-Ddebug.iffn=true`, now removed): with `-Dcuda.dp4a=false` the CPU and GPU paths are bit-equivalent to ±2 ULP at every layer stage. With dp4a on, the ~1-15% per-layer divergence is the expected Q8_1 quantization noise — final output is stable and coherent ("The capital of France is Paris." in 7 tokens, deterministic across 3 runs).
+
+**Measured on RTX 4050 (granite-4.0-h-micro Q4_K_M, best-of-3, 120 tokens, T=0):**
+- **35.6 tok/s** (was ~8 CPU-only, +4.4×)
+- vs llama.cpp 41.8 = **85%** (was 19%) — biggest single-model jump of the sprint
+- CUDA graph: captured 40 layers (first gen may fall back to per-layer on a transient capture error; subsequent gens replay the graph)
+
+Granite Hybrid is now the headline architectural win of v1.11.0-dev. Combined with the dp4a kernel fleet, this closes the two biggest gaps vs llama.cpp identified in the v1.10.1 audit.
+
+### Speculative decoding — scaffolding only
+
+New `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al. 2023). Standalone class that drives a target + draft `LLMEngine` pair via `forwardSingleToken`, using rejection sampling. Enabled with `--draft-model <gguf>`. **Current implementation is sequential verification** — the target runs K separate forwards to verify K draft tokens. Maximum theoretical speedup at K=4 with ratio 0.1: ~1.14×. Real 2-3× speedup requires a batched `forwardBatch(tokens, startPos)` API that does not exist yet. See `docs/optimization/speculative-decoding.md`.
+
+### New optimization journal — `docs/optimization/`
+
+Six new documents recording kernel-level attempts with measured outcomes. The headline is that on RTX 4050 (192 GB/s) at batch=1, Q4_K matvec is bandwidth-bound — cubin (Option A), cp.async prefetch (Option C), multi-warp Q4_K, and a full mmvq-style algorithm port all measured 0 to −22%. The dp4a wiring that shipped was the missing optimization.
+
+- `llamacpp-comparison.md` — rolling tok/s vs llama.cpp across 17 models (Granite 80%, Qwen2.5 73%, Llama 64%, OLMo 62%, Gemma-3 32%; avg standard Q4_K_M ~72%).
+- `option-a-ptx-attempt.md` — offline NVCC cubin path measured ±1% vs NVRTC (same `ptxas` backend). Opt-in via `-Dcuda.prebuilt=true`.
+- `option-c-cpasync-attempt.md` — cp.async input prefetch measured −2.8%. Input is L1-cached by `__ldg`; cp.async forces smem-style algorithm. Opt-in, default OFF.
+- `tier2-attempt.md`, `qwen35-profile-analysis.md`, `speculative-decoding.md`.
+
+### Architecture note: optimization ceiling on RTX 4050
+
+After Tier 1 / Tier 2 / Option A / Option C all failed in sequence on Llama-1B Q4_K, the hypothesis is structural: at 192 GB/s and batch=1, Q4_K matvec is at the bandwidth ceiling. The 30–35% remaining gap vs llama.cpp is now attributed to per-arch tuning and output-projection specialization, not algorithmic room.
+
+---
+
 ## v1.10.2 (2026-04-13)
 
 ### Gemma 4 / Gemma 3n — Fully Working

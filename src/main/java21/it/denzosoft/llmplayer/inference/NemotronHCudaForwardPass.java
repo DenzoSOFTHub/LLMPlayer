@@ -55,6 +55,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     // FFN buffer
     private final long gpuHb; // [ffnDim]
+    private final long gpuHb2; // [ffnDim] — second FFN projection buffer for integrated SwiGLU (Granite Hybrid)
+    private final long gpuHbQ8; // [(ffnDim/32)*40] — Q8_1 scratch for down projection (dp4a path)
 
     // Per-layer weights on GPU
     private final long[] gpuAttnNormWeights;
@@ -66,6 +68,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     // Compiled CUDA functions
     private final MemorySegment rmsnormFunc, siluFunc, ropeFunc, kvUpdateFunc, attnFunc;
+    private final MemorySegment siluMulFunc;   // silu_mul for integrated SwiGLU FFN
     private final MemorySegment accumulateFunc, conv1dSiluFunc, mamba2ScanFunc;
     private final MemorySegment dtSoftplusFunc, gateNormFunc, sqreluFunc;
 
@@ -86,22 +89,75 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         final MemorySegment function; final long weightPtr;
         final int gridDim, blockDim, sharedMem, rows, cols, addToOutput;
         final long inputPtr, outputPtr;
+        // dp4a: type code (0=ineligible, 4=Q4_K, 5=Q5_K, 6=Q6_K, 50=Q5_0, 80=Q8_0, 41=IQ4_NL, 42=IQ4_XS)
+        final int dp4aType;
+        // Q8_1 buffer pointer for inputPtr (0 if not dp4a-eligible). Set by caller at construction.
+        final long q8InputPtr;
         MatmulLaunch(CudaFloatTensor t, long in, long out, int r, int c, int add) {
+            this(t, in, out, r, c, add, 0L);
+        }
+        MatmulLaunch(CudaFloatTensor t, long in, long out, int r, int c, int add, long q8In) {
             function = t.getCudaFunction(); weightPtr = t.getGpuWeights();
             blockDim = t.getMatmulBlockDim(c); gridDim = t.getMatmulGridDim(r, c);
             sharedMem = t.getMatmulSharedMem(c);
             inputPtr = in; outputPtr = out; rows = r; cols = c; addToOutput = add;
+            it.denzosoft.llmplayer.tensor.GGMLType type = t.type();
+            if      (type == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K)   dp4aType = 4;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K)   dp4aType = 5;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K)   dp4aType = 6;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q5_0)   dp4aType = 50;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q8_0)   dp4aType = 80;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_NL) dp4aType = 41;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_XS) dp4aType = 42;
+            else                                                            dp4aType = 0;
+            q8InputPtr = q8In;
         }
     }
 
     private final ParamBuffer matmulPB, normPB, ropePB, kvPB, attnPB;
     private final ParamBuffer conv1dPB, scanPB, dtPB, gateNormPB, siluPB, sqreluPB, convBiasPB;
 
+    // === dp4a path (mirrors CudaForwardPass extension) ===
+    private final boolean useDp4a;
+    private final long gpuXbQ8;       // Q8_1 buffer for gpuXb input (size: dim/32 * 40)
+    private final ParamBuffer quantizeXbPB;   // 3 args: gpuXb, gpuXbQ8, dim
+    private final ParamBuffer dp4aPB;         // 6 args
+    private final int quantizeXbGridDim;
+    private final MemorySegment quantizeFunc;
+    private final MemorySegment dp4aQ4kFunc;
+    private final MemorySegment dp4aQ5kFunc;
+    private final MemorySegment dp4aQ6kFunc;
+    private final MemorySegment dp4aQ50Func;
+    private final MemorySegment dp4aQ80Func;
+    private final MemorySegment dp4aIq4nlFunc;
+    private final MemorySegment dp4aIq4xsFunc;
+
+    // === Granite Hybrid scaling factors (0 = not applied) ===
+    // embeddingScale: applied CPU-side before uploadX (typically 12.0 for Granite 4.0-h).
+    // logitScale: divide final logits (typically 8.0 for Granite 4.0-h).
+    // residualScale: saxpy factor for residual updates (e.g. 0.22 for Granite 4.0-h-micro).
+    // attentionScale: replaces standard 1/sqrt(headSize) attention scale.
+    private final float graniteEmbeddingScale;
+    private final float graniteLogitScale;
+    private final float graniteResidualScale;
+    private final float graniteAttentionScale;
+    private final MemorySegment scaleFunc;       // scale_inplace.cu
+    private final MemorySegment accumulateFunc2; // accumulate.cu (for saxpy)
+    private final ParamBuffer scalePB;           // 3 args: x, scale, size
+    private final ParamBuffer biasPB2;           // 3 args: y, bias, size (for accumulate)
+    private final int scaleDimGridDim;
+    private final int scaleVocabGridDim;
+
     // Per-layer matmul descriptors
     // Mamba: [0]=ssmIn, [1]=ssmOut
     // Attention: [0]=wq, [1]=wk, [2]=wv, [3]=wo
     // FFN: [0]=ffnUp, [1]=ffnDown
     private final MatmulLaunch[][] layerMatmuls;
+
+    // Granite Hybrid integrated SwiGLU FFN (inside Mamba/Attention layers where lw.ffnUp() != null).
+    // Per-layer: [0]=ffnGate, [1]=ffnUp, [2]=ffnDown. NULL when layer has no integrated FFN.
+    private final MatmulLaunch[][] integratedFfnMatmuls;
+    private final long[] gpuIntegratedFfnNormWeights;  // per-layer FFN norm (0 when absent)
     private final MatmulLaunch outputMatmul;
 
     private final int gpuLayerCount;
@@ -177,6 +233,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         gpuXb2 = bufferManager.createBuffer((long) headCount * headSize * fb);
         int maxFfnDim = config.intermediateSize();
         gpuHb = bufferManager.createBuffer((long) maxFfnDim * fb);
+        // Granite Hybrid: second FFN buffer (for integrated SwiGLU up output) + Q8_1 scratch for down.
+        // Always allocated; costs ~10 KB for ffnDim=8192.
+        gpuHb2 = bufferManager.createBuffer((long) maxFfnDim * fb);
+        int hbQ8Bytes = ((maxFfnDim + 31) / 32) * 40;
+        gpuHbQ8 = bufferManager.createBuffer(hbQ8Bytes);
 
         // RoPE tables
         gpuCosTable = uploadFloatArray(rope.getCosTable());
@@ -208,6 +269,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         // Compile kernels
         rmsnormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         siluFunc = cudaContext.compileKernel("kernels/cuda/silu.cu", "silu");
+        siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         ropeFunc = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
         kvUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         attnFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
@@ -253,6 +315,85 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
         // ParamBuffers
         matmulPB = new ParamBuffer(arena, 6);
+
+        // === dp4a setup (mirrors CudaForwardPass extension) ===
+        boolean dp4aReq = !"false".equals(System.getProperty("cuda.dp4a", "true"));
+        MemorySegment qFunc = null, dQ4kFunc = null, dQ5kFunc = null, dQ6kFunc = null;
+        MemorySegment dQ50Func = null, dQ80Func = null, dIq4nlFunc = null, dIq4xsFunc = null;
+        boolean dp4aAvail = false;
+        if (dp4aReq) {
+            try {
+                qFunc = cudaContext.compileKernel("kernels/cuda/quantize_q8.cu", "quantize_q8");
+                dQ4kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q4_k_dp4a.cu", "matmul_q4_k_dp4a");
+                dp4aAvail = true;
+                try { dQ5kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q5_k_dp4a.cu", "matmul_q5_k_dp4a"); } catch (Exception ignored) {}
+                try { dQ6kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q6_k_dp4a.cu", "matmul_q6_k_dp4a"); } catch (Exception ignored) {}
+                try { dQ50Func = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a.cu", "matmul_q5_0_dp4a"); } catch (Exception ignored) {}
+                try { dQ80Func = cudaContext.compileKernel("kernels/cuda/matmul_q8_0_dp4a.cu", "matmul_q8_0_dp4a"); } catch (Exception ignored) {}
+                try { dIq4nlFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_nl_dp4a.cu", "matmul_iq4_nl_dp4a"); } catch (Exception ignored) {}
+                try { dIq4xsFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_xs_dp4a.cu", "matmul_iq4_xs_dp4a"); } catch (Exception ignored) {}
+            } catch (Exception e) {
+                System.err.println("NemotronH CUDA: dp4a kernels unavailable — " + e.getMessage());
+            }
+        }
+        useDp4a = dp4aAvail;
+        quantizeFunc = qFunc;
+        dp4aQ4kFunc = dQ4kFunc;
+        dp4aQ5kFunc = dQ5kFunc;
+        dp4aQ6kFunc = dQ6kFunc;
+        dp4aQ50Func = dQ50Func;
+        dp4aQ80Func = dQ80Func;
+        dp4aIq4nlFunc = dIq4nlFunc;
+        dp4aIq4xsFunc = dIq4xsFunc;
+        if (useDp4a) {
+            int xbQ8Bytes = ((dim + 31) / 32) * 40;
+            gpuXbQ8 = bufferManager.createBuffer(xbQ8Bytes);
+            int xbBlocks = (dim + 31) / 32;
+            quantizeXbGridDim = (xbBlocks + 7) / 8;
+            quantizeXbPB = new ParamBuffer(arena, 3);
+            quantizeXbPB.setLong(0, gpuXb);
+            quantizeXbPB.setLong(1, gpuXbQ8);
+            quantizeXbPB.setInt(2, dim);
+            dp4aPB = new ParamBuffer(arena, 6);
+            System.err.println("NemotronH CUDA: dp4a enabled");
+        } else {
+            gpuXbQ8 = 0;
+            quantizeXbGridDim = 0;
+            quantizeXbPB = null;
+            dp4aPB = null;
+        }
+
+        // === Granite Hybrid scaling ===
+        graniteEmbeddingScale = config.embeddingScale();
+        graniteLogitScale = config.logitScale();
+        graniteResidualScale = config.residualScale();
+        graniteAttentionScale = config.attentionScale();
+        boolean graniteActive = graniteEmbeddingScale > 0f || graniteLogitScale > 0f
+                             || graniteResidualScale > 0f || graniteAttentionScale > 0f;
+        MemorySegment sFunc = null;
+        MemorySegment accumFunc = null;
+        ParamBuffer sPB = null;
+        ParamBuffer bPB = null;
+        if (graniteActive) {
+            try {
+                sFunc = cudaContext.compileKernel("kernels/cuda/scale_inplace.cu", "scale_inplace");
+                accumFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
+                sPB = new ParamBuffer(arena, 3);
+                bPB = new ParamBuffer(arena, 3);
+                System.err.println("NemotronH CUDA: Granite scaling enabled (embed="
+                    + graniteEmbeddingScale + ", logit=" + graniteLogitScale
+                    + ", res=" + graniteResidualScale + ", attn=" + graniteAttentionScale + ")");
+            } catch (Exception e) {
+                System.err.println("NemotronH CUDA: Granite scale kernels unavailable: " + e.getMessage());
+            }
+        }
+        scaleFunc = sFunc;
+        accumulateFunc2 = accumFunc;
+        scalePB = sPB;
+        biasPB2 = bPB;
+        scaleDimGridDim = (sFunc != null) ? (int) ((dim + blockSize - 1) / blockSize) : 0;
+        scaleVocabGridDim = (sFunc != null) ? (int) ((vocabSize + blockSize - 1) / blockSize) : 0;
+
         normPB = new ParamBuffer(arena, 5);
         normPB.setLong(0, gpuXb); normPB.setLong(1, gpuX); normPB.setInt(3, dim); normPB.setFloat(4, normEps);
 
@@ -297,9 +438,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         sqreluPB = new ParamBuffer(arena, 2);
 
         // Pre-allocated bias accumulate PB for conv1d bias
-        ParamBuffer bPB = new ParamBuffer(arena, 3);
-        bPB.setLong(0, gpuXBC); bPB.setInt(2, convChannels);
-        this.convBiasPB = bPB;
+        ParamBuffer cBiasPB = new ParamBuffer(arena, 3);
+        cBiasPB.setLong(0, gpuXBC); cBiasPB.setInt(2, convChannels);
+        this.convBiasPB = cBiasPB;
 
         // Grid sizes
         this.normNumWarps = (int)(blockSize / 32);
@@ -318,24 +459,59 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         for (int i = 0; i < gpuLayerCount; i++) {
             NemotronHLayerWeights lw = weights.layers()[i];
             if (layerTypes[i] == 0) { // Mamba
+                // Granite residual scaling: route ssmOut to gpuXb (scratch) + saxpy later.
+                long ssmOutTarget = graniteResidualScale > 0f ? gpuXb : gpuX;
+                int ssmOutAddTo = graniteResidualScale > 0f ? 0 : 1;
                 layerMatmuls[i] = new MatmulLaunch[] {
-                    new MatmulLaunch((CudaFloatTensor) lw.ssmIn(), gpuXb, gpuZxBCdt, projDim, dim, 0),
-                    new MatmulLaunch((CudaFloatTensor) lw.ssmOut(), gpuY, gpuX, dim, ssmInnerSize, 1)
+                    new MatmulLaunch((CudaFloatTensor) lw.ssmIn(), gpuXb, gpuZxBCdt, projDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.ssmOut(), gpuY, ssmOutTarget, dim, ssmInnerSize, ssmOutAddTo)
                 };
             } else if (layerTypes[i] == 1) { // Attention
                 int qDim = headCount * headSize;
+                long woTarget = graniteResidualScale > 0f ? gpuXb : gpuX;
+                int woAddTo = graniteResidualScale > 0f ? 0 : 1;
                 layerMatmuls[i] = new MatmulLaunch[] {
-                    new MatmulLaunch((CudaFloatTensor) lw.wq(), gpuXb, gpuQ, qDim, dim, 0),
-                    new MatmulLaunch((CudaFloatTensor) lw.wk(), gpuXb, gpuK, kvDim, dim, 0),
-                    new MatmulLaunch((CudaFloatTensor) lw.wv(), gpuXb, gpuV, kvDim, dim, 0),
-                    new MatmulLaunch((CudaFloatTensor) lw.wo(), gpuXb2, gpuX, dim, qDim, 1)
+                    new MatmulLaunch((CudaFloatTensor) lw.wq(), gpuXb, gpuQ, qDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.wk(), gpuXb, gpuK, kvDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.wv(), gpuXb, gpuV, kvDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.wo(), gpuXb2, woTarget, dim, qDim, woAddTo)
                 };
             } else { // FFN
                 int ffnDim = config.nemotronLayerFfnLength(i);
+                long ffnDownTarget = graniteResidualScale > 0f ? gpuXb : gpuX;
+                int ffnDownAddTo = graniteResidualScale > 0f ? 0 : 1;
                 layerMatmuls[i] = new MatmulLaunch[] {
-                    new MatmulLaunch((CudaFloatTensor) lw.ffnUp(), gpuXb, gpuHb, ffnDim, dim, 0),
-                    new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, gpuX, dim, ffnDim, 1)
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnUp(), gpuXb, gpuHb, ffnDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, ffnDownTarget, dim, ffnDim, ffnDownAddTo)
                 };
+            }
+        }
+
+        // === Granite Hybrid integrated FFN (inside Mamba/Attention layers) ===
+        // When lw.ffnUp() != null on a Mamba/Attention layer, we need an additional SwiGLU
+        // block after the residual add. Build its matmul descriptors here (output dim = dim).
+        integratedFfnMatmuls = new MatmulLaunch[gpuLayerCount][];
+        gpuIntegratedFfnNormWeights = new long[gpuLayerCount];
+        for (int i = 0; i < gpuLayerCount; i++) {
+            NemotronHLayerWeights lw = weights.layers()[i];
+            if ((lw.isMamba() || lw.isAttention()) && lw.ffnUp() != null) {
+                int ffnDim = ((CudaFloatTensor) lw.ffnUp()).type() == null ? config.intermediateSize()
+                                                                           : config.intermediateSize();
+                // ffn_norm may be null — fall back to attn_norm (matches CPU engine behavior).
+                FloatTensor ffnNormT = lw.ffnNorm() != null ? lw.ffnNorm() : lw.attnNorm();
+                gpuIntegratedFfnNormWeights[i] = uploadNormWeights(ffnNormT, dim);
+                // Integrated FFN writes to gpuXb (which we'll saxpy into gpuX) when residual scaling is active,
+                // or straight to gpuX (accumulate) otherwise.
+                long intFfnDownTarget = graniteResidualScale > 0f ? gpuXb : gpuX;
+                int intFfnDownAddTo = graniteResidualScale > 0f ? 0 : 1;
+                integratedFfnMatmuls[i] = new MatmulLaunch[] {
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnGate(), gpuXb, gpuHb,  ffnDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnUp(),   gpuXb, gpuHb2, ffnDim, dim, 0, gpuXbQ8),
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, intFfnDownTarget, dim, ffnDim, intFfnDownAddTo, gpuHbQ8)
+                };
+            } else {
+                integratedFfnMatmuls[i] = null;
+                gpuIntegratedFfnNormWeights[i] = 0;
             }
         }
 
@@ -356,16 +532,20 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     public static boolean isSupported(ModelConfig config, NemotronHWeights weights) {
         if (weights.layers().length == 0) return false;
-        // Granite Hybrid uses embeddingScale/attentionScale/residualScale/logitScale
-        // which are NOT applied in this CUDA forward pass — would produce wrong output.
-        // Fall back to CPU until the scaling is wired through the GPU kernels.
-        if (config.embeddingScale() > 0f || config.residualScale() > 0f || config.attentionScale() > 0f) {
-            return false;
-        }
+        // Granite Hybrid fully supported as of 2026-04-14:
+        //   - scale factors (embed/logit/residual/attention)
+        //   - integrated SwiGLU FFN inside Mamba/Attention layers
+        // Verify weight tensors are all on GPU (CudaFloatTensor).
         for (int i = 0; i < Math.min(3, weights.layers().length); i++) {
             NemotronHLayerWeights lw = weights.layers()[i];
             FloatTensor t = lw.isMamba() ? lw.ssmIn() : lw.isAttention() ? lw.wq() : lw.ffnUp();
             if (!(t instanceof CudaFloatTensor)) return false;
+            // If integrated FFN is used, its tensors must also be on GPU
+            if ((lw.isMamba() || lw.isAttention()) && lw.ffnUp() != null) {
+                if (!(lw.ffnGate() instanceof CudaFloatTensor)) return false;
+                if (!(lw.ffnUp() instanceof CudaFloatTensor)) return false;
+                if (!(lw.ffnDown() instanceof CudaFloatTensor)) return false;
+            }
         }
         return true;
     }
@@ -382,6 +562,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     public int getGpuLayerCount() { return gpuLayerCount; }
 
     public void uploadXAndUpdateParams(float[] x, int position) {
+        // Note: Granite Hybrid embeddingScale is applied by NemotronHInferenceEngine
+        // on the CPU side BEFORE calling uploadX (see NemotronHInferenceEngine.forward).
+        // Doing it again here would double-scale. Only logit scaling happens GPU-side.
         long embBytes = (long) dim * Float.BYTES;
         MemorySegment.copy(x, 0, hostCombined, ValueLayout.JAVA_FLOAT, 0, dim);
         hostCombined.set(ValueLayout.JAVA_INT, embBytes, position);
@@ -421,6 +604,13 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             }
         }
         cudaContext.launchGraph(graphExec);
+        // Granite logit scaling (NOT in graph — applied after)
+        if (graniteLogitScale > 0f && scaleFunc != null) {
+            scalePB.setLong(0, gpuLogits);
+            scalePB.setFloat(1, 1.0f / graniteLogitScale);
+            scalePB.setInt(2, vocabSize);
+            launchKernel(scaleFunc, scaleVocabGridDim, (int) blockSize, 0, scalePB.ptrs);
+        }
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
         return true;
@@ -431,6 +621,12 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         normPB.setLong(2, gpuOutputNormWeights);
         launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
         launchMatmul(outputMatmul);
+        if (graniteLogitScale > 0f && scaleFunc != null) {
+            scalePB.setLong(0, gpuLogits);
+            scalePB.setFloat(1, 1.0f / graniteLogitScale);
+            scalePB.setInt(2, vocabSize);
+            launchKernel(scaleFunc, scaleVocabGridDim, (int) blockSize, 0, scalePB.ptrs);
+        }
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
         return true;
@@ -443,8 +639,10 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         // RMSNorm
         normPB.setLong(2, gpuAttnNormWeights[li]);
         launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-        // ssm_in projection
-        launchMatmul(ml[0]);
+        // For Granite: gpuXb is needed at end for residual saxpy; ssmOut writes to gpuXb.
+        // quantizeXb() happens BEFORE ssmIn consumes gpuXb.
+        quantizeXb();
+        launchMatmulDp4a(ml[0]);
         // Copy xBC portion from zxBCdt to gpuXBC
         cudaContext.copyBufferDtoD(gpuXBC, gpuZxBCdt + (long) ssmInnerSize * Float.BYTES,
                 (long) convChannels * Float.BYTES);
@@ -469,8 +667,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         // Gate + grouped RMSNorm (fused)
         gateNormPB.setLong(2, gpuSsmNormWeights[li]);
         launchKernel(gateNormFunc, ssmGroupCount, gateNormBlockDim, gateNormSharedMem, gateNormPB.ptrs);
-        // ssm_out projection (accumulate to x)
+        // ssm_out projection. Standard: accumulate to gpuX. Granite: write to gpuXb + saxpy.
         launchMatmul(ml[1]);
+        graniteResidualAdd();
+        // Granite Hybrid: Mamba layer has integrated SwiGLU FFN after the residual add.
+        runIntegratedFFN(li);
     }
 
     // === Attention layer ===
@@ -479,7 +680,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         MatmulLaunch[] ml = layerMatmuls[li];
         normPB.setLong(2, gpuAttnNormWeights[li]);
         launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-        launchMatmul(ml[0]); launchMatmul(ml[1]); launchMatmul(ml[2]); // Q K V
+        // dp4a: quantize gpuXb before QKV
+        quantizeXb();
+        launchMatmulDp4a(ml[0]); launchMatmulDp4a(ml[1]); launchMatmulDp4a(ml[2]); // Q K V
+        // Granite attention-scale correction on Q (replaces kernel's 1/sqrt(headSize)).
+        graniteAttnPreScale(ml[0].rows);
         ropePB.setLong(0, gpuQ); ropePB.setInt(3, headCount);
         launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
         ropePB.setLong(0, gpuK); ropePB.setInt(3, headCountKV);
@@ -489,7 +694,10 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
         int attnSM = (position + 1 + 32) * Float.BYTES;
         launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB.ptrs);
-        launchMatmul(ml[3]); // wo (accumulate)
+        launchMatmul(ml[3]); // wo — standard: accumulate; Granite: write to gpuXb + saxpy
+        graniteResidualAdd();
+        // Granite Hybrid: Attention layer has integrated SwiGLU FFN after the residual add.
+        runIntegratedFFN(li);
     }
 
     // === FFN layer ===
@@ -498,11 +706,14 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         MatmulLaunch[] ml = layerMatmuls[li];
         normPB.setLong(2, gpuAttnNormWeights[li]);
         launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-        launchMatmul(ml[0]); // ffn_up
+        // dp4a: quantize gpuXb before ffn_up
+        quantizeXb();
+        launchMatmulDp4a(ml[0]); // ffn_up
         int ffnDim = ml[0].rows;
         sqreluPB.setLong(0, gpuHb); sqreluPB.setInt(1, ffnDim);
         launchKernel(sqreluFunc, (int)((ffnDim + blockSize - 1) / blockSize), (int) blockSize, 0, sqreluPB.ptrs);
-        launchMatmul(ml[1]); // ffn_down (accumulate)
+        launchMatmul(ml[1]); // ffn_down — standard: accumulate; Granite: write to gpuXb + saxpy
+        graniteResidualAdd();
     }
 
     // === Graph capture (fixed shared mem for attention) ===
@@ -513,7 +724,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             MatmulLaunch[] ml = layerMatmuls[li];
             normPB.setLong(2, gpuAttnNormWeights[li]);
             launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
-            launchMatmul(ml[0]); launchMatmul(ml[1]); launchMatmul(ml[2]);
+            quantizeXb();
+            launchMatmulDp4a(ml[0]); launchMatmulDp4a(ml[1]); launchMatmulDp4a(ml[2]);
+            graniteAttnPreScale(ml[0].rows);
             ropePB.setLong(0, gpuQ); ropePB.setInt(3, headCount);
             launchKernel(ropeFunc, ropeQGridDim, (int) blockSize, 0, ropePB.ptrs);
             ropePB.setLong(0, gpuK); ropePB.setInt(3, headCountKV);
@@ -523,6 +736,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
             launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), graphAttnSharedMem, attnPB.ptrs);
             launchMatmul(ml[3]);
+            graniteResidualAdd();
+            runIntegratedFFN(li);
         } else forwardFFN(li);
     }
 
@@ -533,6 +748,122 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         matmulPB.setLong(2, ml.outputPtr); matmulPB.setInt(3, ml.rows);
         matmulPB.setInt(4, ml.cols); matmulPB.setInt(5, ml.addToOutput);
         launchKernel(ml.function, ml.gridDim, ml.blockDim, ml.sharedMem, matmulPB.ptrs);
+    }
+
+    /** Quantize gpuXb (FP32, dim) → gpuXbQ8 (Q8_1). No-op if dp4a disabled. */
+    private void quantizeXb() {
+        if (!useDp4a) return;
+        launchKernel(quantizeFunc, quantizeXbGridDim, 256, 0, quantizeXbPB.ptrs);
+    }
+
+    /** Quantize gpuHb (FP32, ffnDim) → gpuHbQ8 (Q8_1). No-op if dp4a disabled. */
+    private void quantizeHb(int ffnDim) {
+        if (!useDp4a) return;
+        // Temporarily reuse quantizeXbPB layout — set 3 params, launch.
+        // Actually use a dedicated buffer layout since dimensions differ.
+        quantizeXbPB.setLong(0, gpuHb);
+        quantizeXbPB.setLong(1, gpuHbQ8);
+        quantizeXbPB.setInt(2, ffnDim);
+        int gridDim = (((ffnDim + 31) / 32) + 7) / 8;
+        launchKernel(quantizeFunc, gridDim, 256, 0, quantizeXbPB.ptrs);
+        // Restore for next gpuXb quantize call
+        quantizeXbPB.setLong(0, gpuXb);
+        quantizeXbPB.setLong(1, gpuXbQ8);
+        quantizeXbPB.setInt(2, dim);
+    }
+
+    /**
+     * Granite Hybrid integrated SwiGLU FFN:
+     *   ffn_norm(gpuX) → gpuXb
+     *   quantize gpuXb → gpuXbQ8
+     *   ffnGate(gpuXbQ8) → gpuHb
+     *   ffnUp(gpuXbQ8)   → gpuHb2
+     *   silu_mul(gpuHb, gpuHb2) → gpuHb
+     *   quantize gpuHb → gpuHbQ8
+     *   ffnDown(gpuHbQ8) → gpuXb (or gpuX when no residual scaling)
+     *   [if residual scale] saxpy: gpuX += residualScale * gpuXb
+     */
+    private void runIntegratedFFN(int layerIdx) {
+        MatmulLaunch[] iff = integratedFfnMatmuls[layerIdx];
+        if (iff == null) return;
+        int ffnDim = iff[0].rows;
+        // RMSNorm with the integrated ffn norm weights
+        normPB.setLong(2, gpuIntegratedFfnNormWeights[layerIdx]);
+        launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        // dp4a quantize
+        quantizeXb();
+        // gate + up
+        launchMatmulDp4a(iff[0]); // gate → gpuHb
+        launchMatmulDp4a(iff[1]); // up → gpuHb2
+        // silu_mul: gpuHb = silu(gpuHb) * gpuHb2
+        scalePB.setLong(0, gpuHb);        // reuse scalePB layout: a, b, size
+        scalePB.setLong(1, gpuHb2);
+        scalePB.setInt(2, ffnDim);
+        int siluMulGridDim = (int) ((ffnDim + blockSize - 1) / blockSize);
+        launchKernel(siluMulFunc, siluMulGridDim, (int) blockSize, 0, scalePB.ptrs);
+        // quantize gpuHb for down projection
+        quantizeHb(ffnDim);
+        // down projection
+        launchMatmulDp4a(iff[2]);
+        // residual
+        graniteResidualAdd();
+    }
+
+    /**
+     * Granite residual scaling: gpuX += residualScale * gpuXb.
+     * Called after ssmOut/wo/ffnDown when graniteResidualScale > 0.
+     * Uses scale_inplace (scales gpuXb) + accumulate (gpuX += gpuXb).
+     */
+    private void graniteResidualAdd() {
+        if (graniteResidualScale <= 0f) return;
+        scalePB.setLong(0, gpuXb);
+        scalePB.setFloat(1, graniteResidualScale);
+        scalePB.setInt(2, dim);
+        launchKernel(scaleFunc, scaleDimGridDim, (int) blockSize, 0, scalePB.ptrs);
+        biasPB2.setLong(0, gpuX);
+        biasPB2.setLong(1, gpuXb);
+        biasPB2.setInt(2, dim);
+        launchKernel(accumulateFunc2, scaleDimGridDim, (int) blockSize, 0, biasPB2.ptrs);
+    }
+
+    /** Granite attention pre-scale: multiply Q by (attentionScale * sqrt(headSize)) so the
+     *  in-kernel 1/sqrt(headSize) factor cancels and only attentionScale remains. */
+    private void graniteAttnPreScale(int qDim) {
+        if (graniteAttentionScale <= 0f) return;
+        scalePB.setLong(0, gpuQ);
+        scalePB.setFloat(1, graniteAttentionScale * (float) Math.sqrt(headSize));
+        scalePB.setInt(2, qDim);
+        int qGridDim = (int) ((qDim + blockSize - 1) / blockSize);
+        launchKernel(scaleFunc, qGridDim, (int) blockSize, 0, scalePB.ptrs);
+    }
+
+    /** Dispatch matmul through dp4a kernel if eligible, else FP32 fallback. */
+    private void launchMatmulDp4a(MatmulLaunch ml) {
+        if (!useDp4a || ml.dp4aType == 0 || ml.q8InputPtr == 0) {
+            launchMatmul(ml);
+            return;
+        }
+        MemorySegment func;
+        switch (ml.dp4aType) {
+            case 4:  func = dp4aQ4kFunc; break;
+            case 5:  func = dp4aQ5kFunc; break;
+            case 6:  // Q6_K dp4a slower than FP32 — opt-in only
+                if (!"true".equals(System.getProperty("cuda.dp4a.q6", "false"))) { launchMatmul(ml); return; }
+                func = dp4aQ6kFunc; break;
+            case 50: func = dp4aQ50Func; break;
+            case 80: func = dp4aQ80Func; break;
+            case 41: func = dp4aIq4nlFunc; break;
+            case 42: func = dp4aIq4xsFunc; break;
+            default: launchMatmul(ml); return;
+        }
+        if (func == null) { launchMatmul(ml); return; }
+        dp4aPB.setLong(0, ml.weightPtr);
+        dp4aPB.setLong(1, ml.q8InputPtr);
+        dp4aPB.setLong(2, ml.outputPtr);
+        dp4aPB.setInt(3, ml.rows);
+        dp4aPB.setInt(4, ml.cols);
+        dp4aPB.setInt(5, ml.addToOutput);
+        launchKernel(func, ml.gridDim, ml.blockDim, 0, dp4aPB.ptrs);
     }
 
     private void launchKernel(MemorySegment fn, int grid, int block, int sm, MemorySegment params) {

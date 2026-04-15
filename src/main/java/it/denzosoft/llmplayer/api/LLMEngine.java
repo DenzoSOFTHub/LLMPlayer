@@ -988,6 +988,50 @@ public class LLMEngine implements AutoCloseable {
         throw new IllegalStateException("No inference engine available for training");
     }
 
+    /**
+     * <h2>Phase 2 of speculative decoding — multi-token forward pass.</h2>
+     *
+     * Compute logits for K consecutive token positions in one call. The semantics
+     * are: feed {@code tokens[0]} at position {@code startPosition}, then
+     * {@code tokens[1]} at position {@code startPosition + 1}, ..., and return a
+     * {@code float[K][vocabSize]} of next-token logits at each of those positions.
+     *
+     * <p>Equivalent to calling {@link #forwardSingleToken} K times sequentially
+     * but provides a single API for callers (notably {@code SpeculativeDecoder}).
+     *
+     * <h3>Current implementation status</h3>
+     *
+     * <b>Sequential</b>: this method currently calls {@link #forwardSingleToken}
+     * K times. There is <b>no per-layer batching</b>, so the cost is K times the
+     * cost of a single forward — same as if the caller had done the loop manually.
+     *
+     * <p>The API exists to provide a stable contract: a future implementation can
+     * batch the per-layer matmul/attention compute (processing K tokens through
+     * each layer in one kernel call) without changing the caller. That work
+     * requires new CUDA kernels — see {@code docs/optimization/speculative-decoding.md}.
+     *
+     * <h3>Returned array layout</h3>
+     *
+     * The returned array has shape {@code [K][vocabSize]}. Each inner array is a
+     * <b>fresh copy</b> of the logits — the caller can retain references across
+     * calls without aliasing into the inference state.
+     */
+    public float[][] forwardBatch(int[] tokens, int startPosition) {
+        if (tokens == null || tokens.length == 0) {
+            throw new IllegalArgumentException("tokens must be non-empty");
+        }
+        int K = tokens.length;
+        int vocabSize = loadedModel.config().vocabSize();
+        float[][] result = new float[K][];
+        for (int k = 0; k < K; k++) {
+            float[] logits = forwardSingleToken(tokens[k], startPosition + k);
+            // Copy because forwardSingleToken returns the internal buffer
+            // (overwritten by next call).
+            result[k] = java.util.Arrays.copyOf(logits, vocabSize);
+        }
+        return result;
+    }
+
     public Tokenizer getTokenizer() { return tokenizer; }
     public SpecialTokens getSpecialTokens() { return specialTokens; }
     public ChatTemplate getChatTemplate() { return chatTemplate; }

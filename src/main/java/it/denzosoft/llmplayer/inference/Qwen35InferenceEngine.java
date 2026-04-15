@@ -257,6 +257,11 @@ public class Qwen35InferenceEngine {
         for (int layer = 0; layer < gpuLayerCount; layer++) {
             gpuForwardLayer.invoke(gpuForwardPass, layer, position);
         }
+        // Profiling hook (no-op unless -Dqwen35.profile=true)
+        try {
+            java.lang.reflect.Method m = gpuForwardPass.getClass().getMethod("profileTokenComplete");
+            m.invoke(gpuForwardPass);
+        } catch (NoSuchMethodException ignored) {}
 
         // If not all layers on GPU, download X and continue on CPU
         if (gpuLayerCount < blockCount) {

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine (v1.10.2) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine (v1.11.0) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -95,6 +95,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 | `tuning` | LoRA fine-tuning pipeline — data chunking, Q&A dataset generation, training loop, LoRA merge, GGUF export |
 | `ui` | Swing desktop GUI |
 | `web` | Embedded HTTP server with HTML web UI, OpenAI-compatible API (`OpenAIHandler`), Anthropic Messages API (`AnthropicHandler`), management API (`ApiHandler`), chat persistence with branching (`ChatHandler`) |
+| `spec` | Speculative decoding (`SpeculativeDecoder`) — standalone class that drives two `LLMEngine` instances (target + draft) via `forwardSingleToken`. Sequential verification only (~1.1× max with K=4); real 2-3× speedup awaits a `forwardBatch` API. Enabled via `--draft-model <gguf>`. |
 
 ### Key data flow
 
@@ -110,7 +111,7 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 2. **DeepSeek2** (`DeepSeek2InferenceEngine`): DeepSeek2 and GLM-4.7-Flash (also uses `deepseek2` GGUF arch). Uses MLA (Multi-Head Latent Attention) + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 3. **Qwen3 MoE** (`Qwen3MoEInferenceEngine`): Qwen3-Coder-30B-A3B and similar. Standard GQA attention with QK-norm + MoE FFN with shared expert. Leading blocks use dense SwiGLU FFN.
 4. **Qwen3.5** (`Qwen35InferenceEngine`): Hybrid DeltaNet + full attention architecture. Alternates Gated DeltaNet (linear attention/SSM) and standard GQA layers in a 3:1 ratio (`full_attention_interval=4`). DeltaNet layers use recurrent state `S` with update rule `S_new = alpha*S + beta*outer(k, v - alpha*S^T@k)`, output `o = S^T_new @ q`. Full attention layers use a packed Q+gate projection where `wq` outputs interleaved `[Q_h0, gate_h0, Q_h1, gate_h1, ...]` — these must be deinterleaved into separate Q and gate arrays before use. Gate is applied as `sigmoid(gate) * attn_output`. Both layer types include short conv1d (width 4) on Q/K and use QK-norm. State is maintained per-layer in `Qwen35State`.
-5. **Nemotron-H / Granite Hybrid** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). Granite Hybrid adds embedding/attention/residual/logit scaling and integrated SwiGLU FFN (with separate ffn_norm) inside Mamba and Attention layers. **Note**: GPU forward pass is currently disabled for Granite Hybrid (CPU fallback) because the scaling factors aren't propagated to the GPU kernels — `isSupported()` returns `false` when any of `embeddingScale/residualScale/attentionScale > 0`.
+5. **Nemotron-H / Granite Hybrid** (`NemotronHInferenceEngine`): Hybrid Mamba-2 SSM + GQA Attention + squared-ReLU FFN. Three distinct layer types (not combined like standard transformers). Per-layer arrays in GGUF metadata (`head_count_kv[]`, `feed_forward_length[]`) determine layer type: kvHeads>0 → Attention, ffnLength>0 → FFN, both 0 → Mamba-2. Mamba-2 uses SSD (Structured State Space Duality) with state `[nheads][headDim][stateSize]`, causal conv1d with bias+SiLU, and grouped RMSNorm with gate (norm_before_gate=False). GPU-resident forward pass via `NemotronHCudaForwardPass` with dedicated kernels (`mamba2_scan.cu`, `mamba2_dt_softplus.cu`, `mamba2_gate_norm.cu`, `sqrelu.cu`). **Granite Hybrid fully GPU-accelerated as of v1.11.0-dev** (2026-04-15): all four scale factors (embedding/logit/residual/attention) wired on GPU via `scale_inplace` + `accumulate` + saxpy, and the integrated SwiGLU FFN inside Mamba/Attention layers (`lw.ffnUp() != null`) runs on GPU via `runIntegratedFFN()` with fused RMSNorm + Q8_1 quant + gate/up/down dp4a + `silu_mul`. Validated bit-equivalent to CPU at ±2 ULP when dp4a is disabled; with dp4a on, the ~1-15% per-layer divergence is the expected Q8_1 quantization noise (same as all other dp4a-accelerated models). CUDA graph capture works.
 6. **Gemma 4 / Gemma 3n** (`Gemma4InferenceEngine`): For PLE (Per-Layer Embeddings) models (E2B/E4B). Two sub-paths in one engine, dispatched by whether `Gemma3nWeights` has AltUp tensors loaded:
    - **Gemma 3n** (arch=GEMMA3N): full **AltUp** (4 parallel activation streams with learned router/predict/correct coefficients) + **Laurel** (low-rank residual branch) + **Gaussian top-k activation sparsity** (first 10 FFN layers) + PLE in `forwardLayerGemma3nInner` + `forwardLayerAltup`. K-norm uses `(1+w)` adjustment.
    - **Gemma 4** (arch=GEMMA4): simpler PLE-only path in `forwardLayer` (no AltUp/Laurel/sparsity). Per llama.cpp `gemma4-iswa.cpp`: **V-norm** (`ggml_rms_norm` on V, no learnable scale), **`layer_output_scale.weight`** per-layer scalar applied as final `cur *= scale` multiplication. K-norm stored as final values (no `(1+w)`).
@@ -297,7 +298,9 @@ Two modes for keeping activations on GPU between transformer layers, reducing CP
 
 Key design: **zero-allocation hot paths** — all kernel param buffers (`ParamBuffer`) and matmul launch descriptors (`MatmulLaunch`) are pre-allocated in the constructor. `forwardLayer()` only writes param values in-place and launches kernels.
 
-**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Falcon3, OLMo2 (incl. Olmo 3), Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`), Granite 3.3 (with scaling factors). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported on GPU**: MoE architectures, Gemma 4/3n (PLE — runs on CPU via `Gemma4InferenceEngine`), Granite Hybrid (scaling factors not propagated to GPU kernels — auto-falls back to CPU). Standard architectures still get full GPU acceleration.
+**Supported architectures for CUDA forward pass**: Llama, Qwen2, Qwen3, Falcon3, OLMo2 (incl. Olmo 3), Mistral3, Gemma 2/3 (post-norm), Phi-3/4 (packed FFN via `split_gate_up.cu`), Granite 3.3 (with scaling factors), and Nemotron-H / Granite Hybrid (via `NemotronHCudaForwardPass` — Granite Hybrid uses the full integrated-FFN path with all scale factors on GPU). Per-head QK-norm (Qwen3) via `rmsnorm_per_head.cu`. **Not supported on GPU**: MoE architectures, Gemma 4/3n (PLE — runs on CPU via `Gemma4InferenceEngine`). Standard architectures get full GPU acceleration.
+
+**dp4a path** (default-on, see `cuda.dp4a` flag): inserts `quantize_q8` calls after each FP32 buffer is produced (post attn norm, post attention, post FFN norm, post silu_mul, post final norm) and routes Q4_K matmuls (QKV / Wo / Gate / Up / Down / Output) through `matmul_q4_k_dp4a.cu` reading int8 Q8_1 input. Q5_K uses `matmul_q5_k_dp4a.cu` similarly. Q6_K dp4a is opt-in only (broken, see `cuda.dp4a.q6`). Falls back to FP32 kernel for non-eligible types or when `cuda.dp4a=false`. Matches the long-standing pattern in `Qwen35CudaForwardPass` — was previously Qwen35-only despite the misleading "default true" doc.
 
 #### Qwen3.5 CUDA forward pass (`Qwen35CudaForwardPass`)
 
@@ -330,7 +333,7 @@ GPU-resident forward pass for the Mamba-2 + Attention + FFN hybrid architecture.
 
 **Mamba-2 kernels:** `mamba2_scan.cu` (SSM state update per head, `[nheads][headDim][stateSize]`), `mamba2_dt_softplus.cu` (discretize timestep), `mamba2_gate_norm.cu` (fused gate+grouped RMSNorm, norm_before_gate=False), `sqrelu.cu` (squared ReLU for FFN layers). Reuses `conv1d_short.cu`, `silu.cu`, `rmsnorm.cu`, `rope.cu`, `attention.cu` for shared operations.
 
-**CUDA graph**: not yet supported for Nemotron-H (DtoD buffer copies in Mamba layers complicate graph capture). Per-layer mode achieves 9.9 tok/s for the 4B model.
+**CUDA graph**: now working — `NemotronH CUDA graph: captured 40 layers` confirmed on `granite-4.0-h-micro` (v1.11.0-dev). First generation may fall back to per-layer on a transient `cuMemcpyDtoH` error (906) during capture; subsequent generations replay the graph. Measured tok/s: **Nemotron-3-Nano-4B 20.0** (vs llama.cpp 35.6 = 56%), **Granite 4.0-h-micro 35.6** (vs llama.cpp 41.8 = 85%).
 
 ### GPU-virtual thread interaction
 
@@ -360,7 +363,7 @@ When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backe
 
 ## Benchmarks
 
-See `BENCHMARKS.md` for full results (34+ models tested across 20 architectures) and `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling.
+See `BENCHMARKS.md` for full results (34+ models tested across 20 architectures), `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling, and `docs/optimization/llamacpp-comparison.md` for the rolling tok/s vs llama.cpp comparison plus a journal of optimization attempts (cubin, cp.async, multi-warp, mmvq, dp4a) with measured outcomes for each.
 
 Current best: Llama-3.2-1B Q4_K_M at **55.8 tok/s** (CUDA graph mode, RTX 4050 Laptop GPU).
 
@@ -379,7 +382,10 @@ All properties are set via `-Dproperty=value` on the Java command line.
 | `cuda.nograph` | `false` | Disable CUDA graph capture; use per-layer kernel launches instead |
 | `cuda.cublas` | `false` | Enable cuBLAS for Q4_K matmul (pre-dequantizes to FP16; requires `libcublas.so`) |
 | `cuda.cublas.fp32` | `false` | Use FP32 instead of FP16 for cuBLAS dequantization (more VRAM, slower) |
-| `cuda.dp4a` | `true` | Enable `__dp4a` integer dot product for Q4_K/Q5_K/Q6_K matmul. Quantizes input to Q8_1 then uses int8 dp4a. |
+| `cuda.dp4a` | `true` | Enable `__dp4a` integer dot product on CudaForwardPass + Qwen35CudaForwardPass + NemotronHCudaForwardPass. Covers Q4_K, Q5_K, Q5_0 (code 50), Q8_0 (80), IQ4_NL (41), IQ4_XS (42). Quantizes input to Q8_1 then uses int8 dp4a. **+34% on Llama-1B** (47→63 tok/s on RTX 4050), **+92% on Nemotron-3-Nano-4B** (10.4→20.0), **+42% on Phi-3-mini IQ4_NL**. Q6_K stays on FP32 fallback by default (see below). |
+| `cuda.dp4a.q6` | `false` | Enable Q6_K dp4a kernel (rewritten 2026-04-14 — bit-equivalent to FP32). **Default OFF** because it's actually SLOWER than the FP32 Q6_K kernel (70.6 vs 72.85 tok/s on Llama-1B): Q6_K block is 210 bytes (not 4-byte aligned) so the dp4a kernel must use byte loads, and that overhead overwhelms the dp4a benefit. Kept for correctness checks. |
+| `cuda.dp4a.fused_gate_up` | `false` | Use a single fused kernel for gate+up dp4a matmuls (`matmul_q4_k_dp4a_fused_gate_up.cu`). Default OFF — measured marginal/regression on Llama-1B (70.9 vs 73.5 separate-dp4a) because input was already L1-cached and the fused kernel adds register pressure. |
+| `cuda.dp4a.mw` | `false` | Use llama.cpp-style multi-warp Q4_K dp4a kernel (`matmul_q4_k_dp4a_mw.cu`: 4 warps × 32 lanes per row, 1 row per block). Slower for small models (Llama-1B: 51 vs 70 tok/s) due to per-block overhead — may help larger models with more super-blocks per row. |
 | `cuda.q4k.coalesced` | `false` | Use coalesced Q4_K kernel variant (all threads process same group) |
 | `cuda.q4k.smem` | `false` | Use shared-memory input tiling Q4_K kernel variant |
 | `cuda.q4k.2warp` | `false` | Use 2-warp-per-row Q4_K kernel (splits column groups between two warps with shared-memory partial-sum reduction) |

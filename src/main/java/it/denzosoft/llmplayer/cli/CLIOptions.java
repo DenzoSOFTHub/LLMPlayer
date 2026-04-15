@@ -30,6 +30,10 @@ public class CLIOptions {
     private String ggufDirectory = "gguf";
     private boolean gpuEnabled;
     private boolean noGpu;
+
+    // Speculative decoding (Tier 3) — opt-in
+    private String draftModelPath;       // path to draft GGUF; enables speculative decoding when set
+    private int speculationDepth = 4;    // K candidate tokens per round
     private int gpuDeviceId;
     private boolean gpuList;
     private int gpuLayers = -1;
@@ -133,6 +137,10 @@ public class CLIOptions {
                 opts.gpuBackend = args[++i].toLowerCase();
             } else if ("--gpu-memory".equals(arg)) {
                 opts.gpuMemoryMode = args[++i].toLowerCase();
+            } else if ("--draft-model".equals(arg)) {
+                opts.draftModelPath = args[++i];
+            } else if ("--spec-depth".equals(arg)) {
+                opts.speculationDepth = Integer.parseInt(args[++i]);
             } else if ("--fine-tune".equals(arg)) {
                 opts.fineTune = true;
             } else if ("--target-model".equals(arg)) {
@@ -200,6 +208,8 @@ public class CLIOptions {
 
     // Getters
     public String getModelPath() { return modelPath; }
+    public String getDraftModelPath() { return draftModelPath; }
+    public int getSpeculationDepth() { return speculationDepth; }
     public String getPrompt() { return prompt; }
     public boolean isInteractive() { return interactive; }
     public int getMaxTokens() { return maxTokens; }

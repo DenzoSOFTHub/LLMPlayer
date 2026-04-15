@@ -22,6 +22,14 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
         "true".equals(System.getProperty("cuda.q4k.smem", "false"));
     private static final boolean USE_2WARP =
         "true".equals(System.getProperty("cuda.q4k.2warp", "false"));
+    // T2.1: multi-row-per-warp Q4_K kernel. Opt-in: mr4 (4 rows) or mr2 (2 rows).
+    private static final boolean USE_MR4 =
+        "true".equals(System.getProperty("cuda.q4k.mr4", "false"));
+    private static final boolean USE_MR2 =
+        "true".equals(System.getProperty("cuda.q4k.mr2", "false"));
+    // Option C: cp.async double-buffered input prefetch (Ampere+). Opt-in PoC.
+    private static final boolean USE_CPASYNC =
+        "true".equals(System.getProperty("cuda.q4k.cpasync", "false"));
 
     public Q4_KCudaTensor(TensorData data, long size, CudaBufferManager bufferManager) {
         super(data, size, bufferManager);
@@ -32,6 +40,9 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     protected String kernelResourcePath() {
+        if (USE_CPASYNC) return "kernels/cuda/matmul_q4_k_cpasync.cu";
+        if (USE_MR4) return "kernels/cuda/matmul_q4_k_mr4.cu";
+        if (USE_MR2) return "kernels/cuda/matmul_q4_k_mr2.cu";
         if (USE_2WARP) return "kernels/cuda/matmul_q4_k_2warp.cu";
         if (USE_SMEM) return "kernels/cuda/matmul_q4_k_smem.cu";
         return USE_COALESCED ? "kernels/cuda/matmul_q4_k_coalesced.cu" : "kernels/cuda/matmul_q4_k.cu";
@@ -39,6 +50,9 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     protected String kernelName() {
+        if (USE_CPASYNC) return "matmul_q4_k_cpasync";
+        if (USE_MR4) return "matmul_q4_k_mr4";
+        if (USE_MR2) return "matmul_q4_k_mr2";
         if (USE_2WARP) return "matmul_q4_k_2warp";
         if (USE_SMEM) return "matmul_q4_k_smem";
         return USE_COALESCED ? "matmul_q4_k_coalesced" : "matmul_q4_k";
@@ -52,6 +66,14 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
 
     @Override
     public int getMatmulGridDim(int rows, int cols) {
+        if (USE_MR4) {
+            // mr4 layout: blockDim=128 (4 warps), each warp = 4 rows = 16 rows/block
+            return (rows + 15) / 16;
+        }
+        if (USE_MR2) {
+            // mr2 layout: blockDim=256 (8 warps), each warp = 2 rows = 16 rows/block
+            return (rows + 15) / 16;
+        }
         if (USE_2WARP) {
             int blockDim = getMatmulBlockDim(cols);
             int rowsPerBlock = blockDim / 64; // 2 warps per row
@@ -61,7 +83,15 @@ public class Q4_KCudaTensor extends CudaFloatTensor {
     }
 
     @Override
+    public int getMatmulBlockDim(int cols) {
+        if (USE_MR4) return 128;  // 4 warps × 32 lanes
+        if (USE_MR2) return 256;  // 8 warps × 32 lanes
+        return super.getMatmulBlockDim(cols);
+    }
+
+    @Override
     protected int computeSharedMemBytes(int cols, long cudaBlockSize) {
+        if (USE_CPASYNC) return 2 * 256 * 4;  // double-buffered tiles
         if (USE_2WARP) return 64 * 4;
         if (USE_SMEM) return 256 * 4;
         return 0;
