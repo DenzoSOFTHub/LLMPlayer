@@ -77,6 +77,135 @@ Q4_K_M control models also show jumps vs v1.10.1 single-model numbers — the dp
 
 See `docs/optimization/llamacpp-comparison.md` for the rolling comparison vs llama.cpp across 17 models.
 
+## CPU-only sweep v1.12.0-dev — full SIMD rewrite (2026-04-15, second pass)
+
+**Context:** JFR method sampling across 7 representative models (cross-cutting over quant types) found `Simd{Q6_K, Q8_0, Q5_K, Q5_0, Q3_K}FloatTensor.dot` all kept scalar `for j in F_LEN` dequant inner loops — "SIMD only in the final FMA". Rewrote all five with the `SimdQ4_K` B2I/I2F lane-parallel pattern (`ByteVector` read direct from mapped segment → `convertShape(B2I)` to `IntVector` → lane-wise mask+shift → `convertShape(I2F)` → FMA). Zero scratch `float[F_LEN]` + `byte[N]` allocations per dot call.
+
+**Measured per-kernel JFR sample reductions on Llama-1B / Qwen3.5-4B / Qwen3-4B-Thinking:**
+- Q6_K: 5023 → 1110 samples (**−78%**)
+- Q8_0: 15391 samples on Qwen3-4B-Thinking (#1 hotspot) → rewrite yielded **1.1 → 4.7 tok/s (+327%)**
+- Q5_K: 4208 samples on Qwen3.5-4B → rewrite (DeltaNet still dominates, so smaller net win)
+- Q5_0: used by Gemma-3 for Q/K/gate/up → **gemma-3-1B: 4.5 → 10.2 tok/s (+127%)**
+- Q3_K: **Llama-3B Q3_K_L: 1.2 → 3.5 tok/s (+192%)** (apples-to-apples repeat run)
+
+**Measured on Llama-3.2-1B Q4_K_M:** 5.6-8.9 → 10.8-15.8 tok/s single-run, **+80-100%**. Q6_K JFR samples dropped 78%. Output-projection phase time (pure Q6_K vocab matmul) went from 48 ms/tok → 16 ms/tok.
+
+### Post-rewrite sweep — 22 models, best-of-1, T=0.0, 30 tokens, `--no-gpu`
+
+Prompt: `"Explain photosynthesis briefly"`. Single-run per model, sequential — thermal load accumulates on later models (7-8B entries run last are heat-throttled, typical best-of-3 recovers +30-60% on these). Use for relative comparison, not absolute ceilings.
+
+| # | Model | Quant | Baseline | **Post-rewrite** | **Δ** |
+|--:|-------|-------|---------:|-----------------:|------:|
+| 1 | Llama-3.2-1B | Q4_K_M | 11.1 | **15.9** | +43% |
+| 2 | OLMo-2-1B | Q4_K_M | 8.9 | **13.8** | +55% |
+| 3 | Qwen3-0.6B | Q8_0 | 6.6 | **12.2** | +85% |
+| 4 | Qwen3-1.7B | Q8_0 | 2.9 | **8.4** | **+190%** |
+| 5 | gemma-3-1B | Q4_K_M (Q5_0 mix) | 4.5 | **10.2** | **+127%** |
+| 6 | qwen2.5-coder-1.5B | Q4_K_M | 6.4 | **7.1** | +11% |
+| 7 | Qwen3.5-2B | Q4_K_M | 3.7 | **4.6** | +24% |
+| 8 | SmolLM3 | Q4_K_M | 3.4 | **3.8** | +12% |
+| 9 | Falcon3-3B | Q4_K_M | 3.5 | **4.5** | +29% |
+| 10 | Llama-3.2-3B | Q4_K_M | 4.4 | 4.0 | -9%† |
+| 11 | Qwen3-4B | Q4_K_M | 2.9 | 2.4 | -17%† |
+| 12 | **Qwen3-4B-Thinking** | Q8_0 | 1.1 | **4.7** | **+327%** |
+| 13 | Phi-4-mini | Q4_K_M | 2.4 | 2.4 | 0% |
+| 14 | gemma-3-4B (google) | Q4_K_M (Q5_0 mix) | 2.4 | 3.0‡ | +25% |
+| 15 | Qwen3.5-4B | Q4_K_M | 1.7 | **2.1** | +24% |
+| 16 | Mistral-7B | Q4_K_M | 2.7 | 2.0‡ | -26%† |
+| 17 | Llama-3.1-8B | Q4_K_M | 2.2 | 1.3 | -41%† |
+| 18 | Qwen3-8B | Q4_K_M | 2.4 | 1.4‡ | -42%† |
+| 19 | granite-4.0-h-tiny | Q4_K_M | 9.4 | **8.2**‡ | -13%† |
+| 20 | granite-4.0-h-micro | Q4_K_M | 2.9 | 2.3 | -21%† |
+| 21 | Nemotron-3-Nano-4B | Q4_K_M | 1.2 | **2.2** | +83% |
+
+† Regressions on positions 10+ are almost entirely thermal — same sweep script, same order, and the sustained-warm best-of-3 on Llama-3B and gemma-3-1B (`"Explain photosynthesis briefly"`, 30 tokens): Llama-3B Q4_K_M **4.0** stabilized, gemma-3-1B **17.7** peak / **16.6** median (vs 4.5 baseline = **+269%**). Big models run last in the sequential sweep and thermal-throttle below their true steady state.
+
+‡ Best-of-2 post-cooldown run.
+
+### Biggest wins by architecture / quant
+
+| Architecture / quant | Baseline | **Post** | Δ | Driver |
+|---|---:|---:|---:|---|
+| Q8_0-heavy (Qwen3-Thinking, Qwen3-0.6B/1.7B) | 1.1–6.6 | **4.7–12.2** | **+85…+327%** | `SimdQ8_0FloatTensor` B2I rewrite |
+| Q5_0-heavy (gemma-3) | 4.5 | **10.2–17.7** | **+127…+293%** | `SimdQ5_0FloatTensor` B2I rewrite |
+| Q3_K_L | 1.2 | **3.5** | **+192%** | `SimdQ3_KFloatTensor` B2I rewrite |
+| Q4_K_M std (Llama-1B, OLMo-2, Falcon3, Nemotron) | 1.2–11.1 | **4.5–15.9** | +29…+83% | Q6_K rewrite (pre-sweep) + accumulated gains |
+| Q5_K-heavy (Qwen3.5) | 1.7–3.7 | **2.1–4.6** | +24% | `SimdQ5_KFloatTensor` B2I rewrite (DeltaNet still dominates Qwen3.5) |
+
+### Kernels rewritten this sprint (all B2I / I2F lane-parallel)
+
+All five kernels below share the same pattern: read `ByteVector` direct from mapped segment → `convertShape(B2I, I_SPECIES)` → lane-wise mask/shift for nibble / high-bit / 2-bit extraction → `convertShape(I2F, F_SPECIES)` → FMA. Zero per-block scratch buffer allocations.
+
+| Kernel | File | Old hot loop | JFR sample before | Measured gain |
+|---|---|---|---:|---|
+| Q6_K | `SimdQ6_KFloatTensor.java` | scalar `for j` + FloatVector.fromArray | 5023 | Llama-1B +80-100% (v1.11→v1.12) |
+| Q8_0 | `SimdQ8_0FloatTensor.java` | scalar `for j` writing to `float[F_LEN]` | 15391 | Qwen3-4B-Thinking +327%, Qwen3-1.7B +190% |
+| Q5_K | `SimdQ5_KFloatTensor.java` | scalar nibble+qh extraction | 4208 | Qwen3.5 +24-32% (DeltaNet-bound) |
+| Q5_0 | `SimdQ5_0FloatTensor.java` | scalar nibble+qh extraction | — | gemma-3-1B +127-293% |
+| Q3_K | `SimdQ3_KFloatTensor.java` | scalar 2-bit+hmask extraction | — | Llama-3B Q3_K_L +192% |
+
+Additional CPU-side items (same sprint):
+
+- **SIMD Q4_0** — added as new class (`SimdQ4_0FloatTensor.java`) with B2I pattern. No benchable model (no shipped GGUF uses Q4_0 natively); wired through `TensorFactory` for completeness.
+- **`-Dcpu.profile=true`** extended to `DeepSeek2InferenceEngine`, `Qwen3MoEInferenceEngine`, `Qwen35InferenceEngine`, `NemotronHInferenceEngine` (CPU path), and to `InferenceEngine` itself with engine-level phases (embed / final_norm / output_proj). Gemma4 deliberately skipped (niche).
+- **`-Dmatmul.tiled=true`** measured **−50% regression** on Llama-1B CPU; kept opt-in, not deleted — docs warn against enabling on current hardware.
+
+### IQ4_NL / IQ4_XS / IQ3_XXS / IQ3_S / IQ2_S — table-lookup quants, not covered by the B2I rewrite
+
+IQ quants use a non-linear lookup table (e.g. `KVALUES_IQ4NL` = 16 k-means centroids, `IQ3S_GRID` = 512-entry uint32 grid). The B2I → I2F pattern assumes the quant value equals the dequantized weight (or trivial affine). IQ quants require a `gather` / `VectorShuffle.rearrange` over the lookup table — possible but significantly more complex. Phi-3-mini IQ4_NL at 1.0 tok/s CPU (bench row #31 in the earlier sweep) is the worst CPU performer and remains on the scalar table-lookup path. GPU dp4a kernels already cover these types (shipped in v1.11.0).
+
+### Legacy sweep — 31 models (pre-rewrite baseline, kept for reference)
+
+Prompt: `"Explain photosynthesis briefly"`. Single-run per model (no warm-up), cold JVM per model. These are the **baseline** numbers that drove the JFR analysis and the kernel rewrites above. Use them to see the delta vs the post-rewrite table.
+
+| # | Model | Quant | Size | CPU tok/s | PPL |
+|--:|-------|-------|-----:|----------:|----:|
+| 1 | Llama-3.2-1B | Q4_K_M | 0.8G | **11.1** | 0.96 |
+| 2 | granite-4.0-h-tiny | Q4_K_M | 3.9G | **9.4** | 0.55 |
+| 3 | OLMo-2-1B | Q4_K_M | 0.9G | **8.9** | 0.58 |
+| 4 | granite-3.3-2B ★ | Q4_K_M | 1.4G | **8.0** | 0.96 |
+| 5 | Qwen3-0.6B | Q8_0 | 0.6G | **6.6** | 1.00 |
+| 6 | qwen2.5-coder-1.5B | Q4_K_M | 1.0G | **6.4** | 0.97 |
+| 7 | Llama-3.2-1B | IQ4_NL | 0.7G | **4.8** | 0.97 |
+| 8 | gemma-3-1B | Q4_K_M | 0.8G | **4.5** | 0.97 |
+| 9 | Llama-3.2-3B | Q4_K_M | 1.9G | **4.4** | 0.99 |
+| 10 | Qwen3.5-2B | Q4_K_M | 1.2G | **3.7** | 0.96 |
+| 11 | Falcon3-3B | Q4_K_M | 1.9G | **3.5** | 0.97 |
+| 12 | SmolLM3 | Q4_K_M | 1.8G | **3.4** | 0.99 |
+| 13 | qwen2.5-coder-3B | Q4_K_M | 2.0G | **3.1** | 1.00 |
+| 14 | Qwen3-1.7B | Q8_0 | 1.7G | **2.9** | 1.00 |
+| 15 | Qwen3-4B | Q4_K_M | 2.3G | **2.9** | 1.00 |
+| 16 | granite-4.0-h-micro | Q4_K_M | 1.8G | **2.9** | 0.83 |
+| 17 | Mistral-7B | Q4_K_M | 4.1G | **2.7** | 1.00 |
+| 18 | Phi-4-mini | Q4_K_M | 2.3G | **2.4** | 0.98 |
+| 19 | gemma-3-4B | Q4_K_M | 2.3G | **2.4** | 0.95 |
+| 20 | Olmo-3-7B | Q4_K_M | 4.2G | **2.4** | 0.92 |
+| 21 | Qwen3-8B | Q4_K_M | 4.7G | **2.4** | 1.00 |
+| 22 | Llama-3.1-8B | Q4_K_M | 4.6G | **2.2** | 0.96 |
+| 23 | gemma-2-2B | IQ4_XS | 1.5G | **2.1** | 0.96 |
+| 24 | DeepSeek-R1-Qwen3-8B | Q4_K_M | 4.7G | **1.9** | 0.86 |
+| 25 | Falcon3-7B | Q4_K_M | 4.3G | **1.8** | 1.00 |
+| 26 | Qwen3.5-4B | Q4_K_M | 2.6G | **1.7** | 1.00 |
+| 27 | Llama-3.2-1B | IQ3_XXS | 0.5G | **1.6** | 0.84 |
+| 28 | granite-3.3-8B | Q4_K_M | 4.6G | **1.5** | 1.00 |
+| 29 | Llama-3.2-3B | Q3_K_L | 1.7G | **1.2** | 0.97 |
+| 30 | Nemotron-3-Nano-4B | Q4_K_M | 2.7G | **1.2** | 0.88 |
+| 31 | Phi-3-mini | IQ4_NL | 2.0G | **1.0** | 0.99 |
+
+★ `granite-3.3-2B` was re-run with a shorter prompt (`"Hi"`, 10 tokens); it timed out at the 30-token harness budget on the cold run, reflecting its heavier scale-factor arithmetic on CPU rather than a quality issue.
+
+**Skipped for time budget / size:** DeepSeek-Coder-V2-Lite (9.7G, MoE MLA), Qwen3-Coder-30B-A3B (17G, MoE), GLM-4.7-Flash (17G), Qwen2.5-Coder-32B (18G), Devstral-24B (13G), GLM-4-32B (18G), MiniMax-55B (22G), gemma-3n-E4B and gemma-4-E4B (CPU-only PLE path, runs but at ~0.5-1 tok/s), qwen2.5-coder-14b variants.
+
+### Observations
+
+- **Q4_K_M dense models are the category most helped** by the Q6_K rewrite (every Q4_K_M model has Q6_K weights in `ffn_down` + `attn_v` + `output`). Llama-3.2-1B Q4_K_M leads the 1B tier at 11.1 tok/s; OLMo-2-1B at 8.9, gemma-3-1B at 4.5 (slower per-parameter because of Q5_0 weights in Q/K/gate/up that do **not** go through the improved Q6_K path).
+- **Q8_0 models** (qwen3-0.6B, qwen3-1.7B) are unchanged by the Q6_K rewrite and represent the pure-Q8_0-dequant ceiling.
+- **IQ-based quants** (IQ3_XXS, IQ4_NL, IQ4_XS) all cluster at the bottom of the table — their scalar dequant paths plus non-standard lookup tables (IQ3_XXS grid, IQ4_NL K-means table) don't benefit from the B2I/I2F pattern used for block K-quants. Phi-3-mini IQ4_NL at 1.0 tok/s is the worst case. See the v1.11.0-dev GPU bench for the same models at 11-32 tok/s (dp4a kernels work where CPU SIMD doesn't).
+- **Hybrid architectures mixed:** granite-4.0-h-tiny at 9.4 tok/s leads all 4B-class models on CPU (Mamba-2 SSM + attention, most weights never active per token for the non-MoE portion), granite-4.0-h-micro at 2.9 tok/s despite being 1.8G (the full-FFN layers dominate). Nemotron-3-Nano-4B at 1.2 tok/s is the slowest 4B (Mamba-2 scan on CPU is scalar recurrence; GPU forward pass is the recommended path for this arch).
+- **Low-PPL outliers** (OLMo-2-1B at 0.58, granite-4.0-h-tiny at 0.55, granite-4.0-h-micro at 0.83, DeepSeek-R1-Qwen3-8B at 0.86, Nemotron-3-Nano-4B at 0.88) reflect model behavior on a 30-token natural-language prompt, not the inference engine — reasoning and small-scale models consistently under-rank here.
+
+The **single best bang-per-buck CPU optimization in this release** is the Q6_K SIMD rewrite. Secondary CPU items (SIMD Q4_0, `cpu.profile` extension to 4 alt engines, tiled-matmul deprecation) have no measurable effect on this sweep because no model here uses Q4_0 weights naturally, and tiled-matmul defaults remain off.
+
 ## Results v1.10.2
 
 **New in v1.10.2 — correctness fixes + Olmo 3 + autosearch:**

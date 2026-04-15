@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation style
+
+When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CALLING, docs under `docs/**`, Javadoc, and any `.md` authored for the project), always use normal prose — full sentences, articles, standard grammar. Do **not** use caveman / ultra-terse style in documentation, even if an active session has caveman mode enabled. Caveman style applies only to in-session assistant chat, not to persisted project artifacts.
+
 ## Project Overview
 
 LLMPlayer is a pure Java LLM inference engine (v1.12.0-dev, latest release v1.11.0) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 16 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K and MXFP4). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
@@ -361,6 +365,29 @@ When `--gpu-device` is not specified, `LLMEngine.autoConfigureGpu()` tries backe
 3. Add the type's case to `TensorFactory.create()`
 4. Optionally: add GPU variants in `java21/` — both OpenCL (`*GpuTensor` + kernel in `kernels/*.cl`) and CUDA (`*CudaTensor` + kernel in `kernels/cuda/*.cu`)
 
+### CPU SIMD kernel pattern (B2I/I2F lane-parallel)
+
+All block K-quant + Q8_0 SIMD kernels under `src/main/java21/.../tensor/Simd*FloatTensor.java` share a common pattern as of v1.12.0-dev (2026-04-15). Before writing a new SIMD kernel (or reviewing an existing one for perf regressions), verify it follows this template:
+
+1. Read packed bytes direct from mapped `MemorySegment` via `ByteVector.fromMemorySegment(B_SPECIES, segment, offset, BYTE_ORDER)` — NO `byte[]` scratch buffer, NO `MemorySegment.copy` inside the hot loop.
+2. Widen via `vbyte.convertShape(VectorOperators.B2I, I_SPECIES, 0)` → `IntVector` (sign-extended for signed quants like Q8_0; masked with `vand(0xFF)` for unsigned).
+3. Extract nibbles / bit-packed fields lane-parallel: `.and(mask)`, `.lanewise(LSHR, shift)`, `.lanewise(LSHL, shift)`. Never write a scalar `for j in F_LEN` loop feeding a `float[F_LEN]` scratch — that's "SIMD only in the final FMA" and gets flagged by JFR as a hotspot.
+4. Apply dequant offset (e.g. `.sub(vSub32)` for Q6_K, `.sub(vSub16)` for Q5_0, `.sub(vSub4)` for Q3_K) in the `IntVector` domain.
+5. Convert via `q.convertShape(VectorOperators.I2F, F_SPECIES, 0)` → `FloatVector`.
+6. FMA with input vector × scale broadcast: `acc = vq.fma(vds.mul(in), acc)` or `acc = w.fma(in, acc)`.
+
+Target `F_SPECIES = SPECIES_256` (8 floats, AVX2). Guard with `if (FloatVector.SPECIES_PREFERRED.length() != 8 || length % BLOCK_SIZE != 0) return super.dot(...)` to fall back to the scalar parent class on non-AVX2 or odd-sized tensors.
+
+Reference implementations (cross-check when adding a new quant type):
+- `SimdQ4_KFloatTensor` — canonical, nibble-only
+- `SimdQ6_KFloatTensor` — nibble + 2-bit qh (4 sub-blocks × 2 halves)
+- `SimdQ5_KFloatTensor` — nibble + 1-bit qh (4 groups)
+- `SimdQ5_0FloatTensor` — nibble + 1-bit qh broadcast via constant shift-vector
+- `SimdQ3_KFloatTensor` — 2-bit low + 1-bit hmask (16 sub-blocks)
+- `SimdQ8_0FloatTensor` — no bit-packing, simplest B2I/I2F chain
+
+**Types still on scalar lookup-table path** (not covered by B2I/I2F): IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S — these use non-linear k-means centroids or grid codebooks and need `VectorShuffle.rearrange` over a pre-multiplied table to go fully lane-parallel. Phi-3-mini IQ4_NL at 1.0 tok/s CPU is the worst CPU performer for this reason; GPU dp4a kernels (v1.11.0) already cover these types.
+
 ## Benchmarks
 
 See `BENCHMARKS.md` for full results (34+ models tested across 20 architectures), `PERFORMANCE-ANALYSIS.md` for detailed per-kernel profiling, and `docs/optimization/llamacpp-comparison.md` for the rolling tok/s vs llama.cpp comparison plus a journal of optimization attempts (cubin, cp.async, multi-warp, mmvq, dp4a) with measured outcomes for each.
@@ -394,13 +421,13 @@ All properties are set via `-Dproperty=value` on the Java command line.
 | `cuda.deltanet.v2` | `true` | Use float4-vectorized DeltaNet kernel (+4% throughput) |
 | `cuda.q6k.smem` | `false` | Use shared-memory input kernel for Q6_K (alternative to tiled variant) |
 | `cuda.profile` | `false` | Enable CUDA per-section timing (adds `finish()` barriers; ~15-25% overhead) |
-| `cpu.profile` | `false` | Enable CPU per-layer timing (standard InferenceEngine only) |
-| `matmul.tiled` | `false` | Enable cache-friendly tiled matmul on CPU (Java 21+) |
+| `cpu.profile` | `false` | Enable CPU per-section timing. Instrumented in `TransformerBlock` (standard engine: attn_norm/attn/ffn_norm/ffn/residual + post-norms), `DeepSeek2InferenceEngine` (attn_norm/attn(MLA)/ffn_norm/dense_ffn/moe_ffn/residual/output), `Qwen3MoEInferenceEngine` (same phases as DS2, attn(GQA)), `Qwen35InferenceEngine` (deltanet/attn(GQA)/output), `NemotronHInferenceEngine` (mamba/attn(GQA)/ffn/output). Not instrumented in `Gemma4InferenceEngine` (PLE paths). Prints summary every 10 tokens. |
+| `matmul.tiled` | `false` | **DEAD PATH** — benched 2026-04-15 on Llama-3.2-1B Q4_K_M CPU, measured -50% regression (3.0 vs 5.6-8.0 tok/s baseline). The per-block `MemorySegment.copy` + ROW_TILE=4 overhead outweighs L1 input reuse because `SimdQ4_KFloatTensor.dot` already reads directly from the segment. Kept opt-in for future hardware where L1 reuse might dominate, but do not enable on current targets. |
 | `kv.q8` | `false` | Use Q8_0 block-quantized KV cache (1.125 vs 4 bytes/elem; **+28% faster** for DeepSeek2 MLA) |
 | `attn.flash` | `false` | Enable FlashAttention online-softmax (single-pass; ~10% slower on Java/CPU; opt-in) |
 | `gemma4.nople` | `false` | Disable PLE pre-computation in Gemma 4 forward pass (debug flag) |
 
-**GPU profiling**: `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. Note: only instrumented in `CudaForwardPass` (standard architectures), not `Qwen35CudaForwardPass`. **CPU profiling**: `-Dcpu.profile=true` (standard `TransformerBlock` only).
+**GPU profiling**: `-Dcuda.profile=true` for per-section timing with `cudaContext.finish()` barriers. Note: only instrumented in `CudaForwardPass` (standard architectures), not `Qwen35CudaForwardPass`. **CPU profiling**: `-Dcpu.profile=true` covers `TransformerBlock`, `DeepSeek2InferenceEngine`, `Qwen3MoEInferenceEngine`, `Qwen35InferenceEngine`, `NemotronHInferenceEngine`. Not wired for `Gemma4InferenceEngine` (niche PLE paths).
 
 ### Automated kernel autosearch (`autosearch.sh`)
 

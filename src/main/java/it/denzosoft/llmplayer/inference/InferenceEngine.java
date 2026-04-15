@@ -192,8 +192,10 @@ public class InferenceEngine {
 
     private float[] forwardInternal(InferenceState state, int token, int position, boolean computeLogits) {
         int dim = config.embeddingLength();
+        long t0 = 0;
 
         // 1. Token embedding lookup
+        if (cpuProfile) t0 = System.nanoTime();
         for (int i = 0; i < dim; i++) {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
@@ -204,6 +206,7 @@ public class InferenceEngine {
                 state.x[i] *= embeddingScale;
             }
         }
+        if (cpuProfile) profEmbedNs += System.nanoTime() - t0;
 
         // 2. Forward through all transformer layers
         boolean logitsDone = false;
@@ -222,16 +225,17 @@ public class InferenceEngine {
         int vocabSize = config.vocabSize();
 
         if (!logitsDone) {
-            // 3. Final norm (RMSNorm or LayerNorm for Command-R)
+            if (cpuProfile) t0 = System.nanoTime();
             if (useLayerNorm) {
                 LayerNorm.apply(state.xb, state.x, normWeightCache, dim, config.normEps());
             } else {
                 VectorOpsFactory.get().rmsnorm(state.xb, state.x, normWeightCache, dim, config.normEps());
             }
+            if (cpuProfile) { long t1 = System.nanoTime(); profFinalNormNs += t1 - t0; t0 = t1; }
 
-            // 4. Output projection: logits = output_weight * xb
             Arrays.fill(state.logits, 0);
             weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+            if (cpuProfile) profOutputNs += System.nanoTime() - t0;
             // E12: optional output.bias for Qwen2 variants — see llama.cpp qwen2.cpp:119-121
             if (weights.outputBias() != null) {
                 FloatTensor ob = weights.outputBias();
@@ -257,7 +261,23 @@ public class InferenceEngine {
             }
         }
 
+        if (cpuProfile) {
+            profEngineTokenCount++;
+            if (profEngineTokenCount % 10 == 0) printEngineProfile();
+        }
+
         return state.logits;
+    }
+
+    private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
+    private long profEmbedNs, profFinalNormNs, profOutputNs;
+    private int profEngineTokenCount;
+
+    private void printEngineProfile() {
+        int n = profEngineTokenCount;
+        double ms = 1e6;
+        System.out.printf("[cpu-profile Engine] %d tokens, per-token avg (ms): embed=%.2f final_norm=%.2f output_proj=%.2f%n",
+            n, profEmbedNs / ms / n, profFinalNormNs / ms / n, profOutputNs / ms / n);
     }
 
     /**

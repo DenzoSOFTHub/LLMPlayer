@@ -26,9 +26,24 @@ test-results-*.md
 CheckTokens.java
 DebugQwen35.java
 InspectGGUF.java
+CheckSizes.*
 benchmark_results.txt
 work-llmplayer/
+code
 code/
+
+# Bench/profiling artifacts
+autosearch-results.txt
+bench-*.tsv
+bench-*.log
+benchmark-results/
+profiling/
+*.jfc
+ppl-*.txt
+
+# Release builds
+release/
+release-v*/
 
 # OS
 .DS_Store

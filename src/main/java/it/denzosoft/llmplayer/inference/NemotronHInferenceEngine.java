@@ -161,29 +161,52 @@ public class NemotronHInferenceEngine {
         }
 
         // 3. CPU forward through all layers
+        long t0 = 0, t1;
         for (int layer = 0; layer < blockCount; layer++) {
             NemotronHLayerWeights lw = weights.layers()[layer];
             if (lw.isMamba()) {
+                if (cpuProfile) t0 = System.nanoTime();
                 forwardMamba2(state, lw, layer);
+                if (cpuProfile) { t1 = System.nanoTime(); profMambaNs += t1 - t0; }
             } else if (lw.isAttention()) {
+                if (cpuProfile) t0 = System.nanoTime();
                 forwardAttention(state, lw, layer, position);
+                if (cpuProfile) { t1 = System.nanoTime(); profAttnNs += t1 - t0; }
             } else {
+                if (cpuProfile) t0 = System.nanoTime();
                 forwardFFN(state, lw, layer);
+                if (cpuProfile) { t1 = System.nanoTime(); profFfnNs += t1 - t0; }
             }
         }
 
         if (!computeLogits) return null;
 
-        // 3. Final RMSNorm + output projection
+        if (cpuProfile) t0 = System.nanoTime();
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
-        // Granite Hybrid: logit scaling (divide by logitScale)
         if (logitScale > 0f) {
             float scale = 1.0f / logitScale;
             for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
         }
+        if (cpuProfile) {
+            profOutputNs += System.nanoTime() - t0;
+            profTokenCount++;
+            if (profTokenCount % 10 == 0) printProfile();
+        }
         return state.logits;
+    }
+
+    private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
+    private long profMambaNs, profAttnNs, profFfnNs, profOutputNs;
+    private int profTokenCount;
+
+    private void printProfile() {
+        int n = profTokenCount;
+        double ms = 1e6;
+        long total = profMambaNs + profAttnNs + profFfnNs + profOutputNs;
+        System.out.printf("[cpu-profile NemotronH] %d tokens, per-token avg (ms): mamba=%.1f attn(GQA)=%.1f ffn=%.1f output=%.1f | total=%.1f%n",
+            n, profMambaNs / ms / n, profAttnNs / ms / n, profFfnNs / ms / n, profOutputNs / ms / n, total / ms / n);
     }
 
     private float[] forwardGpu(NemotronHState state, int position, boolean computeLogits) throws Exception {
