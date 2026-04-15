@@ -58,29 +58,23 @@ extern "C" __global__ void matmul_q4_k(
         unsigned int sc1 = __ldg((const unsigned int*)(weights + bo + 8));
         unsigned int sc2 = __ldg((const unsigned int*)(weights + bo + 12));
 
-        // Extract individual scale bytes
-        unsigned char sb[12];
-        sb[0] = sc0 & 0xFF; sb[1] = (sc0 >> 8) & 0xFF; sb[2] = (sc0 >> 16) & 0xFF; sb[3] = (sc0 >> 24) & 0xFF;
-        sb[4] = sc1 & 0xFF; sb[5] = (sc1 >> 8) & 0xFF; sb[6] = (sc1 >> 16) & 0xFF; sb[7] = (sc1 >> 24) & 0xFF;
-        sb[8] = sc2 & 0xFF; sb[9] = (sc2 >> 8) & 0xFF; sb[10] = (sc2 >> 16) & 0xFF; sb[11] = (sc2 >> 24) & 0xFF;
-
-        // Decode scales and mins for this group's two sub-blocks
-        int sb0 = group * 2;
-        int sb1 = group * 2 + 1;
+        // Decode scales/mins WITHOUT a byte array (avoids NVCC local-memory spill).
+        // Same logic as matmul_q4_k_dp4a: pick correct 16-bit lane of each uint per group.
+        unsigned int shift = (group & 1) ? 16 : 0;
+        unsigned int b0 = (sc0 >> shift) & 0xFFFFu;
+        unsigned int b1 = (sc1 >> shift) & 0xFFFFu;
         int scale0, min0, scale1, min1;
-        if (sb0 < 4) {
-            scale0 = sb[sb0] & 0x3F;
-            min0 = sb[sb0 + 4] & 0x3F;
+        if (group < 2) {
+            scale0 = (int)( b0        & 0x3F);
+            scale1 = (int)((b0 >> 8)  & 0x3F);
+            min0   = (int)( b1        & 0x3F);
+            min1   = (int)((b1 >> 8)  & 0x3F);
         } else {
-            scale0 = (sb[sb0 + 4] & 0x0F) | ((sb[sb0 - 4] >> 6) << 4);
-            min0 = ((sb[sb0 + 4] >> 4) & 0x0F) | ((sb[sb0] >> 6) << 4);
-        }
-        if (sb1 < 4) {
-            scale1 = sb[sb1] & 0x3F;
-            min1 = sb[sb1 + 4] & 0x3F;
-        } else {
-            scale1 = (sb[sb1 + 4] & 0x0F) | ((sb[sb1 - 4] >> 6) << 4);
-            min1 = ((sb[sb1 + 4] >> 4) & 0x0F) | ((sb[sb1] >> 6) << 4);
+            unsigned int b2 = (sc2 >> shift) & 0xFFFFu;
+            scale0 = (int)( (b2        & 0x0F) | (((b0 >> 6)  & 0x03) << 4));
+            scale1 = (int)(((b2 >> 8)  & 0x0F) | (((b0 >> 14) & 0x03) << 4));
+            min0   = (int)(((b2 >> 4)  & 0x0F) | (((b1 >> 6)  & 0x03) << 4));
+            min1   = (int)(((b2 >> 12) & 0x0F) | (((b1 >> 14) & 0x03) << 4));
         }
 
         float ds0 = d * (float)scale0;

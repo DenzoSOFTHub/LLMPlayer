@@ -1,5 +1,7 @@
 # Performance Analysis: Can We Reach 100 tok/s?
 
+> **⚠️ Snapshot from 2026-03-07.** The per-section bandwidth breakdown below is still accurate for the FP32-kernel path, but **dp4a wiring (v1.10.1 → v1.11.0-dev) has since reshaped the headline number**: Llama-3.2-1B Q4_K_M now runs ~63 tok/s in CUDA graph mode (was 47), and Phi-3-mini IQ4_NL jumped 8.4 → 11.9 (+42%). For the current state of the RTX 4050 optimization ceiling and the rolling comparison vs llama.cpp, see `docs/optimization/llamacpp-comparison.md` and the optimization journal under `docs/optimization/`.
+
 **Date**: 2026-03-07
 **Hardware**: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 192 GB/s peak bandwidth)
 **Model**: Llama-3.2-1B-Instruct Q4_K_M (770 MB, 16 layers, dim=2048, vocab=128256)

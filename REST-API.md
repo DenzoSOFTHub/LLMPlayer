@@ -1,8 +1,9 @@
 # LLMPlayer REST API
 
-LLMPlayer exposes three groups of REST APIs when started with `--web` (default port 8080):
+LLMPlayer exposes four groups of REST APIs when started with `--web` (default port 8080):
 
-- **`/v1/*`** — OpenAI Chat Completions compatible API. Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.).
+- **`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`** — OpenAI Chat Completions compatible API. Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.).
+- **`/v1/messages`, `/v1/messages/count_tokens`** — Anthropic Messages API. Compatible with Claude Code and other Anthropic API clients. Implemented by `AnthropicHandler`.
 - **`/api/*`** — LLMPlayer-specific management API for model loading, GPU configuration, and hardware diagnostics.
 - **`/api/chats/*`** — Chat persistence API with conversation branching. Used by the chat UI at `/chat`.
 
@@ -211,6 +212,22 @@ If no model is loaded, lists available GGUF files in the `gguf/` directory:
   ]
 }
 ```
+
+---
+
+## Anthropic Messages API (`/v1/messages`)
+
+Implements the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) for compatibility with Claude Code and other Anthropic API clients. Implemented in `AnthropicHandler.java`.
+
+The `x-api-key` header is accepted and ignored (no authentication required — same pattern as the OpenAI `Authorization: Bearer` header).
+
+### POST `/v1/messages`
+
+Chat completion in Anthropic message format. Supports streaming (`stream: true` → SSE with `message_start` / `content_block_delta` / `message_delta` / `message_stop` events) and non-streaming. Accepts the standard Anthropic fields: `model` (accepted and ignored — uses the currently loaded model), `messages` (array of `{role, content}` with `user` / `assistant` roles), `system`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`.
+
+### POST `/v1/messages/count_tokens`
+
+Returns the token count for a given message payload without generating — useful for budgeting context window usage client-side. Same request shape as `/v1/messages`, response is `{"input_tokens": N}`.
 
 ---
 

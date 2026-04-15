@@ -111,6 +111,12 @@ public class CLIRunner {
     }
 
     private void runSinglePrompt(LLMEngine engine, String prompt) {
+        // Tier 3: speculative decoding when --draft-model provided. Standalone path,
+        // does not affect the normal engine.generate() flow when the flag is absent.
+        if (options.getDraftModelPath() != null) {
+            runSpeculative(engine, prompt);
+            return;
+        }
         SamplerConfig samplerConfig = options.toSamplerConfig();
         GenerationRequest request = GenerationRequest.builder()
             .prompt(prompt)
@@ -133,6 +139,48 @@ public class CLIRunner {
             for (EvaluationResult eval : response.evaluation()) {
                 System.out.println("  " + eval);
             }
+        }
+    }
+
+    /** Tier 3 speculative decoding path. Loads the draft model, runs the algorithm,
+     *  prints stats. Completely separate from normal generation. */
+    private void runSpeculative(LLMEngine target, String prompt) {
+        String draftPath = options.getDraftModelPath();
+        int K = options.getSpeculationDepth();
+        System.out.println("\n--- Speculative Decoding ---");
+        System.out.println("Target: " + target.getModelInfo().name());
+        System.out.println("Draft model: " + draftPath);
+        System.out.println("Speculation depth K=" + K);
+
+        // Load draft on CPU by default to avoid GPU memory contention with target.
+        // User can override with environment but for first iteration we keep it simple.
+        it.denzosoft.llmplayer.gpu.GpuConfig draftGpu = new it.denzosoft.llmplayer.gpu.GpuConfig();
+        draftGpu.setEnabled(false);
+        try (LLMEngine draft = LLMEngine.load(java.nio.file.Path.of(draftPath),
+                options.getContextLength(), draftGpu, false)) {
+            it.denzosoft.llmplayer.spec.SpeculativeDecoder spec =
+                new it.denzosoft.llmplayer.spec.SpeculativeDecoder(target, draft, K);
+            GenerationRequest request = GenerationRequest.builder()
+                .prompt(prompt)
+                .maxTokens(options.getMaxTokens())
+                .build();
+            System.out.println("\n--- Generation ---");
+            GenerationResponse response = spec.generate(request, (token, id) -> {
+                System.out.print(token);
+                System.out.flush();
+                return true;
+            });
+            System.out.println("\n--- Stats ---");
+            System.out.printf("Tokens: %d prompt + %d generated in %dms (%.1f tok/s)%n",
+                response.promptTokenCount(), response.tokenCount(),
+                response.timeMs(), response.tokensPerSecond());
+            System.out.printf("Acceptance rate: %.1f%% (%d/%d draft tokens accepted, %d rounds)%n",
+                spec.getAcceptanceRate() * 100,
+                spec.getTotalAcceptedTokens(), spec.getTotalDraftTokens(),
+                spec.getTotalSpeculationRounds());
+        } catch (Exception e) {
+            System.err.println("Speculative decoding failed: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 

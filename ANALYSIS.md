@@ -1,5 +1,7 @@
 # LLMPlayer — Consolidated Analysis and Roadmap
 
+> **⚠️ Historical document (as of ~v1.2 / early 2026).** The quantization coverage (section 2) and architecture gap analysis (section 3) below are a point-in-time roadmap and are now largely closed. For current state see `README.md` (supported architectures + quant types), `CLAUDE.md` (engine/tensor dispatch), `WHATS-NEW.md` (release deltas), and `docs/optimization/llamacpp-comparison.md` (current tok/s gap vs llama.cpp). Current totals: **21 architectures** across 6 engine paths, **18 quantized formats** (16 with dedicated CUDA kernels).
+
 ## 1. OpenAI API Compatibility
 
 ### Current status: IMPLEMENTED

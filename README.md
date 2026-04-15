@@ -1,6 +1,17 @@
-# LLMPlayer v1.10.2
+# LLMPlayer v1.11.0
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.11.0 — Granite Hybrid full GPU + dp4a kernel fleet
+
+Highlights:
+
+- **dp4a expanded to Q5_0 / Q8_0 / IQ4_NL / IQ4_XS** — four new CUDA kernels (`matmul_{q5_0,q8_0,iq4_nl,iq4_xs}_dp4a.cu`) wired into `CudaForwardPass`, `Qwen35CudaForwardPass`, and `NemotronHCudaForwardPass`. Measured on RTX 4050: **Phi-3-mini IQ4_NL +42%** (8.4 → 11.9 tok/s), **Nemotron-3-Nano-4B +92%** (10.4 → 20.0), Qwen3-1.7B Q8_0 +8%, Gemma-3-1B Q5_0 +4%. The previously-anomalous models stuck at 15–32% of llama.cpp (Phi-3-mini IQ4_NL, Gemma-2-2B IQ4_XS, Gemma-3-1B Q5_0) were all falling through to FP32 kernels — fixed. PPL preserved bit-equivalent.
+- **Granite Hybrid — full GPU path** — integrated SwiGLU FFN (inside Mamba/Attention layers) + all four scale factors (embedding/logit/residual/attention) on GPU via `runIntegratedFFN()`, `scale_inplace`, `accumulate`, and saxpy. `isSupported()` now returns true for Granite Hybrid; CUDA graph capture works. Bit-equivalent to CPU at ±2 ULP when dp4a is disabled. **Measured on granite-4.0-h-micro Q4_K_M: 35.6 tok/s (was ~8 CPU, +4.4×; 19% → 85% of llama.cpp).** Biggest single-model jump of the sprint.
+- **Speculative decoding (scaffolding)** — new `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al.). Standalone class driving target + draft `LLMEngine` via `forwardSingleToken`. Enabled with `--draft-model <gguf>`. **Sequential verification only** (~1.14× max with K=4); real 2-3× requires a batched `forwardBatch` API that doesn't exist yet. Kept shipped for algorithmic correctness testing. See `docs/optimization/speculative-decoding.md`.
+- **Optimization journal** — new `docs/optimization/` directory records kernel-level attempts with measured outcomes: cubin (Option A), cp.async prefetch (Option C), multi-warp Q4_K, mmvq port. All 0 to −22% on RTX 4050 Q4_K matvec at batch=1 — the hardware is at the bandwidth ceiling for this workload. `llamacpp-comparison.md` tracks the rolling tok/s vs llama.cpp across 17 models (avg ~72% of llama.cpp for standard Q4_K_M).
+
+Still planned: Gemma 4 E2B benchmark, Q4_1 tensor support, dedicated `Gemma4CudaForwardPass` (PLE on GPU), MoE Granite Hybrid Tiny, Bonsai Q1_0 format, batched `forwardBatch` to unlock real speculative-decoding speedup.
 
 ### What's new in v1.10.2 — Gemma 4 fully working + Granite Hybrid GPU fix + Olmo 3 + autosearch
 
@@ -315,6 +326,7 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 | `--port` | — | Integer | 8080 | Web server port |
 | `--gguf-dir` | — | String | `gguf` | GGUF file directory |
 | `--thinking` | — | Flag | false | Enable thinking/reasoning mode (SmolLM3, Qwen3, Qwen3.5) |
+| `--draft-model` | — | String | — | Path to draft GGUF. Enables speculative decoding via `SpeculativeDecoder` (target = `--model`, draft = this). **Experimental**: sequential verification only (~1.14× max with K=4); kept for algorithmic correctness. See `docs/optimization/speculative-decoding.md`. |
 | `--force` | `-y` | Flag | false | Skip confirmation prompts (e.g., RAM warning) |
 | `--help` | `-h` | Flag | false | Show help |
 
@@ -373,10 +385,22 @@ Advanced performance tuning via JVM system properties (`-Dproperty=value`). Thes
 | `-Dcuda.nograph=true` | `false` | Disable CUDA graph; use per-layer kernel launches |
 | `-Dcuda.cublas=true` | `false` | Enable cuBLAS for matmul (dequantizes Q4_K to FP16, uses `libcublas.so`). Useful on high-bandwidth GPUs (A100, H100). On RTX 4050, custom Q4_K kernels + CUDA graph are faster |
 | `-Dcuda.cublas.fp32=true` | `false` | Use FP32 instead of FP16 for cuBLAS (requires 7x VRAM vs Q4_K) |
-| `-Dcuda.dp4a=true` | `false` | Enable `__dp4a` int8 dot product for Qwen3.5 matmul (~2% gain on consumer GPUs, more on datacenter GPUs with dedicated INT8 units) |
+| `-Dcuda.dp4a=true` | **`true`** | Enable `__dp4a` int8 dot product across `CudaForwardPass` + `Qwen35CudaForwardPass` + `NemotronHCudaForwardPass`. Covers Q4_K, Q5_K, Q5_0 (v1.11.0-dev), Q8_0 (v1.11.0-dev), IQ4_NL (v1.11.0-dev), IQ4_XS (v1.11.0-dev). Input is quantized to Q8_1 on the fly. **+34% on Llama-1B Q4_K, +42% on Phi-3-mini IQ4_NL, +92% on Nemotron-3-Nano-4B.** Q6_K stays on FP32 (dp4a slower due to unaligned 210-byte block). |
+| `-Dcuda.dp4a.q6=true` | `false` | Force Q6_K dp4a kernel. Kept for correctness checks only — measures slower than the FP32 Q6_K kernel on Llama-1B (70.6 vs 72.85 tok/s). |
+| `-Dcuda.dp4a.fused_gate_up=true` | `false` | Single fused kernel for gate+up dp4a matmul. Default OFF — marginal/regression (input is already L1-cached; fused kernel adds register pressure). |
+| `-Dcuda.dp4a.mw=true` | `false` | llama.cpp-style multi-warp Q4_K dp4a kernel (4 warps × 32 lanes per row). Slower for small models (Llama-1B: 51 vs 70 tok/s); may help larger models with more super-blocks per row. |
 | `-Dcuda.q4k.coalesced=true` | `false` | Alternative coalesced Q4_K kernel (all threads process same group) |
 | `-Dcuda.q4k.smem=true` | `false` | Q4_K kernel with shared-memory input tiling |
+| `-Dcuda.q4k.2warp=true` | `false` | 2-warp-per-row Q4_K (splits column groups with shared-memory partial-sum reduction) |
+| `-Dcuda.q4k.cpasync=true` | `false` | cp.async input prefetch (Option C — measured −2.8% on RTX 4050; kept for future high-bandwidth GPU experiments) |
+| `-Dcuda.q5k.smem=true` | **`true`** | Shared-memory input kernel for Q5_K (+7%) |
+| `-Dcuda.q6k.tiled=true` | **`true`** | Tiled shared-memory Q6_K kernel (256-elem tiles, +9%) |
+| `-Dcuda.q6k.smem=true` | `false` | Alternative shared-memory Q6_K (vs tiled) |
+| `-Dcuda.deltanet.v2=true` | **`true`** | Float4-vectorized DeltaNet kernel (+4%) |
+| `-Dcuda.prebuilt=true` | `false` | Load pre-built CUDA cubin instead of compiling via NVRTC (Option A — measured ±1%; no shipped artifacts) |
 | `-Dcuda.profile=true` | `false` | Per-section GPU timing (adds sync barriers, ~15-25% overhead) |
+| `-Dcpu.profile=true` | `false` | Per-layer CPU timing (standard `InferenceEngine` only) |
+| `-Dgemma4.nople=true` | `false` | Disable PLE pre-computation in Gemma 4 forward pass (debug flag) |
 
 ### HuggingFace Download
 
@@ -498,11 +522,17 @@ engine.close();
 | GLM4 | `glm4` | SentencePiece | `[gMASK]<sop><\|user\|>` |
 | Gemma 2 | `gemma2` | SentencePiece | `<start_of_turn>user` |
 | Gemma 3 | `gemma3` | SentencePiece | `<start_of_turn>user` |
+| Gemma 3n (PLE) | `gemma3n` | SentencePiece | `<start_of_turn>user` |
+| Gemma 4 (PLE, V-norm, layer_output_scale) | `gemma4` | BPE (gemma4 mode) | `<\|turn>...<turn\|>` |
 | Phi-3/4 | `phi3` | BPE (gpt2) | `<\|user\|>` |
 | Mistral3/Devstral | `mistral3` | SentencePiece | `[INST]` |
 | Command-R/Cohere (Aya-23) | `command-r` | SentencePiece | `<\|START_OF_TURN_TOKEN\|><\|USER_TOKEN\|>` |
 | OLMo2 | `olmo2` | BPE (gpt2) | `<\|user\|>` |
+| Olmo 3 (ChatML variant) | `olmo2` (auto-detected) | BPE (gpt2) | `<\|im_start\|>user` |
+| Falcon3 | `falcon3` | BPE (gpt2) | `<\|user\|>` |
 | GPT-OSS (Sonar) | `llama` (MoE) | BPE (gpt2) | `<\|start_header_id\|>user<\|end_header_id\|>` |
+| Granite 3.3 | `granite` | BPE (gpt2) | `<\|start_of_role\|>user<\|end_of_role\|>` |
+| Granite Hybrid | `granitehybrid` | BPE (gpt2) | `<\|start_of_role\|>user<\|end_of_role\|>` |
 | Nemotron-H (Mamba-2 hybrid) | `nemotron_h` | BPE (gpt2) | `<\|im_start\|>user` |
 
 The architecture is automatically detected from the `general.architecture` field in GGUF metadata.
@@ -513,46 +543,52 @@ Hardware: Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM, 19
 
 **34+ models tested** across 20 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM-4.7-Flash, GLM4, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Command-R/Cohere, OLMo2, GPT-OSS, Nemotron-H, Granite 3.3, Granite Hybrid).
 
-### Top results — CUDA GPU (ranked by tok/s)
+### Top results — CUDA GPU (v1.11.0-dev sweep, ranked by tok/s)
 
-| # | Model | Params | Quant | GPU Config | tok/s |
-|--:|-------|--------|-------|------------|------:|
-| 1 | OLMo-2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 52.1 |
-| 2 | Llama-3.2-1B-Instruct | 1B | Q4_K_M | CUDA graph | 48.8 |
-| 3 | Qwen2.5-Coder-1.5B-Instruct | 1.5B | Q4_K_M | CUDA graph | 40.8 |
-| 4 | Gemma-3-1B-it | 1B | Q4_K_M | CUDA graph | 33.1 |
-| 5 | Qwen3.5-2B-Claude-4.6 | 2B | Q4_K_M | CUDA graph (Qwen35) | 28.2 |
-| 6 | Llama-3.2-1B-Instruct | 1B | IQ4_NL | CUDA graph | 27.8 |
-| 7 | SmolLM3-3B | 3B | Q4_K_M | CUDA graph | 22.9 |
-| 8 | Llama-3.2-3B-Instruct | 3B | Q4_K_M | CUDA graph | 22.6 |
-| 9 | Qwen2.5-Coder-3B-Instruct | 3B | Q4_K_M | CUDA graph | 21.5 |
-| 10 | Gemma-3-4B-it | 4B | Q4_K_M | CUDA graph | 16.3 |
-| 11 | Qwen3-4B | 4B | Q4_K_M | CUDA graph | 18.3 |
-| 11 | Phi-4-mini-Instruct | 3.8B | Q4_K_M | CUDA graph | 14.5 |
-| 12 | Qwen3.5-4B-Claude-4.6 | 4B | Q4_K_M | CUDA graph (Qwen35) | 13.7 |
-| 13 | Mistral-7B-Instruct-v0.3 | 7B | Q4_K_M | CUDA graph | 11.8 |
-| 14 | Qwen2.5-Coder-7B-Instruct | 7B | Q4_K_M | CUDA graph | 11.2 |
-| 15 | NVIDIA-Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | Per-layer (NemotronH) | 9.9 |
-| 16 | Qwen3.5-9B-Claude-4.6 | 9B | Q4_K_M | CUDA graph (Qwen35) | 7.9 |
+Best-of-3 per model, T=0.0, 120 tokens, --context-length 512. All output is deterministic across the 3 runs (identical hash). Quality columns: PPL = normalized perplexity [0..1] · Coh = coherence [0..1] · Agg = composite quality score [0..1] (EXCELLENT ≥0.80, GOOD ≥0.55, FAIR ≥0.40).
 
-Full benchmark results (27 models, CUDA GPU) in [BENCHMARKS.md](BENCHMARKS.md). Detailed performance analysis in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md).
+| # | Model | Quant | Arch | GPU Path | tok/s | Agg |
+|--:|-------|-------|------|----------|------:|----:|
+| 1 | Qwen3-0.6B | Q8_0 | qwen3 | CUDA graph + dp4a (Q8_0) | **99.4** | 0.83 |
+| 2 | granite-4.0-h-tiny | Q4_K_M | granite-hybrid | CUDA graph + dp4a (NemotronH) | **94.3** | 0.46 |
+| 3 | OLMo-2-1B-Instruct | Q4_K_M | olmo2 | CUDA graph + dp4a (Q4_K) | **84.5** | 0.85 |
+| 4 | Llama-3.2-1B-Instruct | Q4_K_M | llama | CUDA graph + dp4a (Q4_K) | **84.3** | 0.84 |
+| 5 | granite-3.3-2b-instruct | Q4_K_M | granite | CUDA graph + dp4a (Q4_K) | **50.3** | 0.84 |
+| 6 | Falcon3-3B-Instruct | Q4_K_M | falcon3 | CUDA graph + dp4a (Q4_K) | **44.1** | 0.84 |
+| 7 | Qwen3-1.7B | Q8_0 | qwen3 | CUDA graph + dp4a (Q8_0) | **42.7** | 0.81 |
+| 8 | Gemma-3-1B-it | Q4_K_M | gemma3 | CUDA graph + dp4a (Q4_K + Q5_0) | **41.2** | 0.51 |
+| 9 | granite-4.0-h-micro | Q4_K_M | granite-hybrid | CUDA graph + dp4a + integrated SwiGLU | **34.1** | 0.60 |
+| 10 | Llama-3.2-1B-Instruct | IQ4_NL | llama | CUDA graph + dp4a (IQ4_NL) | **32.6** | 0.85 |
+| 11 | Qwen3-4B | Q4_K_M | qwen3 | CUDA graph + dp4a (Q4_K) | **32.3** | 0.85 |
+| 12 | Phi-4-mini-Instruct | Q4_K_M | phi3 | CUDA graph + dp4a (Q4_K) | **32.1** | **0.98** |
+| 13 | NVIDIA-Nemotron-3-Nano-4B | Q4_K_M | nemotron-h | Per-layer + dp4a (NemotronH) | **22.6** | 0.84 |
+| 14 | Mistral-7B-Instruct-v0.3 | Q4_K_M | mistral3 | CUDA graph + dp4a (Q4_K) | **20.1** | 0.82 |
+| 15 | Phi-3-mini-4k-instruct | IQ4_NL | phi3 | CUDA graph + dp4a (IQ4_NL) | **12.0** | 0.77 |
+| 16 | Gemma-2-2b-it | IQ4_XS | gemma2 | CUDA graph + dp4a (IQ4_XS) | **10.8** | 0.66 |
 
-### LLMPlayer vs llama.cpp (CPU comparison)
+Full results, methodology, headline gains and llama.cpp comparison in [BENCHMARKS.md](BENCHMARKS.md). Per-kernel profiling in [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md). Sweep is reproducible via `bench-v1.11.0-dev.sh`.
+
+### LLMPlayer vs llama.cpp (CPU comparison, v1.11.0-dev refresh)
 
 LLMPlayer CUDA graph vs llama.cpp CPU-only (`llama-cpp-python`, same hardware, same GGUF files):
 
 | Model | Params | Quant | LLMPlayer GPU | LLMPlayer CPU | llama.cpp CPU | GPU vs llama.cpp |
 |-------|--------|-------|-------------:|-------------:|-------------:|---------:|
-| Qwen3-0.6B | 0.6B | Q8_0 | **74.6** | 5.9 | 4.5 | **16.6x** |
-| Llama-3.2-1B | 1B | Q4_K_M | **52.8** | 3.5 | 4.3 | **12.3x** |
-| Qwen3-1.7B | 1.7B | Q8_0 | **32.1** | 2.9 | 4.2 | **7.6x** |
-| Granite-3.3-2B | 2B | Q4_K_M | **26.4** | 1.3 | 1.8 | **14.7x** |
-| Falcon3-3B | 3B | Q4_K_M | **22.9** | 1.3 | 4.8 | **4.8x** |
-| SmolLM3-3B | 3B | Q4_K_M | **22.4** | 1.3 | N/A | — |
-| Qwen3-4B | 4B | Q4_K_M | **18.3** | 0.9 | 1.9 | **9.6x** |
-| Qwen3-8B | 8B | Q4_K_M | **10.2** | 0.5 | 1.7 | **6.0x** |
+| Qwen3-0.6B | 0.6B | Q8_0 | **99.4** | 5.9 | 4.5 | **22.1×** |
+| granite-4.0-h-tiny | ~400M | Q4_K_M | **94.3** | — | — | — |
+| OLMo-2-1B | 1B | Q4_K_M | **84.5** | — | — | — |
+| Llama-3.2-1B | 1B | Q4_K_M | **84.3** | 3.5 | 4.3 | **19.6×** |
+| granite-3.3-2B | 2B | Q4_K_M | **50.3** | 1.3 | 1.8 | **27.9×** |
+| Falcon3-3B | 3B | Q4_K_M | **44.1** | 1.3 | 4.8 | **9.2×** |
+| Qwen3-1.7B | 1.7B | Q8_0 | **42.7** | 2.9 | 4.2 | **10.2×** |
+| Gemma-3-1B | 1B | Q4_K_M | **41.2** | — | — | — |
+| granite-4.0-h-micro | 1.8B | Q4_K_M | **34.1** | ~8 | 41.8 | **0.82×** (85%) |
+| Qwen3-4B | 4B | Q4_K_M | **32.3** | 0.9 | 1.9 | **17.0×** |
+| Phi-4-mini | 3.8B | Q4_K_M | **32.1** | — | — | — |
+| Nemotron-3-Nano-4B | 4B (hybrid) | Q4_K_M | **22.6** | — | 35.6 | **0.63×** (63%) |
+| Mistral-7B | 7B | Q4_K_M | **20.1** | — | — | — |
 
-LLMPlayer with CUDA graph is **5–17x faster** than llama.cpp running CPU-only on the same machine. On CPU-only, llama.cpp is 1.2–3.7x faster than LLMPlayer (expected: C/C++ native SIMD vs Java Vector API). The GPU acceleration closes this gap and provides a significant net advantage.
+LLMPlayer GPU is now **9–28× faster** than llama.cpp CPU-only on dense Q4_K models (was 5–17× in v1.10.x), and the dp4a expansion + Granite Hybrid GPU path bring the two hybrid-arch outliers (Granite Hybrid, Nemotron-H) up to **63–85% of llama.cpp's GPU baseline** (was 19% and 29% respectively). On CPU-only, llama.cpp is still 1.2–3.7× faster than LLMPlayer (expected: C/C++ native SIMD vs Java Vector API).
 
 ### GPU strategy summary
 
