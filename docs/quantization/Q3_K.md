@@ -93,8 +93,15 @@ The scale offset of 32 centers the 6-bit scale range (0-63) around zero, giving 
 | Property | Value |
 |----------|-------|
 | Fused SIMD class | `SimdQ3_KFloatTensor` (java21) |
-| Available since | v1.6.0 |
-| CPU dot path | Fused dequant+dot with SIMD vector operations |
+| Available since | v1.6.0, rewritten v1.12.0-dev (B2I lane-parallel) |
+| CPU dot path | `ByteVector → B2I → I2F → FMA`. 2-bit low quants and 1-bit hmask extracted lane-parallel with `LSHR pair*2 & 3` and `LSHR hmBitPos & 1` (then `LSHL 2`). |
+
+### B2I lane-parallel rewrite (v1.12.0-dev, 2026-04-15)
+
+Q3_K has the most complex K-quant layout: 16 sub-blocks each with a 6-bit scale spread across 12 bytes, plus 2-bit low quants (64 bytes for 256 elements) and a 1-bit hmask (32 bytes). Old SIMD had two nested scalar `for j in F_LEN` loops — one per 16-element half of each sub-block — extracting the 2-bit + 1-bit parts per lane. New kernel loads 8 qs bytes + 8 hm bytes as `ByteVector`, does lane-wise shift+mask for the 2-bit groups (runtime-variable `shift = pair*2` ∈ {0,2,4,6}) and 1-bit hmask (`hmBitPos = 0..7`), then `I2F` + FMA. The scale decoding (6-bit pack across 12 bytes) stays scalar — runs once per super-block, not per element.
+
+**Measured (Intel Core Ultra 7 155H, apples-to-apples 30-token prompt):**
+- **Llama-3.2-3B Q3_K_L: 1.2 → 3.5 tok/s (+192%)** — PPL 0.97 preserved.
 
 ## Performance Characteristics
 

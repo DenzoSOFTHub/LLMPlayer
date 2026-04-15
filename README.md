@@ -4,7 +4,22 @@ Pure Java LLM inference engine for running GGUF models locally. Zero external de
 
 ### What's coming in v1.12.0 (in development)
 
-_Planned scope to be filled in as features land. Candidate items: dedicated `Gemma4CudaForwardPass` (PLE on GPU), MoE Granite Hybrid Tiny support, Bonsai Q1_0 format, Q4_1 tensor support, batched `forwardBatch` API to unlock real speculative-decoding speedup, per-arch kernel tuning to close the remaining 30% gap vs llama.cpp on RTX 4050._
+**CPU-side landed (2026-04-15):**
+- **Full SIMD kernel rewrite sweep** — JFR method sampling across 9 models flagged all block K-quant + Q8_0 "SIMD" kernels as having scalar `for j in F_LEN` dequant inner loops. Rewrote **5 kernels** (`SimdQ6_K`, `SimdQ8_0`, `SimdQ5_K`, `SimdQ5_0`, `SimdQ3_K`) with the `SimdQ4_K` B2I/I2F lane-parallel pattern. Top measured gains:
+  - **Qwen3-4B-Thinking Q8_0: 1.1 → 4.7 tok/s (+327%)**
+  - **Qwen3-1.7B Q8_0: 2.9 → 8.4 tok/s (+190%)**
+  - **gemma-3-1B Q4_K_M (Q5_0 mix): 4.5 → 10.2–17.7 tok/s (+127–+293%)**
+  - **Llama-3.2-3B Q3_K_L: 1.2 → 3.5 tok/s (+192%)**
+  - **Llama-3.2-1B Q4_K_M: 8.9 → 15.9 tok/s (+79%)**
+  - **OLMo-2-1B: 8.9 → 13.8 tok/s (+55%)**
+  - Nemotron-3-Nano-4B: 1.2 → 2.2 (+83%), Qwen3-0.6B Q8_0: 6.6 → 12.2 (+85%), Falcon3-3B: 3.5 → 4.5 (+29%).
+  - All PPL preserved. User goal "double tok/s on CPU" hit on all small/medium models (<4B). See `BENCHMARKS.md` → "CPU-only sweep v1.12.0-dev — full SIMD rewrite" for 22-model table.
+- **SIMD Q4_0** added (no shipped GGUF uses it natively — wired for completeness).
+- **`-Dcpu.profile=true` extended** to `DeepSeek2InferenceEngine`, `Qwen3MoEInferenceEngine`, `Qwen35InferenceEngine`, `NemotronHInferenceEngine`, and to `InferenceEngine` itself with engine-level phases (embed / final_norm / output_proj). Critical for the JFR analysis that drove the kernel rewrites.
+- **`-Dmatmul.tiled=true` measured −50%** on Llama-1B CPU; kept opt-in with a warning, not deleted.
+- **Still scalar on CPU** — IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S use non-linear lookup tables; B2I pattern doesn't apply. Phi-3-mini IQ4_NL at 1.0 tok/s CPU remains the worst CPU performer. GPU dp4a covers these (v1.11.0).
+
+_Still planned: dedicated `Gemma4CudaForwardPass` (PLE on GPU), MoE Granite Hybrid Tiny support, Bonsai Q1_0 format, Q4_1 tensor support, batched `forwardBatch` API to unlock real speculative-decoding speedup, per-arch kernel tuning to close the remaining 30% gap vs llama.cpp on RTX 4050._
 
 ### What's new in v1.11.0 — Granite Hybrid full GPU + dp4a kernel fleet
 

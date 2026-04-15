@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.tensor.VectorOps;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
+
 /**
  * Key-Value cache for autoregressive generation. Pre-allocated per layer, stores projected K and V
  * vectors for all past positions.
@@ -30,6 +31,50 @@ public class KVCache {
 
     /** Block size for Q8_0 quantization (same as llama.cpp). */
     public static final int Q8_BLOCK = 32;
+
+    /** Strategy interface used internally for Q8 dequant ops; SIMD impl plugs in via reflection. */
+    public interface Q8Ops {
+        float dot(float[] q, int qOff, byte[] kQuants, int kOff,
+                  float[] kScales, int kScalesOff, int n);
+        void  saxpy(float weight, byte[] vQuants, int vOff,
+                    float[] vScales, int vScalesOff, float[] out, int outOff, int n);
+        void  quantize(float[] src, int srcOff, int n,
+                       byte[] dst, int dstOff, float[] scales, int scalesOff);
+    }
+
+    private static final Q8Ops Q8 = loadQ8Ops();
+
+    /**
+     * Probe for the Java 21 SIMD impl ({@code SimdQ8KvOps}); fall back to scalar.
+     * {@link SimdQ8KvOps} implements {@link Q8Ops} so that the per-call dispatch goes
+     * through a direct interface invocation (JIT-inlinable), not reflection. The
+     * Java 8 build excludes {@code java21/} so {@code Class.forName} returns null and
+     * we use {@link #SCALAR_Q8}.
+     */
+    private static Q8Ops loadQ8Ops() {
+        try {
+            Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.SimdQ8KvOps");
+            Q8Ops impl = (Q8Ops) cls.getDeclaredConstructor().newInstance();
+            return impl;
+        } catch (Throwable t) {
+            return SCALAR_Q8;
+        }
+    }
+
+    private static final Q8Ops SCALAR_Q8 = new Q8Ops() {
+        public float dot(float[] q, int qOff, byte[] kQ, int kOff,
+                         float[] kS, int kSOff, int n) {
+            return dotQ8BlockScalar(q, qOff, kQ, kOff, kS, kSOff, n);
+        }
+        public void saxpy(float w, byte[] vQ, int vOff, float[] vS, int vSOff,
+                          float[] out, int outOff, int n) {
+            saxpyQ8BlockScalar(w, vQ, vOff, vS, vSOff, out, outOff, n);
+        }
+        public void quantize(float[] src, int srcOff, int n,
+                             byte[] dst, int dstOff, float[] scales, int sOff) {
+            quantizeBlocksScalar(src, srcOff, n, dst, dstOff, scales, sOff);
+        }
+    };
 
     public enum Mode { FLOAT32, Q8_0 }
 
@@ -120,7 +165,7 @@ public class KVCache {
         if (mode == Mode.FLOAT32) {
             System.arraycopy(k, 0, keyCache[layer], pos * kvDim, len);
         } else {
-            quantizeBlocks(k, 0, len, keyQuants[layer], pos * kvDim, keyScales[layer], pos * (kvDim / Q8_BLOCK));
+            Q8.quantize(k, 0, len, keyQuants[layer], pos * kvDim, keyScales[layer], pos * (kvDim / Q8_BLOCK));
         }
     }
 
@@ -129,7 +174,7 @@ public class KVCache {
         if (mode == Mode.FLOAT32) {
             System.arraycopy(v, 0, valueCache[layer], pos * vDim, len);
         } else {
-            quantizeBlocks(v, 0, len, valueQuants[layer], pos * vDim, valueScales[layer], pos * (vDim / Q8_BLOCK));
+            Q8.quantize(v, 0, len, valueQuants[layer], pos * vDim, valueScales[layer], pos * (vDim / Q8_BLOCK));
         }
     }
 
@@ -145,7 +190,7 @@ public class KVCache {
         } else {
             int baseOff = pos * kvDim + kvHeadOff;
             int baseScales = baseOff / Q8_BLOCK; // safe: kvHeadOff is multiple of Q8_BLOCK because headSize∈{64,128,256}
-            return dotQ8Block(query, qOff, keyQuants[layer], baseOff, keyScales[layer], baseScales, headSize);
+            return Q8.dot(query, qOff, keyQuants[layer], baseOff, keyScales[layer], baseScales, headSize);
         }
     }
 
@@ -160,7 +205,7 @@ public class KVCache {
         } else {
             int baseOff = pos * vDim + kvHeadOff;
             int baseScales = baseOff / Q8_BLOCK;
-            saxpyQ8Block(weight, valueQuants[layer], baseOff, valueScales[layer], baseScales, out, outOff, headSize);
+            Q8.saxpy(weight, valueQuants[layer], baseOff, valueScales[layer], baseScales, out, outOff, headSize);
         }
     }
 
@@ -170,7 +215,7 @@ public class KVCache {
      * Quantize {@code n} floats from {@code src[srcOff..]} into Q8_0 blocks of 32. Writes
      * {@code n} bytes to {@code dst[dstOff..]} and {@code n/32} scales to {@code scales[scalesOff..]}.
      */
-    private static void quantizeBlocks(float[] src, int srcOff, int n,
+    private static void quantizeBlocksScalar(float[] src, int srcOff, int n,
                                         byte[] dst, int dstOff, float[] scales, int scalesOff) {
         int blocks = n / Q8_BLOCK;
         for (int b = 0; b < blocks; b++) {
@@ -204,7 +249,7 @@ public class KVCache {
     // Future work: a localized SIMD class wired in directly without VectorOpsFactory dispatch
     // could deliver real speedup, especially with ByteVector-based byte→float conversion.
 
-    private static float dotQ8Block(float[] q, int qOff, byte[] kQuants, int kOff,
+    private static float dotQ8BlockScalar(float[] q, int qOff, byte[] kQuants, int kOff,
                                      float[] kScales, int kScalesOff, int n) {
         int blocks = n / Q8_BLOCK;
         float total = 0f;
@@ -221,7 +266,7 @@ public class KVCache {
         return total;
     }
 
-    private static void saxpyQ8Block(float weight, byte[] vQuants, int vOff,
+    private static void saxpyQ8BlockScalar(float weight, byte[] vQuants, int vOff,
                                       float[] vScales, int vScalesOff,
                                       float[] out, int outOff, int n) {
         int blocks = n / Q8_BLOCK;

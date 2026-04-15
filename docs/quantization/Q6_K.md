@@ -87,8 +87,14 @@ This optimization matters disproportionately because Q6_K is typically used for 
 | Property | Value |
 |----------|-------|
 | Fused SIMD class | `SimdQ6_KFloatTensor` (java21) |
-| Available since | v1.6.0 |
-| CPU dot path | Fused dequant+dot with SIMD vector operations |
+| Available since | v1.6.0, rewritten v1.12.0-dev (B2I lane-parallel) |
+| CPU dot path | Fused dequant+dot via `ByteVector → B2I → I2F → FMA` — no scratch buffer |
+
+### B2I lane-parallel rewrite (v1.12.0-dev, 2026-04-15)
+
+JFR flagged `SimdQ6_KFloatTensor.dot` as the #1 CPU hotspot on Llama-3.2-1B Q4_K_M (5023 samples, 3× Q4_K — the Q4_K_M mix stores `ffn_down`, `attn_v`, `output.weight` as Q6_K). Old "SIMD" version kept a scalar `for j in F_LEN` loop to extract 4+2-bit quants and quadrant scales, then `FloatVector.fromArray` — SIMD only in the final FMA. Rewrite loads 8 ql bytes and 8 qh bytes directly as `ByteVector` from mapped segment, widens via `convertShape(B2I, I_SPECIES)`, does all 4-bit + 2-bit mask/shift lane-parallel (qh loaded once per half, reused across all 4 quadrants), then `convertShape(I2F, F_SPECIES)` + FMA.
+
+**Measured (Intel Core Ultra 7 155H):** Llama-3.2-1B Q4_K_M CPU 8.9 → 15.9 tok/s (+79%). JFR samples 5023 → 1110 (−78%). Output-projection phase 48 → 16 ms/tok (−67%). PPL bit-identical.
 
 ## Performance Characteristics
 

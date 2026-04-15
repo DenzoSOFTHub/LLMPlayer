@@ -29,8 +29,13 @@ public class DeepSeek2InferenceEngine {
     private final float[] outputNormCache;
     private final int maxSeqLen;
 
+    private final boolean cpuProfile;
+    private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
+    private int profTokenCount;
+
     public DeepSeek2InferenceEngine(ModelConfig config, DeepSeek2Weights weights, int maxSeqLen,
                                      float[] ropeFreqFactors) {
+        this.cpuProfile = "true".equals(System.getProperty("cpu.profile"));
         this.config = config;
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
@@ -81,6 +86,7 @@ public class DeepSeek2InferenceEngine {
     private float[] forwardInternal(DeepSeek2State state, int token, int position, boolean computeLogits) {
         int dim = config.embeddingLength();
         int leadingDenseCount = config.leadingDenseBlockCount();
+        long t0 = 0, t1;
 
         // 1. Token embedding lookup
         for (int i = 0; i < dim; i++) {
@@ -91,43 +97,56 @@ public class DeepSeek2InferenceEngine {
         for (int layer = 0; layer < config.blockCount(); layer++) {
             DeepSeek2LayerWeights layerWeights = weights.layers()[layer];
 
-            // Attention norm
+            if (cpuProfile) t0 = System.nanoTime();
             RMSNorm.apply(state.xb, state.x, cachedAttnNorm[layer], dim, config.normEps());
+            if (cpuProfile) { t1 = System.nanoTime(); profAttnNormNs += t1 - t0; t0 = t1; }
 
-            // MLA Attention
             mlaAttention.forward(state, layerWeights, layer, position);
+            if (cpuProfile) { t1 = System.nanoTime(); profAttnNs += t1 - t0; t0 = t1; }
 
-            // Residual
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
+            if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; t0 = t1; }
 
-            // FFN norm
             RMSNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
+            if (cpuProfile) { t1 = System.nanoTime(); profFfnNormNs += t1 - t0; t0 = t1; }
 
             if (layer < leadingDenseCount) {
-                // Dense SwiGLU FFN
                 denseFFN(state, layerWeights);
+                if (cpuProfile) { t1 = System.nanoTime(); profDenseFfnNs += t1 - t0; t0 = t1; }
             } else {
-                // Save xb before MoE (since MoE uses xb as accumulator)
                 System.arraycopy(state.xb, 0, state.xbSaved, 0, dim);
-                // MoE FFN
                 moeFFN.forward(state, layerWeights);
+                if (cpuProfile) { t1 = System.nanoTime(); profMoeFfnNs += t1 - t0; t0 = t1; }
             }
 
-            // Residual
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
+            if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; }
         }
 
         if (!computeLogits) return null;
 
-        // 3. Final RMSNorm
+        if (cpuProfile) t0 = System.nanoTime();
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
-
-        // 4. Output projection
         int vocabSize = config.vocabSize();
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+        if (cpuProfile) {
+            profOutputNs += System.nanoTime() - t0;
+            profTokenCount++;
+            if (profTokenCount % 10 == 0) printProfile();
+        }
 
         return state.logits;
+    }
+
+    private void printProfile() {
+        int n = profTokenCount;
+        double ms = 1e6;
+        long total = profAttnNormNs + profAttnNs + profFfnNormNs + profDenseFfnNs + profMoeFfnNs + profResidualNs + profOutputNs;
+        System.out.printf("[cpu-profile DS2] %d tokens, per-token avg (ms): attn_norm=%.1f attn(MLA)=%.1f ffn_norm=%.1f dense_ffn=%.1f moe_ffn=%.1f residual=%.1f output=%.1f | total=%.1f%n",
+            n, profAttnNormNs / ms / n, profAttnNs / ms / n, profFfnNormNs / ms / n,
+            profDenseFfnNs / ms / n, profMoeFfnNs / ms / n, profResidualNs / ms / n,
+            profOutputNs / ms / n, total / ms / n);
     }
 
     /**

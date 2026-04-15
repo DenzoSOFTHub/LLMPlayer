@@ -39,6 +39,7 @@ public final class TensorFactory {
     private static volatile Constructor<?> simdQ4KCtor;
     private static volatile Constructor<?> simdQ8_0Ctor;
     private static volatile Constructor<?> simdQ6KCtor;
+    private static volatile Constructor<?> simdQ4_0Ctor;
     private static volatile Constructor<?> simdQ5_0Ctor;
     private static volatile Constructor<?> simdQ5KCtor;
     private static volatile Constructor<?> simdQ3KCtor;
@@ -87,7 +88,7 @@ public final class TensorFactory {
 
         // Only these types have SIMD variants
         if (type != GGMLType.Q4_K && type != GGMLType.Q8_0
-            && type != GGMLType.Q6_K && type != GGMLType.Q5_0
+            && type != GGMLType.Q6_K && type != GGMLType.Q4_0 && type != GGMLType.Q5_0
             && type != GGMLType.Q5_K && type != GGMLType.Q3_K
             && type != GGMLType.IQ4_NL && type != GGMLType.IQ4_XS
             && type != GGMLType.IQ3_XXS && type != GGMLType.IQ3_S && type != GGMLType.IQ2_S) return null;
@@ -104,6 +105,7 @@ public final class TensorFactory {
             if (type == GGMLType.Q4_K) ctor = simdQ4KCtor;
             else if (type == GGMLType.Q8_0) ctor = simdQ8_0Ctor;
             else if (type == GGMLType.Q6_K) ctor = simdQ6KCtor;
+            else if (type == GGMLType.Q4_0) ctor = simdQ4_0Ctor;
             else if (type == GGMLType.Q5_0) ctor = simdQ5_0Ctor;
             else if (type == GGMLType.Q5_K) ctor = simdQ5KCtor;
             else if (type == GGMLType.Q3_K) ctor = simdQ3KCtor;
@@ -129,6 +131,7 @@ public final class TensorFactory {
             simdQ4KCtor = probeCtor(base + "SimdQ4_KFloatTensor");
             simdQ8_0Ctor = probeCtor(base + "SimdQ8_0FloatTensor");
             simdQ6KCtor = probeCtor(base + "SimdQ6_KFloatTensor");
+            simdQ4_0Ctor = probeCtor(base + "SimdQ4_0FloatTensor");
             simdQ5_0Ctor = probeCtor(base + "SimdQ5_0FloatTensor");
             simdQ5KCtor = probeCtor(base + "SimdQ5_KFloatTensor");
             simdQ3KCtor = probeCtor(base + "SimdQ3_KFloatTensor");
@@ -139,7 +142,7 @@ public final class TensorFactory {
             simdIQ2SCtor = probeCtor(base + "SimdIQ2_SFloatTensor");
 
             simdAvailable = (simdQ4KCtor != null || simdQ8_0Ctor != null || simdQ6KCtor != null
-                || simdQ5_0Ctor != null || simdQ5KCtor != null || simdQ3KCtor != null
+                || simdQ4_0Ctor != null || simdQ5_0Ctor != null || simdQ5KCtor != null || simdQ3KCtor != null
                 || simdIQ4NLCtor != null || simdIQ4XSCtor != null
                 || simdIQ3XXSCtor != null || simdIQ3SCtor != null || simdIQ2SCtor != null);
             if (simdAvailable) {
@@ -147,6 +150,7 @@ public final class TensorFactory {
                 if (simdQ4KCtor != null) sb.append(" Q4_K");
                 if (simdQ8_0Ctor != null) sb.append(" Q8_0");
                 if (simdQ6KCtor != null) sb.append(" Q6_K");
+                if (simdQ4_0Ctor != null) sb.append(" Q4_0");
                 if (simdQ5_0Ctor != null) sb.append(" Q5_0");
                 if (simdQ5KCtor != null) sb.append(" Q5_K");
                 if (simdQ3KCtor != null) sb.append(" Q3_K");

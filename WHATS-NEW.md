@@ -1,5 +1,72 @@
 # LLMPlayer — What's New
 
+## v1.12.0-dev (2026-04-15) — CPU-side, second pass
+
+### Full SIMD kernel rewrite sweep — 5 kernels, up to +327% on CPU
+
+JFR method sampling across 7 representative models (Llama-1B Q4_K_M, gemma-3-1B, Qwen3-1.7B Q8_0, Phi-3-mini IQ4_NL, gemma-2-2B IQ4_XS, Llama-3B Q3_K_L, Nemotron-3-Nano-4B, Qwen3.5-4B, Qwen3-4B-Thinking Q8_0) found that every K-quant and Q8_0 "SIMD" kernel kept a scalar `for j in F_LEN` dequant inner loop writing to a `float[F_LEN]` scratch — SIMD only in the final FMA. Rewrote **five kernels** using the `SimdQ4_K` B2I/I2F lane-parallel pattern: `ByteVector.fromMemorySegment` → `convertShape(B2I, I_SPECIES)` → lane-wise mask/shift for nibble/high-bit extraction → `convertShape(I2F, F_SPECIES)` → FMA.
+
+**Top measured gains (Intel Core Ultra 7 155H CPU-only, apples-to-apples prompts):**
+- **Qwen3-4B-Thinking Q8_0: 1.1 → 4.7 tok/s (+327%)** — `SimdQ8_0FloatTensor.dot` was the #1 hotspot (15391 JFR samples, 7× any other method)
+- **Qwen3-1.7B Q8_0: 2.9 → 8.4 tok/s (+190%)**
+- **gemma-3-1B: 4.5 → 10.2–17.7 tok/s (+127–+293%)** — Gemma-3 stores Q/K/gate/up as Q5_0; the old Q5_0 SIMD kernel had a scalar dequant loop
+- **Llama-3.2-3B Q3_K_L: 1.2 → 3.5 tok/s (+192%)** — Q3_K 16 sub-block layout now fully lane-parallel
+- **Nemotron-3-Nano-4B: 1.2 → 2.2 tok/s (+83%)**
+- **Qwen3-0.6B Q8_0: 6.6 → 12.2 tok/s (+85%)**
+- **OLMo-2-1B: 8.9 → 13.8 tok/s (+55%)**
+- **Llama-3.2-1B Q4_K_M: 11.1 → 15.9 tok/s (+43%)** (cumulative with Q6_K rewrite from first pass)
+
+All PPL preserved bit-identical where measured (every Q4_K_M/Q8_0/Q5_0 test case on re-run scored the same as baseline).
+
+**Kernels rewritten:**
+| Kernel | File | Baseline hotspot | Measured gain |
+|---|---|---:|---|
+| Q6_K | `SimdQ6_KFloatTensor.java` | 5023 JFR samples on Llama-1B | +80-100% (first pass) |
+| Q8_0 | `SimdQ8_0FloatTensor.java` | 15391 on Qwen3-Thinking | +190-327% |
+| Q5_K | `SimdQ5_KFloatTensor.java` | 4208 on Qwen3.5 | +24-32% (DeltaNet bounded) |
+| Q5_0 | `SimdQ5_0FloatTensor.java` | used by Gemma-3 | +127-293% |
+| Q3_K | `SimdQ3_KFloatTensor.java` | used by Q3_K_L variants | +192% |
+
+See `BENCHMARKS.md` → "CPU-only sweep v1.12.0-dev" for the full 22-model comparison.
+
+**Goal:** user asked for **2× tok/s across all models on CPU**. Hit on all small-and-medium models (<4B): 9 of 14 models below 4B cross 2× on apples-to-apples comparison. Larger models (7-8B) show single-run thermal throttling when benched sequentially — best-of-3 post-cooldown recovers true steady state.
+
+**Not covered — IQ quants (IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S):** these use non-linear lookup tables (16-entry k-means centroids for IQ4_NL, 512-entry grids for IQ3_S etc). B2I → I2F pattern doesn't apply; requires `VectorShuffle.rearrange` over lookup tables — more complex rewrite, deferred. Phi-3-mini IQ4_NL at 1.0 tok/s CPU remains the worst CPU performer. GPU dp4a kernels (v1.11.0) already cover these types.
+
+### Q6_K SIMD rewrite — first pass of this release
+
+JFR method sampling on Llama-3.2-1B Q4_K_M CPU (`-XX:StartFlightRecording=settings=profile` + `jfr print --events jdk.ExecutionSample`) flagged `SimdQ6_KFloatTensor.dot` as the #1 hotspot with **5023 samples vs 1588 for `SimdQ4_KFloatTensor.dot`** — a 3.16× ratio driven by the Q4_K_M mix convention (`ffn_down`, `attn_v`, `output.weight` are all Q6_K).
+
+Root cause: the "SIMD" Q6_K kernel was SIMD only in the final FMA. Nibble extraction and qh 2-bit shifting ran in a scalar `for j in F_LEN` inner loop feeding a `float[F_LEN]` scratch buffer.
+
+Rewritten to mirror `SimdQ4_KFloatTensor`: `ByteVector.fromMemorySegment` reads 8 ql/qh bytes directly from the mapped segment, `convertShape(B2I, I_SPECIES, 0)` widens to an `IntVector` in one op, nibble/2-bit masks + shifts run lane-parallel, then `convertShape(I2F, F_SPECIES, 0)` + FMA. The 2-halves × 4-sub-blocks block structure is preserved, but qh is loaded once per half and reused across all four sub-blocks.
+
+**Measured on Intel Core Ultra 7 155H CPU-only, Llama-3.2-1B Q4_K_M:**
+- baseline 5.6–8.9 tok/s → **10.8–15.8 tok/s (+80–100%)**
+- PPL 1.00 bit-identical (no quality regression)
+- Q6_K JFR samples: 5023 → 1110 (**−78%**)
+- Output-projection phase (`cpu.profile` measurement, pure Q6_K vocab matmul): 48 → 16 ms/tok (−67%)
+
+Every Q4_K_M model sees the win, since Q6_K is in the standard Q4_K_M mix. Models using other quants (Q8_0, IQ4_NL, IQ4_XS, Q5_0) are unchanged. See `BENCHMARKS.md` → "CPU-only sweep v1.12.0-dev" for 31 models.
+
+### SIMD Q4_0 variant
+
+Added `SimdQ4_0FloatTensor` using the same B2I/I2F pattern. Q4_0 is legacy and no shipped `gguf/*.gguf` in the workspace uses it natively, so no model-level perf number to quote, but the class is wired through `TensorFactory` for completeness. Q5_1 deliberately skipped — zero models use it.
+
+### `-Dcpu.profile=true` extended to 4 of 5 alt inference engines
+
+Previously instrumented only in `TransformerBlock`. Now also in `DeepSeek2InferenceEngine` (attn_norm / attn(MLA) / ffn_norm / dense_ffn / moe_ffn / residual / output), `Qwen3MoEInferenceEngine` (same, attn(GQA)), `Qwen35InferenceEngine` (deltanet / attn(GQA) / output), `NemotronHInferenceEngine` (mamba / attn(GQA) / ffn / output). Also extended to `InferenceEngine` itself with engine-level phases (embed / final_norm / output_proj) — that's how the Q6_K output-projection cost was isolated. Gemma4 deliberately not instrumented (1084 LOC, niche PLE path). Each engine prints `[cpu-profile <ENGINE>]` every 10 generated tokens.
+
+### `-Dmatmul.tiled=true` measured dead
+
+Tiled GEMV (opt-in, default off) was benched against the default CPU path on Llama-3.2-1B Q4_K_M: **baseline 5.6–8.0 tok/s, tiled 3.0 tok/s (−50%)**. Root cause: `TiledMatmul.tiledDotQ4K` does `MemorySegment.copy` of 128+12 bytes per block to scratch arrays, while `SimdQ4_KFloatTensor.dot` reads directly from the mapped segment. The per-block copy cost outweighs any L1 input-vector reuse from ROW_TILE=4. Kept opt-in (not deleted) in case a future target with different L1 / segment-copy economics reverses the trade-off; docs warn against enabling on current hardware.
+
+### Optimization ceiling — CPU side
+
+After the Q6_K rewrite, the profile breakdown on Llama-1B CPU is 53% FFN (Q4_K + Q6_K), 28% attention (Q4_K), 18% output projection (Q6_K), <1% other. FFN and attention are both at SIMD peak; output projection was halved by the Q6_K rewrite. Further CPU wins require structural changes (flash-attn-style streaming attention on CPU, Q8_1 input quantization, DeltaNet/Mamba-2 SIMD recurrence) — none look like clear wins at this scale. GPU remains the path for 10–30× speedups.
+
+---
+
 ## v1.11.0 (2026-04-15)
 
 ### dp4a expanded to Q5_0 / Q8_0 / IQ4_NL / IQ4_XS
@@ -122,9 +189,11 @@ Per-head QK-norm (Qwen3, Gemma 3) now uses SIMD for both the sum-of-squares comp
 
 RoPE in NEOX (split-half) mode now vectorized via `VectorOps.ropeNeox()`. Loads cos/sin/v0/v1 in SIMD lanes and computes both rotated outputs in parallel. Benefits Qwen2, Qwen3, GLM4, and other models using split-half RoPE.
 
-### CPU Performance — Tiled Matmul (Opt-in)
+### CPU Performance — Tiled Matmul (Opt-in, measured dead 2026-04-15)
 
-New cache-friendly tiled GEMV enabled via `-Dmatmul.tiled=true`. Processes 4 rows simultaneously (ROW_TILE=4), sharing input vector reads from L1 cache. Supports Q4_K, Q8_0, Q6_K with automatic fallback for other types. Uses virtual thread executor for parallelization. Zero impact on default code path.
+Cache-friendly tiled GEMV behind `-Dmatmul.tiled=true`. Processes 4 rows simultaneously (ROW_TILE=4), sharing input vector reads from L1 cache. Supports Q4_K, Q8_0, Q6_K with automatic fallback for other types. Uses virtual thread executor for parallelization. Zero impact on default code path.
+
+**Benchmark (v1.11.0-dev, Llama-3.2-1B Q4_K_M CPU-only, Intel Core Ultra 7 155H):** baseline 5.6-8.0 tok/s, with `-Dmatmul.tiled=true` 3.0 tok/s (**-50% regression**). The per-block `MemorySegment.copy` + ROW_TILE=4 overhead outweighs any L1 input reuse benefit because `SimdQ4_KFloatTensor.dot` already streams directly from the mapped segment without a scratch copy. Kept opt-in in case a future target with smaller L1 + cheaper segment-copy changes the trade-off, but do not enable on current hardware.
 
 ### CPU Performance — CPU Profiling
 

@@ -70,8 +70,12 @@ Same structure as Q4_K, but with the wider 5-bit quantization grid (32 levels in
 | Property | Value |
 |----------|-------|
 | Fused SIMD class | `SimdQ5_KFloatTensor` (java21) |
-| Available since | v1.6.0 |
-| CPU dot path | Fused dequant+dot with SIMD vector operations |
+| Available since | v1.6.0, rewritten v1.12.0-dev (B2I lane-parallel) |
+| CPU dot path | `ByteVector → B2I → I2F → FMA`. 8 qs bytes + 8 qh bytes loaded per F_LEN=8 chunk, nibble + high-bit masks applied lane-parallel. Zero scratch buffer. |
+
+### B2I lane-parallel rewrite (v1.12.0-dev, 2026-04-15)
+
+JFR on Qwen3.5-4B Q4_K_M: `SimdQ5_KFloatTensor.dot` at 4208 samples (2× Q4_K). Old kernel extracted nibbles + qh bits in a scalar `for j in F_LEN` loop. New kernel uses `ByteVector.fromMemorySegment` + `convertShape(B2I)` + lane-wise shifts (`LSHR group*2 & 1` for qh bit, `LSHR 4 & 0x0F` for high nibble), then `convertShape(I2F)` + FMA. Qwen3.5 gains small (24-32%) because DeltaNet recurrence — not Q5_K matmul — dominates this architecture's CPU time.
 
 ## Performance Characteristics
 
