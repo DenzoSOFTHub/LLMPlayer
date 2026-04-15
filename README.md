@@ -1,6 +1,10 @@
-# LLMPlayer v1.11.0
+# LLMPlayer v1.12.0-dev
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's coming in v1.12.0 (in development)
+
+_Planned scope to be filled in as features land. Candidate items: dedicated `Gemma4CudaForwardPass` (PLE on GPU), MoE Granite Hybrid Tiny support, Bonsai Q1_0 format, Q4_1 tensor support, batched `forwardBatch` API to unlock real speculative-decoding speedup, per-arch kernel tuning to close the remaining 30% gap vs llama.cpp on RTX 4050._
 
 ### What's new in v1.11.0 — Granite Hybrid full GPU + dp4a kernel fleet
 
