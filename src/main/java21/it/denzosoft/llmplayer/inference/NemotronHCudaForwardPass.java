@@ -57,6 +57,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     private final long gpuHb; // [ffnDim]
     private final long gpuHb2; // [ffnDim] — second FFN projection buffer for integrated SwiGLU (Granite Hybrid)
     private final long gpuHbQ8; // [(ffnDim/32)*40] — Q8_1 scratch for down projection (dp4a path)
+    private final long gpuYQ8;  // [(ssmInnerSize/32)*40] — Q8_1 scratch for ssm_out dp4a input
+    private final long gpuXb2Q8; // [(qDim/32)*40] — Q8_1 scratch for attention wo dp4a input
 
     // Per-layer weights on GPU
     private final long[] gpuAttnNormWeights;
@@ -241,6 +243,15 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         gpuHb2 = bufferManager.createBuffer((long) maxFfnDim * fb);
         int hbQ8Bytes = ((maxFfnDim + 31) / 32) * 40;
         gpuHbQ8 = bufferManager.createBuffer(hbQ8Bytes);
+        // Q8_1 scratch for the ssm_out and attention wo inputs. Previously the Mamba
+        // ssm_out and Attention wo matmuls ran through the FP32 kernel (no dp4a) because
+        // their inputs (gpuY, gpuXb2) had no Q8_1 companion buffer. Sub-kernel profiling
+        // showed ssm_out + wo = ~12 ms/tok on Nemotron-H 4B (~27 % of total) — most of
+        // that is recoverable by dp4a.
+        int yQ8Bytes = ((ssmInnerSize + 31) / 32) * 40;
+        gpuYQ8 = bufferManager.createBuffer(yQ8Bytes);
+        int xb2Q8Bytes = (((headCount * headSize) + 31) / 32) * 40;
+        gpuXb2Q8 = bufferManager.createBuffer(xb2Q8Bytes);
 
         // RoPE tables
         gpuCosTable = uploadFloatArray(rope.getCosTable());
@@ -482,7 +493,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 int ssmOutAddTo = graniteResidualScale > 0f ? 0 : 1;
                 layerMatmuls[i] = new MatmulLaunch[] {
                     new MatmulLaunch((CudaFloatTensor) lw.ssmIn(), gpuXb, gpuZxBCdt, projDim, dim, 0, gpuXbQ8),
-                    new MatmulLaunch((CudaFloatTensor) lw.ssmOut(), gpuY, ssmOutTarget, dim, ssmInnerSize, ssmOutAddTo)
+                    new MatmulLaunch((CudaFloatTensor) lw.ssmOut(), gpuY, ssmOutTarget, dim, ssmInnerSize, ssmOutAddTo, gpuYQ8)
                 };
             } else if (layerTypes[i] == 1) { // Attention
                 int qDim = headCount * headSize;
@@ -492,7 +503,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                     new MatmulLaunch((CudaFloatTensor) lw.wq(), gpuXb, gpuQ, qDim, dim, 0, gpuXbQ8),
                     new MatmulLaunch((CudaFloatTensor) lw.wk(), gpuXb, gpuK, kvDim, dim, 0, gpuXbQ8),
                     new MatmulLaunch((CudaFloatTensor) lw.wv(), gpuXb, gpuV, kvDim, dim, 0, gpuXbQ8),
-                    new MatmulLaunch((CudaFloatTensor) lw.wo(), gpuXb2, woTarget, dim, qDim, woAddTo)
+                    new MatmulLaunch((CudaFloatTensor) lw.wo(), gpuXb2, woTarget, dim, qDim, woAddTo, gpuXb2Q8)
                 };
             } else { // FFN
                 int ffnDim = config.nemotronLayerFfnLength(i);
@@ -500,7 +511,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 int ffnDownAddTo = graniteResidualScale > 0f ? 0 : 1;
                 layerMatmuls[i] = new MatmulLaunch[] {
                     new MatmulLaunch((CudaFloatTensor) lw.ffnUp(), gpuXb, gpuHb, ffnDim, dim, 0, gpuXbQ8),
-                    new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, ffnDownTarget, dim, ffnDim, ffnDownAddTo)
+                    new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, ffnDownTarget, dim, ffnDim, ffnDownAddTo, gpuHbQ8)
                 };
             }
         }
@@ -608,7 +619,14 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     // ---- -Dcuda.profile=true support (coarse per-layer-type timing) ----
 
     private static final boolean PROFILING = Boolean.getBoolean("cuda.profile");
+    /** Fine-grained Mamba sub-kernel profiling (opt-in: -Dcuda.profile.mamba=true).
+     *  Requires PROFILING=true as well (the main cuda.profile flag adds the finish() barriers). */
+    private static final boolean PROFILING_MAMBA = PROFILING && Boolean.getBoolean("cuda.profile.mamba");
     private long profMambaNs, profAttnNs, profFfnNs, profTotalNs;
+    // Mamba sub-kernel breakdown (only populated when PROFILING_MAMBA=true).
+    private long profMambaNormNs, profMambaSsmInNs, profMambaSplitCopyNs, profMambaConv1dNs,
+                 profMambaConvBiasSiluNs, profMambaDtSoftplusNs, profMambaScanNs,
+                 profMambaGateNormNs, profMambaSsmOutNs, profMambaIFfnNs;
     private int profTokens;
 
     /** Profiled variant of {@link #forwardLayer}. Attributes per-layer-type GPU time via
@@ -639,6 +657,15 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         System.err.printf("NemotronH CUDA profile (%d tokens, %d GPU layers):%n", profTokens, gpuLayerCount);
         System.err.printf("  mamba (per tok total): %6.2f ms  |  attention: %6.2f ms  |  ffn (sqReLU): %6.2f ms  |  TOTAL: %6.2f ms/tok%n",
             profMambaNs / 1e6 / n, profAttnNs / 1e6 / n, profFfnNs / 1e6 / n, profTotalNs / 1e6 / n);
+        if (PROFILING_MAMBA) {
+            System.err.printf("  mamba sub-kernels (ms/tok):  norm=%.2f  ssm_in=%.2f  split=%.2f  conv1d=%.2f  conv_bias_silu=%.2f  dt_softplus=%.2f  scan=%.2f  gate_norm=%.2f  ssm_out=%.2f  iFFN=%.2f%n",
+                profMambaNormNs / 1e6 / n, profMambaSsmInNs / 1e6 / n, profMambaSplitCopyNs / 1e6 / n,
+                profMambaConv1dNs / 1e6 / n, profMambaConvBiasSiluNs / 1e6 / n, profMambaDtSoftplusNs / 1e6 / n,
+                profMambaScanNs / 1e6 / n, profMambaGateNormNs / 1e6 / n, profMambaSsmOutNs / 1e6 / n,
+                profMambaIFfnNs / 1e6 / n);
+            profMambaNormNs = profMambaSsmInNs = profMambaSplitCopyNs = profMambaConv1dNs = profMambaConvBiasSiluNs = 0;
+            profMambaDtSoftplusNs = profMambaScanNs = profMambaGateNormNs = profMambaSsmOutNs = profMambaIFfnNs = 0;
+        }
         profMambaNs = profAttnNs = profFfnNs = profTotalNs = 0;
         profTokens = 0;
     }
@@ -696,42 +723,67 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     private void forwardMamba(int li) {
         MatmulLaunch[] ml = layerMatmuls[li];
+        long t0 = 0, t1;
+        if (PROFILING_MAMBA) t0 = System.nanoTime();
+
         // RMSNorm
         normPB.setLong(2, gpuAttnNormWeights[li]);
         launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaNormNs += t1 - t0; t0 = t1; }
+
         // For Granite: gpuXb is needed at end for residual saxpy; ssmOut writes to gpuXb.
         // quantizeXb() happens BEFORE ssmIn consumes gpuXb.
         quantizeXb();
         launchMatmulDp4a(ml[0]);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaSsmInNs += t1 - t0; t0 = t1; }
+
         // Copy xBC portion from zxBCdt to gpuXBC
         cudaContext.copyBufferDtoD(gpuXBC, gpuZxBCdt + (long) ssmInnerSize * Float.BYTES,
                 (long) convChannels * Float.BYTES);
         // Copy dt portion to gpuDt
         cudaContext.copyBufferDtoD(gpuDt, gpuZxBCdt + (long)(ssmInnerSize + convChannels) * Float.BYTES,
                 (long) ssmTimeStepRank * Float.BYTES);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaSplitCopyNs += t1 - t0; t0 = t1; }
+
         // Conv1d (no SiLU) → add bias → SiLU (bias must be before SiLU)
         conv1dPB.setLong(1, gpuConvState[li]); conv1dPB.setLong(2, gpuConvWeights[li]);
         launchKernel(conv1dSiluFunc, convGridDim, (int) blockSize, 0, conv1dPB.ptrs);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaConv1dNs += t1 - t0; t0 = t1; }
+
         // Add conv1d bias
         convBiasPB.setLong(1, gpuConvBias[li]);
         launchKernel(accumulateFunc, convGridDim, (int) blockSize, 0, convBiasPB.ptrs);
         // SiLU activation
         siluPB.setLong(0, gpuXBC); siluPB.setInt(1, convChannels);
         launchKernel(siluFunc, siluConvGridDim, (int) blockSize, 0, siluPB.ptrs);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaConvBiasSiluNs += t1 - t0; t0 = t1; }
+
         // dt softplus
         dtPB.setLong(1, gpuDtBias[li]);
         launchKernel(dtSoftplusFunc, 1, (int) Math.max(32, ssmTimeStepRank), 0, dtPB.ptrs);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaDtSoftplusNs += t1 - t0; t0 = t1; }
+
         // Mamba-2 scan
         scanPB.setLong(0, gpuSsmState[li]); scanPB.setLong(5, gpuSsmA[li]); scanPB.setLong(6, gpuSsmD[li]);
         launchKernel(mamba2ScanFunc, scanGridDim, headDim, 0, scanPB.ptrs);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaScanNs += t1 - t0; t0 = t1; }
+
         // Gate + grouped RMSNorm (fused)
         gateNormPB.setLong(2, gpuSsmNormWeights[li]);
         launchKernel(gateNormFunc, ssmGroupCount, gateNormBlockDim, gateNormSharedMem, gateNormPB.ptrs);
-        // ssm_out projection. Standard: accumulate to gpuX. Granite: write to gpuXb + saxpy.
-        launchMatmul(ml[1]);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaGateNormNs += t1 - t0; t0 = t1; }
+
+        // ssm_out projection via dp4a. gpuY → gpuYQ8 then int8 dp4a matmul. Previously ran on
+        // the FP32 kernel because gpuY lacked a Q8_1 companion — profile showed ~11 ms/tok on
+        // Nemotron-H 4B spent here. Standard: accumulate to gpuX. Granite: write to gpuXb + saxpy.
+        quantizeY();
+        launchMatmulDp4a(ml[1]);
         graniteResidualAdd();
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaSsmOutNs += t1 - t0; t0 = t1; }
+
         // Granite Hybrid: Mamba layer has integrated SwiGLU FFN after the residual add.
         runIntegratedFFN(li);
+        if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaIFfnNs += t1 - t0; }
     }
 
     // === Attention layer ===
@@ -754,7 +806,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
         int attnSM = (position + 1 + 32) * Float.BYTES;
         launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB.ptrs);
-        launchMatmul(ml[3]); // wo — standard: accumulate; Granite: write to gpuXb + saxpy
+        // wo via dp4a: gpuXb2 → gpuXb2Q8 then int8 matmul.
+        quantizeXb2();
+        launchMatmulDp4a(ml[3]); // wo — standard: accumulate; Granite: write to gpuXb + saxpy
         graniteResidualAdd();
         // Granite Hybrid: Attention layer has integrated SwiGLU FFN after the residual add.
         runIntegratedFFN(li);
@@ -772,7 +826,10 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         int ffnDim = ml[0].rows;
         sqreluPB.setLong(0, gpuHb); sqreluPB.setInt(1, ffnDim);
         launchKernel(sqreluFunc, (int)((ffnDim + blockSize - 1) / blockSize), (int) blockSize, 0, sqreluPB.ptrs);
-        launchMatmul(ml[1]); // ffn_down — standard: accumulate; Granite: write to gpuXb + saxpy
+        // ffn_down via dp4a (gpuHb → gpuHbQ8). Q6_K will stay on the FP32 fallback by default
+        // (see cuda.dp4a.q6), but Q4_K / Q5_K ffn_down now takes the dp4a path.
+        quantizeHb(ffnDim);
+        launchMatmulDp4a(ml[1]); // ffn_down — standard: accumulate; Granite: write to gpuXb + saxpy
         graniteResidualAdd();
     }
 
@@ -795,7 +852,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             launchKernel(kvUpdateFunc, kvUpdateGridDim, (int) blockSize, 0, kvPB.ptrs);
             attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
             launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), graphAttnSharedMem, attnPB.ptrs);
-            launchMatmul(ml[3]);
+            quantizeXb2();
+            launchMatmulDp4a(ml[3]);
             graniteResidualAdd();
             runIntegratedFFN(li);
         } else forwardFFN(li);
@@ -830,6 +888,29 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         quantizeXbPB.setLong(0, gpuXb);
         quantizeXbPB.setLong(1, gpuXbQ8);
         quantizeXbPB.setInt(2, dim);
+    }
+
+    /** Quantize gpuY (FP32, ssmInnerSize) → gpuYQ8 for the ssm_out dp4a matmul. */
+    private void quantizeY() {
+        if (!useDp4a) return;
+        quantizeXbPB.setLong(0, gpuY);
+        quantizeXbPB.setLong(1, gpuYQ8);
+        quantizeXbPB.setInt(2, ssmInnerSize);
+        int gridDim = (((ssmInnerSize + 31) / 32) + 7) / 8;
+        launchKernel(quantizeFunc, gridDim, 256, 0, quantizeXbPB.ptrs);
+        quantizeXbPB.setLong(0, gpuXb); quantizeXbPB.setLong(1, gpuXbQ8); quantizeXbPB.setInt(2, dim);
+    }
+
+    /** Quantize gpuXb2 (FP32, qDim) → gpuXb2Q8 for the attention wo dp4a matmul. */
+    private void quantizeXb2() {
+        if (!useDp4a) return;
+        int qDim = headCount * headSize;
+        quantizeXbPB.setLong(0, gpuXb2);
+        quantizeXbPB.setLong(1, gpuXb2Q8);
+        quantizeXbPB.setInt(2, qDim);
+        int gridDim = (((qDim + 31) / 32) + 7) / 8;
+        launchKernel(quantizeFunc, gridDim, 256, 0, quantizeXbPB.ptrs);
+        quantizeXbPB.setLong(0, gpuXb); quantizeXbPB.setLong(1, gpuXbQ8); quantizeXbPB.setInt(2, dim);
     }
 
     /**
