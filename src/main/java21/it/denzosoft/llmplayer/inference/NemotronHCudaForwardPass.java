@@ -105,6 +105,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             if      (type == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K)   dp4aType = 4;
             else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K)   dp4aType = 5;
             else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K)   dp4aType = 6;
+            else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q3_K)   dp4aType = 3;
             else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q5_0)   dp4aType = 50;
             else if (type == it.denzosoft.llmplayer.tensor.GGMLType.Q8_0)   dp4aType = 80;
             else if (type == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_NL) dp4aType = 41;
@@ -125,6 +126,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     private final int quantizeXbGridDim;
     private final MemorySegment quantizeFunc;
     private final MemorySegment dp4aQ4kFunc;
+    private final MemorySegment dp4aQ3kFunc;
     private final MemorySegment dp4aQ5kFunc;
     private final MemorySegment dp4aQ6kFunc;
     private final MemorySegment dp4aQ50Func;
@@ -318,7 +320,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
         // === dp4a setup (mirrors CudaForwardPass extension) ===
         boolean dp4aReq = !"false".equals(System.getProperty("cuda.dp4a", "true"));
-        MemorySegment qFunc = null, dQ4kFunc = null, dQ5kFunc = null, dQ6kFunc = null;
+        MemorySegment qFunc = null, dQ4kFunc = null, dQ5kFunc = null, dQ6kFunc = null, dQ3kFunc = null;
         MemorySegment dQ50Func = null, dQ80Func = null, dIq4nlFunc = null, dIq4xsFunc = null;
         boolean dp4aAvail = false;
         if (dp4aReq) {
@@ -328,6 +330,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 dp4aAvail = true;
                 try { dQ5kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q5_k_dp4a.cu", "matmul_q5_k_dp4a"); } catch (Exception ignored) {}
                 try { dQ6kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q6_k_dp4a.cu", "matmul_q6_k_dp4a"); } catch (Exception ignored) {}
+                try { dQ3kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q3_k_dp4a.cu", "matmul_q3_k_dp4a"); } catch (Exception ignored) {}
                 try { dQ50Func = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a.cu", "matmul_q5_0_dp4a"); } catch (Exception ignored) {}
                 try { dQ80Func = cudaContext.compileKernel("kernels/cuda/matmul_q8_0_dp4a.cu", "matmul_q8_0_dp4a"); } catch (Exception ignored) {}
                 try { dIq4nlFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_nl_dp4a.cu", "matmul_iq4_nl_dp4a"); } catch (Exception ignored) {}
@@ -339,6 +342,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         useDp4a = dp4aAvail;
         quantizeFunc = qFunc;
         dp4aQ4kFunc = dQ4kFunc;
+        dp4aQ3kFunc = dQ3kFunc;
         dp4aQ5kFunc = dQ5kFunc;
         dp4aQ6kFunc = dQ6kFunc;
         dp4aQ50Func = dQ50Func;
@@ -355,7 +359,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             quantizeXbPB.setLong(1, gpuXbQ8);
             quantizeXbPB.setInt(2, dim);
             dp4aPB = new ParamBuffer(arena, 6);
-            System.err.println("NemotronH CUDA: dp4a enabled");
+            String dp4aTypes = "Q4_K";
+            if (dp4aQ3kFunc != null) dp4aTypes += "+Q3_K";
+            if (dp4aQ5kFunc != null) dp4aTypes += "+Q5_K";
+            if (dp4aQ6kFunc != null) dp4aTypes += "+Q6_K";
+            System.err.println("NemotronH CUDA: dp4a enabled (" + dp4aTypes + " × Q8_1)");
         } else {
             gpuXbQ8 = 0;
             quantizeXbGridDim = 0;
@@ -850,6 +858,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             case 6:  // Q6_K dp4a slower than FP32 — opt-in only
                 if (!"true".equals(System.getProperty("cuda.dp4a.q6", "false"))) { launchMatmul(ml); return; }
                 func = dp4aQ6kFunc; break;
+            case 3:
+                if ("false".equals(System.getProperty("cuda.dp4a.q3", "true"))) { launchMatmul(ml); return; }
+                func = dp4aQ3kFunc; break;
             case 50: func = dp4aQ50Func; break;
             case 80: func = dp4aQ80Func; break;
             case 41: func = dp4aIq4nlFunc; break;

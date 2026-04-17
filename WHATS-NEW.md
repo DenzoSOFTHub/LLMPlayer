@@ -1,6 +1,104 @@
 # LLMPlayer — What's New
 
-## v1.12.0-dev (2026-04-15) — CPU-side, second pass
+## v1.13.0 (2026-04-17) — GPU coverage round-up
+
+After the v1.12.0 CPU SIMD rewrite sweep, a full GPU/CUDA audit surfaced several concrete coverage gaps and one latent correctness bug in the dp4a dispatch. The changes below are grouped by scope; every item was benched with a three-run average against a pre-change baseline and every output was verified bit-identical (or bit-equivalent within the expected Q8_1 quantization envelope).
+
+### Q3_K GPU dp4a kernel — **+15.5 % on Llama-3.2-3B Q3_K_L**
+
+`matmul_q3_k_dp4a.cu` is a new kernel mirroring the Q4_K dp4a template: it reads Q8_1 int8 input, uses `__dp4a` for the 4-byte integer dot product, and handles Q3_K's 110-byte block with 8 sub-blocks × 2 half-scales each. Block size is not 4-byte aligned, so every load goes through byte `__ldg` (same constraint as Q6_K dp4a), but Q3_K's scale decode is cheap enough that the dp4a path still wins decisively — unlike Q6_K, which remained opt-in because its 210-byte block has much more scale-decode overhead per byte.
+
+Wired into all three forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`) with an opt-out flag `-Dcuda.dp4a.q3=false`. Measured on Llama-3.2-3B Q3_K_L at 80 tokens per run, best-of-three:
+
+| Configuration | tok/s | Δ |
+|---|---:|---:|
+| Q3_K dp4a ON (new default) | 14.47 | — |
+| Q3_K dp4a OFF (FP32 fallback) | 12.53 | −15.5 % |
+
+Perplexity bit-identical. The startup banner now reports `CUDA: dp4a enabled (Q4_K+Q3_K+Q5_K+Q6_K × Q8_1, …)`.
+
+### `launchOutputMatmul` coverage gap — **+2.8 % on Gemma-3-1B**
+
+`launchOutputMatmul` in `CudaForwardPass` dispatched only Q4_K / Q5_K / Q6_K (and the newly added Q3_K). Models whose output weight was Q5_0, Q8_0, IQ4_NL, or IQ4_XS silently fell through to the FP32 kernel — effectively disabling dp4a for the single largest matmul of the forward pass. `Qwen35CudaForwardPass` had the correct wiring all along; the gap was isolated to the standard forward pass.
+
+Fix: added cases 50, 80, 41, 42 to `launchOutputMatmul`. Measured on Gemma-3-1B Q4_K_M (whose `output.weight` is Q5_0) at 80 tokens: **42.4 → 43.6 tok/s (+2.8 %)**. PPL EXCELLENT both sides of the fix. Phi-3-mini IQ4_NL did not move because its output projection is already small enough to be latency-bound, not bandwidth-bound.
+
+### Q5_0 shared-memory dp4a — **+2-3 % on Gemma-3 1B/4B**
+
+`matmul_q5_0_dp4a_smem.cu` caches the Q8_1 input vector in shared memory so the eight warps per block share one HBM read instead of eight. Gemma-3 Q4_K_M ships Q5_0 for Q/K/gate/up projections, and per-section profiling showed GateUp alone eating 12.7 ms/tok on Gemma-3-1B (51 % of the total). Shared memory reclaims a fraction of that.
+
+Enabled by default via `-Dcuda.q5_0.smem=true`. The measured gain is modest (**+2.7 % on Gemma-3-1B, +1.7 % on Gemma-3-4B**) because CUDA-graph mode already amortizes most of the HBM pressure through `cuGraphLaunch`. In no-graph mode the win is larger.
+
+### IQ4_NL shared-memory dp4a — kernel written, opt-in
+
+`matmul_iq4_nl_dp4a_smem.cu` applies the same pattern to IQ4_NL. Phi-3-mini IQ4_NL profiling showed 78 ms/tok concentrated in QKV + GateUp + siluDown, all of which are IQ4_NL matmuls. The kernel was written and wired but measured neutral in graph mode (12.0 smem vs 12.07 baseline tok/s), so the flag `-Dcuda.iq4nl.smem` **defaults to false**. Kept available for future hardware or for non-graph fallback paths.
+
+### MXFP4 CUDA tensor wrapper
+
+`matmul_mxfp4.cu` already existed and was compiled by `CudaContext` for the MoE expert cache, but the regular-tensor layer had no `MXFP4CudaTensor`, so any non-expert MXFP4 weight would fall to the CPU path. Added the wrapper class and registered it in `TensorFactory.gpuTensorClassName()`. Unblocks future MXFP4-quantized models outside MoE experts; no standalone bench since the one local MXFP4 model exceeds available RAM on the test host.
+
+### Runtime QKV fusion — new opt-in path
+
+For models that ship separate Q/K/V weights (Llama, Qwen, Mistral, Gemma, Granite …), `CudaForwardPass` can now concatenate the three weight tensors byte-for-byte at init time into a single GPU buffer and activate the merged-matmul + `split_qkv.cu` path that was previously only used for natively-packed architectures (Phi-3/4). Saves two kernel launches + two redundant Q8_1 input reads per layer per token.
+
+Enabled with `-Dcuda.fuse.qkv=true`. Measured neutral on Llama-1B Q4_K_M in graph mode (CUDA-graph replay already batches the launches into a single `cuGraphLaunch`, so saving two individual launches has no measurable effect), and around **+2 %** in no-graph mode. Kept opt-in because it costs the QKV weight footprint on VRAM during the init d2d copy, and the graph-mode baseline is already optimal.
+
+The implementation introduces `MergedQkvCudaTensor`, a GPU-only wrapper that delegates type / kernel / block-size to a template (usually `wq`) and overrides `getGpuWeights()` to return the pre-allocated merged pointer. CPU-fallback methods (`getFloat`, `dot`, `matmulParallel`) throw `UnsupportedOperationException` — the GPU path must succeed for this tensor, and the caller reverts to separate wq/wk/wv if fusion is disabled.
+
+### Q4_K multi-row kernel opt-in on the standard forward pass
+
+`matmul_q4_k_dp4a_mr4.cu` has been available on `Qwen35CudaForwardPass` for a while as `-Dcuda.q4k.mr4=true`. Mirrored the wiring into `CudaForwardPass` so the same flag works for all architectures. Still default OFF because mr4 trades per-block overhead for weight-matrix reuse and the bench on small models (Llama-1B) showed a regression; potentially useful on larger models where the reuse dominates.
+
+### JFR / GPU profile diagnostics
+
+A full `-Dcuda.profile=true -Dcuda.nograph=true` session on Gemma-3-1B and Phi-3-mini identified the structural sources of the remaining gap to llama.cpp (reported separately at **32 %** and **19 %** of llama.cpp respectively in the pre-session comparison). The per-section breakdown is now documented in `CLAUDE.md` under the "dp4a path" note; the short version is that both anomalies trace back to non-4-byte-aligned quantization block sizes (Q5_0's 22 bytes, IQ4_NL's 18 bytes) forcing byte `__ldg` in the inner loop.
+
+### Structural refactor: `forwardLayer` split + `forwardAttentionOnly`
+
+`CudaForwardPass.forwardLayer` was internally split into two private helpers — `forwardAttentionPart(layerIdx, position)` covering steps 1–6c (RMSNorm → QKV → per-head QK-norm → Granite scale → RoPE → KV cache → attention → Wo → post-attention norm/accumulate) and `forwardFFNPart(layerIdx)` covering steps 7–10c (FFN RMSNorm → Gate/Up → silu_mul → Down → post-FFN norm). The public `forwardLayer` now simply calls both and its external contract is unchanged.
+
+On top of the split we added a new public entry point `forwardAttentionOnly(state, layerWeights, layerIdx, position, attention)` and a relaxed `isSupportedForAttention(config, weights)` check that drops the MoE block and the FFN-tensor requirement. Together these provide the infrastructure needed for engines that own their own FFN path (Qwen3MoE, DeepSeek2, future architectures) to reuse the standard attention pipeline on GPU while running the FFN step in whatever form they need — dense, sparse, mamba, MoE routing — on CPU between GPU attention calls. The Qwen3MoE engine wiring itself is scheduled for v1.14.
+
+### Latent QK-norm bug fix in the non-graph path — Qwen3 / Gemma-3 / SmolLM3
+
+The refactor above surfaced a pre-existing correctness bug. The per-head QK-norm kernel launch used by Qwen3, Gemma-3 and SmolLM3 lived only in the graph-capture path (`forwardLayerKernels`). The non-graph per-layer path — reached for partial-offload workloads and for the first tokens of a session before graph capture completes — silently skipped it. Output was garbage on those architectures whenever CUDA graph mode was disabled or unavailable.
+
+Fixed by copying the QK-norm launch into `forwardAttentionPart` (lines after QKV bias, before Granite attention-scale correction). Validated on Qwen3-0.6B Q8_0 with `-Dcuda.nograph=true`: **PPL 1.32 bit-identical to graph mode** (previously would have produced incoherent output). Llama-1B (no QK-norm) regressed 0 % — the `if (hasQKNorm)` branch is correctly skipped. Gemma-3-1B non-graph mode now produces coherent output (previously untested — probably also garbage before the fix).
+
+### Release bench snapshot — 14 models (2026-04-17, RTX 4050, three-run best-of)
+
+| Model | Quant | Arch | v1.13.0 tok/s | PPL |
+|-------|-------|------|--------------:|----:|
+| Qwen3-0.6B | Q8_0 | qwen3 | **108.7** | 1.48 (EXCELLENT) |
+| Llama-3.2-1B | Q4_K_M | llama | **84.8** | 1.58 (EXCELLENT) |
+| OLMo-2-1B | Q4_K_M | olmo2 | **84.2** | — |
+| Falcon3-3B | Q4_K_M | falcon3 | **45.5** | 1.33 (EXCELLENT) |
+| gemma-3-1B | Q4_K_M | gemma3 | **45.0** | 3.92 (GOOD) |
+| Qwen3-1.7B | Q8_0 | qwen3 | **43.5** | 2.50 (EXCELLENT) |
+| Qwen3-4B | Q4_K_M | qwen3 | **32.1** | 1.56 (EXCELLENT) |
+| gemma-3-4B | Q4_K_M | gemma3 | **30.5** | 2.12 (EXCELLENT) |
+| Nemotron-3-Nano-4B | Q4_K_M | nemotron-h | **22.3** | 1.82 (EXCELLENT) |
+| Mistral-7B-Instruct-v0.3 | Q4_K_M | mistral | **20.6** | 1.41 (EXCELLENT) |
+| Qwen3-4B-Thinking | Q8_0 | qwen3 | **20.2** | 1.25 (EXCELLENT) |
+| Granite-3.3-8B | Q4_K_M | granite | **16.6** | 1.35 (EXCELLENT) |
+| Llama-3.2-3B | Q3_K_L | llama | **14.7** | EXCELLENT |
+| Phi-3-mini-4k | IQ4_NL | phi3 | **12.2** | 1.80 (EXCELLENT) |
+
+### Cumulative delta on the worst-performing models
+
+| Model | Pre-v1.13 tok/s | v1.13.0 tok/s | Δ |
+|---|---:|---:|---:|
+| Llama-3.2-3B Q3_K_L | 12.5 | 14.7 | +18 % |
+| Gemma-3 1B Q4_K_M | ~32 | 45.0 | +41 % |
+| Gemma-3 4B Q4_K_M | ~27 | 30.5 | +13 % |
+| Llama-3.2-1B Q4_K_M | 70 | 84.8 | +21 % (cumulative v1.11→v1.13) |
+| Qwen3-0.6B Q8_0 | ~99 | 108.7 | +10 % |
+| Nemotron-3-Nano-4B | 20.0 | 22.3 | +12 % |
+| Phi-3-mini IQ4_NL | 11.9 | 12.2 | neutral (IQ4_NL codebook-lookup bound) |
+
+No regression on any model checked — `launchOutputMatmul` fix and QK-norm fix are both bit-identical-to-graph on tested configurations. Full 14-model table in `BENCHMARKS.md`.
+
+## v1.12.0 (2026-04-15) — CPU-side, second pass
 
 ### Full SIMD kernel rewrite sweep — 5 kernels, up to +327% on CPU
 

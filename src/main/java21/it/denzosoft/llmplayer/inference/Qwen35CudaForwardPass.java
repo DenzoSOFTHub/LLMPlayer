@@ -88,6 +88,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     private final long gpuXbQ8;             // Q8_1 buffer: (dim/32) * 40 bytes
     private final MemorySegment quantizeFunc;
     private final MemorySegment dp4aFunc;
+    private final MemorySegment dp4aQ3kFunc;  // Q3_K dp4a kernel
     private final MemorySegment dp4aQ5kFunc;  // Q5_K dp4a kernel
     private final MemorySegment dp4aQ6kFunc;  // Q6_K dp4a kernel
     // Extended dp4a kernels for non-K-quant types (mirroring CudaForwardPass extension)
@@ -223,7 +224,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         final int rows;
         final int cols;
         final int addToOutput;
-        final int dp4aType;  // 0=none, 4=Q4_K, 5=Q5_K, 6=Q6_K
+        final int dp4aType;  // 0=none, 3=Q3_K, 4=Q4_K, 5=Q5_K, 6=Q6_K, 50=Q5_0, 80=Q8_0, 41=IQ4_NL, 42=IQ4_XS
 
         MatmulLaunch(CudaFloatTensor tensor, long inputPtr, long outputPtr,
                      int rows, int cols, int addToOutput) {
@@ -241,6 +242,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
             if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) dp4aType = 4;
             else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K) dp4aType = 5;
             else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K) dp4aType = 6;
+            else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q3_K) dp4aType = 3;
             else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q5_0) dp4aType = 50;
             else if (t == it.denzosoft.llmplayer.tensor.GGMLType.Q8_0) dp4aType = 80;
             else if (t == it.denzosoft.llmplayer.tensor.GGMLType.IQ4_NL) dp4aType = 41;
@@ -435,7 +437,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
 
         // dp4a integer dot product path (llama.cpp-style optimization)
         boolean dp4aAvail = false;
-        MemorySegment qFunc = null, dFunc = null, d5kFunc = null, d6kFunc = null;
+        MemorySegment qFunc = null, dFunc = null, d5kFunc = null, d6kFunc = null, d3kFunc = null;
         MemorySegment d50Func = null, d80Func = null, dIq4nlFunc = null, dIq4xsFunc = null;
         try {
             qFunc = cudaContext.compileKernel("kernels/cuda/quantize_q8.cu", "quantize_q8");
@@ -446,6 +448,8 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
             catch (Exception ignored) {}
             try { d6kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q6_k_dp4a.cu", "matmul_q6_k_dp4a"); }
             catch (Exception ignored) {}
+            try { d3kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q3_k_dp4a.cu", "matmul_q3_k_dp4a"); }
+            catch (Exception e) { System.err.println("Qwen35 CUDA: Q3_K dp4a unavailable: " + e.getMessage()); }
             // Extended dp4a kernels (mirrors CudaForwardPass extension)
             try { d50Func    = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a.cu",   "matmul_q5_0_dp4a"); }
             catch (Exception e) { System.err.println("Qwen35 CUDA: Q5_0 dp4a unavailable: " + e.getMessage()); }
@@ -462,6 +466,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         useDp4a = dp4aAvail && !"false".equals(System.getProperty("cuda.dp4a", "true"));
         quantizeFunc = qFunc;
         dp4aFunc = dFunc;
+        dp4aQ3kFunc = d3kFunc;
         dp4aQ5kFunc = d5kFunc;
         dp4aQ6kFunc = d6kFunc;
         dp4aQ50Func = d50Func;
@@ -493,6 +498,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
             quantizePB.setInt(2, dim);
             dp4aPB = new ParamBuffer(arena, 6);
             String dp4aTypes = "Q4_K";
+            if (dp4aQ3kFunc != null) dp4aTypes += "+Q3_K";
             if (dp4aQ5kFunc != null) dp4aTypes += "+Q5_K";
             if (dp4aQ6kFunc != null) dp4aTypes += "+Q6_K";
             System.err.println("Qwen35 CUDA: dp4a enabled (" + dp4aTypes + " × Q8_1)");
@@ -1251,6 +1257,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         int gridDim = ml.gridDim;
         int blockDim = ml.blockDim;
         switch (ml.dp4aType) {
+            case 3: func = dp4aQ3kFunc; break;
             case 5: func = dp4aQ5kFunc; break;
             case 6: func = dp4aQ6kFunc; break;
             case 50: func = dp4aQ50Func; break;
@@ -1305,6 +1312,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         if (!useDp4aOutputs || ml.dp4aType == 0) { launchMatmul(ml); return; }
         MemorySegment func;
         switch (ml.dp4aType) {
+            case 3: func = dp4aQ3kFunc; break;
             case 5: func = dp4aQ5kFunc; break;
             case 6: func = dp4aQ6kFunc; break;
             case 50: func = dp4aQ50Func; break;

@@ -44,6 +44,11 @@ public abstract class CudaFloatTensor extends FloatTensor {
      */
     protected abstract int blockSize();
 
+    /** Total weight bytes on GPU (element count / blockSize × blockBytes). */
+    public long getWeightsBytes() {
+        return (size / blockSize()) * blockBytes();
+    }
+
     /**
      * Get or lazily upload the weight data to GPU.
      */
