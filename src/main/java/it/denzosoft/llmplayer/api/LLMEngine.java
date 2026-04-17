@@ -610,7 +610,6 @@ public class LLMEngine implements AutoCloseable {
         int blockCount = config.blockCount();
         int pleDim = config.embeddingLengthPerLayer();
 
-        // Load PLE global tensors (always on CPU — lookup only)
         it.denzosoft.llmplayer.tensor.FloatTensor pleTokenEmbd = null;
         it.denzosoft.llmplayer.tensor.FloatTensor pleModelProj = null;
         float[] pleProjNormWeights = null;
@@ -621,11 +620,28 @@ public class LLMEngine implements AutoCloseable {
         java.util.Arrays.fill(layerOutputScale, 1.0f);
 
         if (pleDim > 0) {
+            // per_layer_token_embd.weight is a pure lookup table (~1.6-1.8 GB on Gemma 3n/4 E4B,
+            // roughly 39 % of the model file). One row is selected per token per layer — no
+            // matmul — so GPU residency costs VRAM without any throughput benefit. Force it to
+            // the CPU path even when a GpuBufferManager is active. Other PLE tensors
+            // (per_layer_model_proj, per_layer_inp_gate, per_layer_proj) participate in actual
+            // matmuls and stay GPU-eligible.
+            // Opt-out for debugging / benchmarking: -Dgemma.ple.gpu=true.
+            boolean pleOnCpu = !"true".equals(System.getProperty("gemma.ple.gpu", "false"));
+            Object savedGpuForPle = it.denzosoft.llmplayer.tensor.TensorFactory.getGpuBufferManager();
+            if (pleOnCpu) it.denzosoft.llmplayer.tensor.TensorFactory.setGpuBufferManager(null);
             try {
                 pleTokenEmbd = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_TOKEN_EMBD);
+                if (pleTokenEmbd != null) {
+                    long bytes = pleTokenEmbd.size() * pleTokenEmbd.type().getTypeSize() / Math.max(1, pleTokenEmbd.type().getBlockSize());
+                    System.err.println("  PLE per_layer_token_embd loaded: " + pleTokenEmbd.getClass().getSimpleName()
+                        + " (" + (bytes / 1024 / 1024) + " MB, " + (pleOnCpu ? "CPU" : "GPU") + " by request)");
+                }
             } catch (UnsupportedOperationException e) {
                 System.err.println("  Warning: PLE token embedding unsupported quantization (" + e.getMessage() + "), disabling PLE");
                 pleTokenEmbd = null;
+            } finally {
+                it.denzosoft.llmplayer.tensor.TensorFactory.setGpuBufferManager(savedGpuForPle);
             }
             pleModelProj = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_MODEL_PROJ);
             it.denzosoft.llmplayer.tensor.FloatTensor normTensor = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.PER_LAYER_PROJ_NORM);
