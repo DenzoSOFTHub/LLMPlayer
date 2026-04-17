@@ -904,11 +904,56 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
 
     /** Execute one layer on GPU. Dispatches to DeltaNet or attention based on layer type. */
     public void forwardLayer(int layerIdx, int position) {
+        if (PROFILING) {
+            forwardLayerProfiled(layerIdx, position);
+            return;
+        }
         if (isDeltaNet[layerIdx]) {
             forwardDeltaNetLayer(layerIdx);
         } else {
             forwardAttentionLayer(layerIdx, position);
         }
+    }
+
+    // ---- -Dcuda.profile=true support (coarse per-layer-type timing) ----
+
+    private static final boolean PROFILING = Boolean.getBoolean("cuda.profile");
+    private long profDeltaNs, profAttnNs, profTotalNs;
+    private int profTokens;
+
+    /** Profiled variant of {@link #forwardLayer}. Adds a finish() barrier per layer to attribute
+     *  time; prints a summary every 10 tokens.  The finish() calls add 15-25 % overhead, so
+     *  profiling is opt-in via the {@code -Dcuda.profile=true} system property. */
+    private void forwardLayerProfiled(int layerIdx, int position) {
+        if (layerIdx == 0) {
+            profTokens++;
+            if (profTokens > 1 && profTokens % 10 == 0) printProfile();
+        }
+        long t0 = System.nanoTime();
+        if (isDeltaNet[layerIdx]) {
+            forwardDeltaNetLayer(layerIdx);
+            cudaContext.finish();
+            long dt = System.nanoTime() - t0;
+            profDeltaNs += dt;
+            profTotalNs += dt;
+        } else {
+            forwardAttentionLayer(layerIdx, position);
+            cudaContext.finish();
+            long dt = System.nanoTime() - t0;
+            profAttnNs += dt;
+            profTotalNs += dt;
+        }
+    }
+
+    /** Print the rolling profile summary and reset counters. */
+    public void printProfile() {
+        if (profTokens == 0) return;
+        double n = profTokens;
+        System.err.printf("Qwen35 CUDA profile (%d tokens, %d GPU layers):%n", profTokens, gpuLayerCount);
+        System.err.printf("  deltanet (per token total): %6.2f ms  |  full-attn (per token total): %6.2f ms  |  TOTAL: %6.2f ms/tok%n",
+            profDeltaNs / 1e6 / n, profAttnNs / 1e6 / n, profTotalNs / 1e6 / n);
+        profDeltaNs = profAttnNs = profTotalNs = 0;
+        profTokens = 0;
     }
 
     /** Execute all GPU layers + output projection via CUDA graph. */
