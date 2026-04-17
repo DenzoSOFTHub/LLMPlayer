@@ -130,6 +130,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     private final MemorySegment dp4aQ5kFunc;
     private final MemorySegment dp4aQ6kFunc;
     private final MemorySegment dp4aQ50Func;
+    private final MemorySegment dp4aQ50SmemFunc;   // shared-memory Q8_1 input cache (v1.13.0)
     private final MemorySegment dp4aQ80Func;
     private final MemorySegment dp4aIq4nlFunc;
     private final MemorySegment dp4aIq4xsFunc;
@@ -322,6 +323,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         boolean dp4aReq = !"false".equals(System.getProperty("cuda.dp4a", "true"));
         MemorySegment qFunc = null, dQ4kFunc = null, dQ5kFunc = null, dQ6kFunc = null, dQ3kFunc = null;
         MemorySegment dQ50Func = null, dQ80Func = null, dIq4nlFunc = null, dIq4xsFunc = null;
+        MemorySegment dQ50SmemFunc = null;
         boolean dp4aAvail = false;
         if (dp4aReq) {
             try {
@@ -332,6 +334,13 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 try { dQ6kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q6_k_dp4a.cu", "matmul_q6_k_dp4a"); } catch (Exception ignored) {}
                 try { dQ3kFunc = cudaContext.compileKernel("kernels/cuda/matmul_q3_k_dp4a.cu", "matmul_q3_k_dp4a"); } catch (Exception ignored) {}
                 try { dQ50Func = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a.cu", "matmul_q5_0_dp4a"); } catch (Exception ignored) {}
+                // Q5_0 smem variant — shared-mem Q8_1 input cache. Nemotron-H / Granite Hybrid
+                // use Q5_0 for ssm_in projections (~720 MB on 4B model). Default ON like the
+                // CudaForwardPass wiring; opt-out with -Dcuda.q5_0.smem=false.
+                if (!"false".equals(System.getProperty("cuda.q5_0.smem", "true"))) {
+                    try { dQ50SmemFunc = cudaContext.compileKernel("kernels/cuda/matmul_q5_0_dp4a_smem.cu", "matmul_q5_0_dp4a_smem"); }
+                    catch (Exception e) { System.err.println("NemotronH CUDA: Q5_0 dp4a smem unavailable: " + e.getMessage()); }
+                }
                 try { dQ80Func = cudaContext.compileKernel("kernels/cuda/matmul_q8_0_dp4a.cu", "matmul_q8_0_dp4a"); } catch (Exception ignored) {}
                 try { dIq4nlFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_nl_dp4a.cu", "matmul_iq4_nl_dp4a"); } catch (Exception ignored) {}
                 try { dIq4xsFunc = cudaContext.compileKernel("kernels/cuda/matmul_iq4_xs_dp4a.cu", "matmul_iq4_xs_dp4a"); } catch (Exception ignored) {}
@@ -346,6 +355,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         dp4aQ5kFunc = dQ5kFunc;
         dp4aQ6kFunc = dQ6kFunc;
         dp4aQ50Func = dQ50Func;
+        dp4aQ50SmemFunc = dQ50SmemFunc;
         dp4aQ80Func = dQ80Func;
         dp4aIq4nlFunc = dIq4nlFunc;
         dp4aIq4xsFunc = dIq4xsFunc;
@@ -586,9 +596,51 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     }
 
     public void forwardLayer(int layerIdx, int position) {
+        if (PROFILING) {
+            forwardLayerProfiled(layerIdx, position);
+            return;
+        }
         if (layerTypes[layerIdx] == 0) forwardMamba(layerIdx);
         else if (layerTypes[layerIdx] == 1) forwardAttention(layerIdx, position);
         else forwardFFN(layerIdx);
+    }
+
+    // ---- -Dcuda.profile=true support (coarse per-layer-type timing) ----
+
+    private static final boolean PROFILING = Boolean.getBoolean("cuda.profile");
+    private long profMambaNs, profAttnNs, profFfnNs, profTotalNs;
+    private int profTokens;
+
+    /** Profiled variant of {@link #forwardLayer}. Attributes per-layer-type GPU time via
+     *  {@code cudaContext.finish()} barriers. Opt-in via {@code -Dcuda.profile=true}. */
+    private void forwardLayerProfiled(int layerIdx, int position) {
+        if (layerIdx == 0) {
+            profTokens++;
+            if (profTokens > 1 && profTokens % 10 == 0) printProfile();
+        }
+        long t0 = System.nanoTime();
+        int type = layerTypes[layerIdx];
+        if (type == 0) forwardMamba(layerIdx);
+        else if (type == 1) forwardAttention(layerIdx, position);
+        else forwardFFN(layerIdx);
+        cudaContext.finish();
+        long dt = System.nanoTime() - t0;
+        profTotalNs += dt;
+        switch (type) {
+            case 0: profMambaNs += dt; break;
+            case 1: profAttnNs += dt; break;
+            default: profFfnNs += dt; break;
+        }
+    }
+
+    public void printProfile() {
+        if (profTokens == 0) return;
+        double n = profTokens;
+        System.err.printf("NemotronH CUDA profile (%d tokens, %d GPU layers):%n", profTokens, gpuLayerCount);
+        System.err.printf("  mamba (per tok total): %6.2f ms  |  attention: %6.2f ms  |  ffn (sqReLU): %6.2f ms  |  TOTAL: %6.2f ms/tok%n",
+            profMambaNs / 1e6 / n, profAttnNs / 1e6 / n, profFfnNs / 1e6 / n, profTotalNs / 1e6 / n);
+        profMambaNs = profAttnNs = profFfnNs = profTotalNs = 0;
+        profTokens = 0;
     }
 
     public boolean forwardGraph(float[] logits) {
@@ -861,7 +913,21 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             case 3:
                 if ("false".equals(System.getProperty("cuda.dp4a.q3", "true"))) { launchMatmul(ml); return; }
                 func = dp4aQ3kFunc; break;
-            case 50: func = dp4aQ50Func; break;
+            case 50:
+                // Q5_0: prefer the shared-memory variant (Q8_1 input cached across warps)
+                // when it compiled successfully. Handled inline here because the smem variant
+                // needs a non-zero smemBytes at launch — generic path passes 0.
+                if (dp4aQ50SmemFunc != null) {
+                    dp4aPB.setLong(0, ml.weightPtr);
+                    dp4aPB.setLong(1, ml.q8InputPtr);
+                    dp4aPB.setLong(2, ml.outputPtr);
+                    dp4aPB.setInt(3, ml.rows);
+                    dp4aPB.setInt(4, ml.cols);
+                    dp4aPB.setInt(5, ml.addToOutput);
+                    launchKernel(dp4aQ50SmemFunc, ml.gridDim, ml.blockDim, (ml.cols / 32) * 40, dp4aPB.ptrs);
+                    return;
+                }
+                func = dp4aQ50Func; break;
             case 80: func = dp4aQ80Func; break;
             case 41: func = dp4aIq4nlFunc; break;
             case 42: func = dp4aIq4xsFunc; break;
