@@ -212,6 +212,7 @@ public final class TensorFactory {
         if (type == GGMLType.IQ3_XXS && cuda) return base + "IQ3_XXSCudaTensor";
         if (type == GGMLType.IQ3_S && cuda) return base + "IQ3_SCudaTensor";
         if (type == GGMLType.IQ2_S && cuda) return base + "IQ2_SCudaTensor";
+        if (type == GGMLType.MXFP4 && cuda) return base + "MXFP4CudaTensor";
         return null; // No GPU version for this type
     }
 }

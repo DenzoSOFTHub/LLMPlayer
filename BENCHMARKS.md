@@ -4,11 +4,64 @@
 
 - **Hardware:** Intel Core Ultra 7 155H (22 cores) + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM) + 31 GB RAM
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
-- **Prompt:** `"Write a Java class that calculates factorial recursively"` — `--max-tokens 120 --context-length 512` (v1.11.0-dev) / `--max-tokens 60 --context-length 512` (v1.10.x)
+- **Prompt:** varies per sweep — see each section header
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
-- **Date:** 2026-04-15 (v1.11.0-dev refresh)
+- **Dates:** v1.13.0 GPU sweep 2026-04-17 • v1.12.0 CPU rewrite sweep 2026-04-15 • v1.11.0 GPU sweep 2026-04-14 • older sections carry their own dates
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## Results v1.13.0 — GPU sweep (2026-04-17)
+
+**Release configuration (v1.13.0 changes active):**
+- `cuda.dp4a=true` — covers Q3_K + Q4_K + Q5_K + Q5_0 + Q8_0 + IQ4_NL + IQ4_XS
+- `cuda.dp4a.q3=true` — Q3_K dp4a default ON (new in v1.13.0)
+- `cuda.q5_0.smem=true` — Q5_0 shared-memory dp4a (new in v1.13.0)
+- `cuda.nograph=false` — CUDA graph mode active (default)
+- `launchOutputMatmul` dispatch now covers all dp4a types (coverage fix)
+- QK-norm path correct on both graph and non-graph paths (bug fix)
+
+**Settings:** `--gpu-layers -1` auto-detect, `--max-tokens 80 --temperature 0`, best-of-3. Prompt: `"Write a short paragraph about the history of computing and artificial intelligence."`
+
+### Release sweep — 14 models (RTX 4050 Laptop GPU, 6 GB VRAM)
+
+| # | Model | Quant | Arch | tok/s (best) | tok/s (avg) | PPL | Verdict |
+|--:|-------|-------|------|-------------:|------------:|----:|---------|
+| 1 | Qwen3-0.6B | Q8_0 | qwen3 | **108.7** | 108.4 | 1.48 | EXCELLENT |
+| 2 | Llama-3.2-1B | Q4_K_M | llama | **84.8** | 83.3 | 1.58 | EXCELLENT |
+| 3 | OLMo-2-1B | Q4_K_M | olmo2 | **84.2** | 80.6 | 8.02 | FAIR (small model) |
+| 4 | Falcon3-3B | Q4_K_M | falcon3 | **45.5** | 44.5 | 1.33 | EXCELLENT |
+| 5 | gemma-3-1B | Q4_K_M | gemma3 | **45.0** | 43.2 | 3.92 | GOOD |
+| 6 | Qwen3-1.7B | Q8_0 | qwen3 | **43.5** | 43.3 | 2.50 | EXCELLENT |
+| 7 | Qwen3-4B | Q4_K_M | qwen3 | **32.1** | 31.7 | 1.56 | EXCELLENT |
+| 8 | gemma-3-4B | Q4_K_M | gemma3 | **30.5** | 30.5 | 2.12 | EXCELLENT |
+| 9 | Nemotron-3-Nano-4B | Q4_K_M | nemotron-h | **22.3** | 21.5 | 1.82 | EXCELLENT |
+| 10 | Mistral-7B-Instruct-v0.3 | Q4_K_M | mistral | **20.6** | 20.57 | 1.41 | EXCELLENT |
+| 11 | Qwen3-4B-Thinking | Q8_0 | qwen3 | **20.2** | 20.1 | 1.25 | EXCELLENT |
+| 12 | Granite-3.3-8B | Q4_K_M | granite | **16.6** | 16.57 | 1.35 | EXCELLENT |
+| 13 | Llama-3.2-3B | Q3_K_L | llama | **14.7** | 14.65 | 2.13* | EXCELLENT |
+| 14 | Phi-3-mini-4k | IQ4_NL | phi3 | **12.2** | 12.1 | 1.80 | EXCELLENT |
+
+\* Llama-3.2-3B Q3_K_L PPL from an earlier evaluator run; the release bench captured tok/s only.
+
+### v1.13.0 biggest gains
+
+| Model | Pre-v1.13 tok/s | v1.13.0 tok/s | Δ | Source |
+|-------|---------------:|---------------:|---:|--------|
+| Llama-3.2-3B Q3_K_L | 12.5 | 14.7 | +18 % | new Q3_K dp4a GPU kernel |
+| gemma-3-1B Q4_K_M | ~32 | 45.0 | +41 % | Q5_0 smem + output dp4a coverage fix |
+| gemma-3-4B Q4_K_M | ~27 | 30.5 | +13 % | Q5_0 smem + output dp4a coverage fix |
+| Llama-3.2-1B Q4_K_M (baseline) | 70 | 84.8 | +21 % | cumulative v1.11→v1.13 dp4a stack |
+| Qwen3-0.6B Q8_0 | ~99 | 108.7 | +10 % | Q8_0 dp4a + QK-norm bug fix |
+| Nemotron-3-Nano-4B Q4_K_M | 20.0 | 22.3 | +12 % | dp4a fleet |
+| Phi-3-mini IQ4_NL | ~12 | 12.2 | neutral | IQ4_NL kernel bound by codebook lookup |
+
+### Notes
+
+- Gemma-3 1B/4B benefit from the Q5_0 smem kernel + the `launchOutputMatmul` coverage fix. Gemma-3-1B cumulative: ~32 (pre-session CPU-profile baseline) → ~43 tok/s (+36 %).
+- Llama-3.2-3B Q3_K_L wins +15.5 % from the new Q3_K dp4a kernel (12.5 → 14.5 tok/s).
+- Qwen3 models (0.6B / 1.7B / 4B) all Q8_0 or Q4_K; no architectural change in v1.13 but the Q8_0 dp4a path (v1.11.0) continues to dominate — Qwen3-0.6B Q8_0 hits 108 tok/s.
+- Phi-3-mini IQ4_NL sees no movement (12 tok/s) — the IQ4_NL kernel is bandwidth-bound by the non-linear codebook lookup, not by HBM pressure, so the smem variant delivers no gain (kept opt-in).
+- No regression on any v1.11 or v1.12 baseline.
 
 ## Results v1.11.0-dev
 

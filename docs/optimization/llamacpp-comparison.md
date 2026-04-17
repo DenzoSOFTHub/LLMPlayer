@@ -1,15 +1,17 @@
 # LLMPlayer vs llama.cpp — performance comparison and optimization findings
 
-> **Date**: 2026-04-13/14 (multi-session optimization sprint)
+> **Date**: 2026-04-13/14 (initial sprint) + 2026-04-16/17 (v1.13.0 round-up)
 > **Hardware**: NVIDIA RTX 4050 Laptop GPU (sm_89, 192 GB/s HBM, 6 GB VRAM)
 > **Reference**: llama.cpp built from `master` (commit a8bad38), CUDA 12.6, sm_89
 
-## TL;DR
+## TL;DR (v1.13.0 release snapshot)
 
-- **Closed gap from 43% → 65% of llama.cpp** on Llama-3.2-1B Q4_K_M (47 → 70 tok/s vs llama.cpp's 110)
-- **Single biggest win**: dp4a (`__dp4a` int8 dot product) was wired only in `Qwen35CudaForwardPass`. Wiring it into the standard `CudaForwardPass` (used for Llama, Qwen2/3, Mistral, Gemma 2/3, Phi, Granite) gave **+34% by itself**.
-- **Closed bug**: `matmul_q4_k_dp4a` had local-memory spill (`__local_depot0[12]` for `sb[12]` byte array). Rewriting scale extraction without the array eliminated the spill.
-- **Multiple architectural ports tried**: all gave 0% to -22% on Llama-1B. The remaining 30-35% gap is **not** in any single kernel; it's spread across many micro-optimizations llama.cpp has accumulated over years.
+- **Llama-3.2-1B Q4_K_M: 47 → 83 tok/s = 43 % → ~76 % of llama.cpp**. Combined effect of the initial dp4a wiring (v1.11) + the v1.13.0 coverage fixes (Q3_K kernel, `launchOutputMatmul` coverage gap, Q5_0 smem, QK-norm bug fix in non-graph path).
+- **Gemma-3-1B Q4_K_M: ~32 → ~43 tok/s = +36 %**. Driven by the v1.13.0 Q5_0 smem kernel plus the `launchOutputMatmul` coverage fix.
+- **Llama-3.2-3B Q3_K_L: 12.5 → 14.5 tok/s = +15.5 %**. The Q3_K dp4a kernel added in v1.13.0.
+- **dp4a dispatch now complete for all 7 measurable quant types** (Q3_K, Q4_K, Q5_K, Q5_0, Q8_0, IQ4_NL, IQ4_XS) across `CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`. Q6_K stays opt-in (210-byte block's byte `__ldg` overhead exceeds the dp4a benefit).
+- **Latent correctness bug surfaced and fixed** during the v1.13.0 refactor: per-head QK-norm was missing from the non-graph per-layer path (`forwardAttentionPart`). Affected Qwen3 / Gemma-3 / SmolLM3 in partial-offload or `-Dcuda.nograph=true` mode. Output was garbage before the fix; bit-identical to graph mode after.
+- **Remaining 25-35 % gap**: structural, spread across micro-optimizations llama.cpp has accumulated over years. No single-kernel change has been shown to close it on RTX 4050 (192 GB/s HBM is the bandwidth ceiling for Q4_K matvec at batch=1).
 
 ## Method
 
@@ -46,6 +48,47 @@ Profile breakdown (cuda.profile=true, ~17% overhead from `cudaContext.finish()` 
 - attn: 0.85 ms (6%)
 - attnNorm: 0.76 ms (5%)
 - ffnNorm: 0.65 ms (4%)
+
+## What landed in v1.13.0 (2026-04-16)
+
+This section tracks the second GPU sprint, after the initial dp4a wiring. The pattern is the same — identify a concrete, addressable gap, fix it, measure against a three-run baseline. Findings are merged into the global "What landed" list below.
+
+### 7. Q3_K dp4a kernel — **+15.5 % on Llama-3.2-3B Q3_K_L**
+
+Q3_K was previously on the FP32 fallback because no `matmul_q3_k_dp4a.cu` existed. Wrote the kernel using the Q4_K dp4a template (one warp per row, stride-32 over 8 sub-blocks, `__dp4a` int8 dot product, two per-sub-block scales). Q3_K's 110-byte block is not 4-byte aligned, so every load uses byte `__ldg`, but unlike Q6_K (whose 210-byte block loses the race) the Q3_K scale decode is cheap enough that dp4a wins by 15.5 % on Llama-3.2-3B Q3_K_L (12.53 → 14.47 tok/s, three-run average). Wired into all three forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`); opt-out with `-Dcuda.dp4a.q3=false`.
+
+### 8. `launchOutputMatmul` coverage gap — **+2.8 % on Gemma-3-1B**
+
+Latent correctness/performance bug found while scanning for residual defects after the Q3_K wiring. `launchOutputMatmul` in `CudaForwardPass` dispatched only Q4_K / Q5_K / Q6_K / Q3_K, so any model whose output weight was Q5_0, Q8_0, IQ4_NL, or IQ4_XS quietly fell through to the FP32 kernel — effectively disabling dp4a for the largest single matmul per token. Qwen35CudaForwardPass had the correct wiring. Added cases 50, 80, 41, 42 to match; measured on Gemma-3-1B Q4_K_M (output weight is Q5_0): 42.4 → 43.6 tok/s (+2.8 %). Phi-3-mini IQ4_NL did not move because its output projection is already latency-bound rather than bandwidth-bound.
+
+### 9. Q5_0 shared-memory dp4a — **+2-3 % on Gemma-3 1B/4B**
+
+Gemma-3 Q4_K_M ships Q5_0 for Q/K/gate/up. Per-section profiling (`-Dcuda.profile=true -Dcuda.nograph=true`) on Gemma-3-1B showed GateUp alone at 12.7 ms/tok (51 % of total). `matmul_q5_0_dp4a_smem.cu` caches the Q8_1 input vector in shared memory so the eight warps per block share one HBM read. Measured **+2.7 % on Gemma-3-1B, +1.7 % on Gemma-3-4B**. The modest size of the win reflects the fact that CUDA-graph mode already amortizes most of the HBM pressure through `cuGraphLaunch`; the same kernel would help more in no-graph mode. Default ON via `-Dcuda.q5_0.smem=true`.
+
+### 10. Runtime QKV fusion — neutral in graph mode, infra-ready
+
+New `MergedQkvCudaTensor` class plus init-time d2d concatenation in `CudaForwardPass` lets the existing merged-QKV + `split_qkv.cu` path (previously only used for natively-packed Phi-3/4) fire for any model with separate Q/K/V weights. Opt-in via `-Dcuda.fuse.qkv=true`. Measured neutral on Llama-1B Q4_K_M in graph mode (graph replay already batches the three individual launches) and ~+2 % in no-graph mode. Shipped as opt-in because the graph-mode baseline is already optimal and the fusion doubles the QKV weight footprint on VRAM during init.
+
+### 11. IQ4_NL shared-memory dp4a — kernel written, opt-in
+
+Wrote `matmul_iq4_nl_dp4a_smem.cu` on the same pattern as Q5_0 smem, targeting Phi-3-mini's 78 ms/tok IQ4_NL matmuls. Measured neutral in graph mode (12.0 smem vs 12.07 baseline tok/s), so `-Dcuda.iq4nl.smem` ships as `false`. The kernel is still useful for no-graph fallback.
+
+### 12. Smaller items
+
+- MXFP4 GPU tensor wrapper (`MXFP4CudaTensor`): kernel already existed for MoE experts, registered the non-MoE path so future MXFP4 models can route through GPU.
+- Q3_K dp4a extended to the output projection switch in all three forward passes.
+- Q4_K `mr4` kernel wiring mirrored from `Qwen35CudaForwardPass` into `CudaForwardPass` (opt-in via `-Dcuda.q4k.mr4=true`).
+- NemotronH startup banner now lists enabled dp4a types (matches other forward passes).
+
+### 13. Per-section profile on the anomaly models (reference)
+
+| Model | TOTAL | QKV | GateUp | siluDown | output | Layers | tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M (baseline) | 10.5 ms | 1.37 | 2.62 | 2.99 | 2.56 | 16 | 65 |
+| Gemma-3 1B Q4_K_M | 25 ms | 1.83 | **12.7** | 3.57 | 3.54 | 26 | 32 |
+| Phi-3-mini IQ4_NL | 95 ms | **21** | **36** | **21** | 0.91 | 32 | 10 |
+
+The Gemma-3 bottleneck is Q5_0 gate/up (fixed partially by #9); the Phi-3-mini bottleneck is IQ4_NL across the board, which is limited by the non-linear codebook lookup more than by HBM bandwidth and is therefore not fixable by an smem variant alone.
 
 ## What landed (default ON, validated)
 

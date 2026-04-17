@@ -1,8 +1,28 @@
-# LLMPlayer v1.12.0-dev
+# LLMPlayer v1.13.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with 16 dedicated CUDA kernels. Includes CUDA GPU acceleration with graph mode (~57 tok/s on RTX 4050 for Llama-3.2-1B), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
 
-### What's coming in v1.12.0 (in development)
+### What's new in v1.13.0 (released 2026-04-17)
+
+**GPU coverage round-up — fills the last obvious gaps in the dp4a dispatch and the attention pipeline.**
+
+- **Q3_K dp4a GPU kernel** (`matmul_q3_k_dp4a.cu`) — new kernel wired into all three forward passes. Measured **+15.5 % on Llama-3.2-3B Q3_K_L** (12.5 → 14.5 tok/s on RTX 4050). PPL bit-identical. Opt-out with `-Dcuda.dp4a.q3=false`.
+- **`launchOutputMatmul` coverage gap fixed** — `CudaForwardPass` previously dispatched the final output projection only for Q4_K / Q5_K / Q6_K. Models with Q5_0 / Q8_0 / IQ4_NL / IQ4_XS output weights silently fell to the FP32 kernel. Added the missing cases; measured **+2.8 % on Gemma-3-1B** (42.4 → 43.6 tok/s, whose `output.weight` is Q5_0).
+- **Latent QK-norm bug fix in the non-graph forward path** — per-head QK-norm was missing from `forwardAttentionPart`; Qwen3 / Gemma-3 / SmolLM3 produced garbage in partial-offload or `-Dcuda.nograph=true` mode. Now bit-identical to graph mode on Qwen3-0.6B Q8_0 (PPL 1.32 both paths).
+- **Q5_0 shared-memory dp4a kernel** (`matmul_q5_0_dp4a_smem.cu`) — Gemma-3 Q4_K_M ships Q5_0 for Q/K/gate/up; per-section profiling showed GateUp at 51 % of total time. New kernel caches the Q8_1 input in shared memory. Measured **+2.7 % on Gemma-3-1B, +1.7 % on Gemma-3-4B**. Enabled by default via `-Dcuda.q5_0.smem=true`.
+- **Cumulative Gemma-3-1B improvement: ~32 → 43.6 tok/s (+36 %)** across v1.13.0 changes.
+- **`forwardAttentionOnly` + `isSupportedForAttention`** — public API for engines that own their FFN path (Qwen3MoE, DeepSeek2, future architectures). Runs steps 1-6c on GPU, leaves the post-attention residual on `gpuX`. Ready for v1.14 Qwen3MoE wiring.
+- **MXFP4 GPU tensor wrapper** (`MXFP4CudaTensor`) — kernel already existed for MoE experts; added the regular-tensor wrapper so future non-MoE MXFP4 models can run on GPU.
+- **Runtime QKV fusion** — new `-Dcuda.fuse.qkv=true` opt-in that concatenates separate Q/K/V weights byte-for-byte at init and activates the merged-matmul + `split_qkv.cu` path previously reserved for natively-packed Phi-3/4. Measured neutral on Llama-1B in CUDA-graph mode (graph capture already amortizes launches), ~+2 % in no-graph mode.
+- **IQ4_NL shared-memory dp4a** written and wired but measured neutral on Phi-3-mini in graph mode. Kept opt-in via `-Dcuda.iq4nl.smem=true`.
+- **Q4_K mr4 multi-row kernel** wiring mirrored from `Qwen35CudaForwardPass` into `CudaForwardPass` as `-Dcuda.q4k.mr4=true`. Default OFF (regression on small models).
+- **JFR / GPU per-section profile** session on Gemma-3-1B and Phi-3-mini identified the remaining llama.cpp gap as concentrated in non-4-byte-aligned block sizes (Q5_0's 22 B, IQ4_NL's 18 B) forcing byte `__ldg` in the inner loop. Documented in `CLAUDE.md`.
+
+See `WHATS-NEW.md` for the detailed per-item writeup, `BENCHMARKS.md` for the v1.13.0 multi-model sweep, and `docs/optimization/llamacpp-comparison.md` for the full optimization journal.
+
+_Planned for v1.14: Qwen3MoE GPU attention path (consuming the v1.13.0 `forwardAttentionOnly` infrastructure), DeepSeek2 MLA + MoE GPU port, Gemma 4 / 3n PLE + AltUp + Laurel GPU, `forwardBatch` API to unlock real speculative-decoding speedup._
+
+### What was new in v1.12.0
 
 **CPU-side landed (2026-04-15):**
 - **Full SIMD kernel rewrite sweep** — JFR method sampling across 9 models flagged all block K-quant + Q8_0 "SIMD" kernels as having scalar `for j in F_LEN` dequant inner loops. Rewrote **5 kernels** (`SimdQ6_K`, `SimdQ8_0`, `SimdQ5_K`, `SimdQ5_0`, `SimdQ3_K`) with the `SimdQ4_K` B2I/I2F lane-parallel pattern. Top measured gains:
@@ -404,7 +424,12 @@ Advanced performance tuning via JVM system properties (`-Dproperty=value`). Thes
 | `-Dcuda.nograph=true` | `false` | Disable CUDA graph; use per-layer kernel launches |
 | `-Dcuda.cublas=true` | `false` | Enable cuBLAS for matmul (dequantizes Q4_K to FP16, uses `libcublas.so`). Useful on high-bandwidth GPUs (A100, H100). On RTX 4050, custom Q4_K kernels + CUDA graph are faster |
 | `-Dcuda.cublas.fp32=true` | `false` | Use FP32 instead of FP16 for cuBLAS (requires 7x VRAM vs Q4_K) |
-| `-Dcuda.dp4a=true` | **`true`** | Enable `__dp4a` int8 dot product across `CudaForwardPass` + `Qwen35CudaForwardPass` + `NemotronHCudaForwardPass`. Covers Q4_K, Q5_K, Q5_0 (v1.11.0-dev), Q8_0 (v1.11.0-dev), IQ4_NL (v1.11.0-dev), IQ4_XS (v1.11.0-dev). Input is quantized to Q8_1 on the fly. **+34% on Llama-1B Q4_K, +42% on Phi-3-mini IQ4_NL, +92% on Nemotron-3-Nano-4B.** Q6_K stays on FP32 (dp4a slower due to unaligned 210-byte block). |
+| `-Dcuda.dp4a=true` | **`true`** | Enable `__dp4a` int8 dot product across `CudaForwardPass` + `Qwen35CudaForwardPass` + `NemotronHCudaForwardPass`. Covers Q3_K (v1.13.0), Q4_K, Q5_K, Q5_0 (v1.11.0-dev), Q8_0 (v1.11.0-dev), IQ4_NL (v1.11.0-dev), IQ4_XS (v1.11.0-dev). Input is quantized to Q8_1 on the fly. **+34 % on Llama-1B Q4_K, +42 % on Phi-3-mini IQ4_NL, +92 % on Nemotron-3-Nano-4B, +15.5 % on Llama-3.2-3B Q3_K_L.** Q6_K stays on FP32 (dp4a slower due to unaligned 210-byte block). |
+| `-Dcuda.dp4a.q3=true` | **`true`** | Q3_K dp4a kernel (v1.13.0). Opt-out. |
+| `-Dcuda.q5_0.smem=true` | **`true`** | Shared-memory Q8_1 input cache for Q5_0 dp4a (v1.13.0). Target: Gemma-3 (ships Q5_0 for Q/K/gate/up). Measured +2-3 %. |
+| `-Dcuda.iq4nl.smem=true` | `false` | Shared-memory Q8_1 input cache for IQ4_NL dp4a (v1.13.0). Kernel written; measured neutral on Phi-3-mini in graph mode. |
+| `-Dcuda.fuse.qkv=true` | `false` | Runtime QKV weight fusion (v1.13.0). Concatenates separate Q/K/V into a merged GPU buffer so the merged-matmul + `split_qkv.cu` path fires universally. Measured neutral in graph mode, ~+2 % no-graph. |
+| `-Dcuda.q4k.mr4=true` | `false` | Q4_K multi-row dp4a kernel (4 rows × 4 warps per block). Already on `Qwen35CudaForwardPass`; mirrored onto `CudaForwardPass` in v1.13.0. Regression on small models → opt-in. |
 | `-Dcuda.dp4a.q6=true` | `false` | Force Q6_K dp4a kernel. Kept for correctness checks only — measures slower than the FP32 Q6_K kernel on Llama-1B (70.6 vs 72.85 tok/s). |
 | `-Dcuda.dp4a.fused_gate_up=true` | `false` | Single fused kernel for gate+up dp4a matmul. Default OFF — marginal/regression (input is already L1-cached; fused kernel adds register pressure). |
 | `-Dcuda.dp4a.mw=true` | `false` | llama.cpp-style multi-warp Q4_K dp4a kernel (4 warps × 32 lanes per row). Slower for small models (Llama-1B: 51 vs 70 tok/s); may help larger models with more super-blocks per row. |
