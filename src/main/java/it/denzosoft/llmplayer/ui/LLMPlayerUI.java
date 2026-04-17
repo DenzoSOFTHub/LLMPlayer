@@ -4,6 +4,7 @@ import it.denzosoft.llmplayer.api.*;
 import it.denzosoft.llmplayer.gguf.GGUFFile;
 import it.denzosoft.llmplayer.gguf.GGUFParser;
 import it.denzosoft.llmplayer.gpu.GpuConfig;
+import it.denzosoft.llmplayer.model.ModelArchitecture;
 import it.denzosoft.llmplayer.sampler.SamplerConfig;
 import it.denzosoft.llmplayer.web.WebServer;
 
@@ -52,14 +53,23 @@ public class LLMPlayerUI extends JFrame {
     private JTextArea inputArea;
     private JButton sendBtn;
 
+    /**
+     * Whitelist of GGUF architecture strings the engine can load. Derived from
+     * {@link ModelArchitecture} (single source of truth) plus the alias names that
+     * {@link ModelArchitecture#fromGgufName} accepts. Keeping this in sync with the
+     * enum avoids the historical drift where new architectures were added to the
+     * engine but the UI kept greying out their models as "unsupported".
+     */
     private static final Set<String> SUPPORTED_ARCHS;
     static {
         Set<String> set = new HashSet<>();
-        set.add("llama");
-        set.add("qwen2");
-        set.add("qwen3");
-        set.add("glm4");
-        set.add("deepseek2");
+        for (ModelArchitecture arch : ModelArchitecture.values()) {
+            set.add(arch.getGgufName());
+        }
+        // Aliases handled by ModelArchitecture.fromGgufName
+        set.add("command_r");    // → COMMAND_R
+        set.add("cohere");       // → COMMAND_R
+        set.add("gemma");        // → GEMMA2 (Gemma1 uses same forward pass)
         SUPPORTED_ARCHS = Collections.unmodifiableSet(set);
     }
 
@@ -528,43 +538,60 @@ public class LLMPlayerUI extends JFrame {
         if (entry == null) return;
         if (!entry.supported()) {
             JOptionPane.showMessageDialog(this,
-                "Architecture '" + entry.arch() + "' is not yet supported.\nOnly Llama models can be loaded at this time.",
+                "Architecture '" + entry.arch() + "' is not recognised by this build.\n"
+                + "Supported architectures: " + SUPPORTED_ARCHS,
                 "Unsupported Model", JOptionPane.WARNING_MESSAGE);
             return;
         }
         loadBtn.setEnabled(false);
         modelCombo.setEnabled(false);
-        int ctxLen = ((Number) ctxSpinner.getValue()).intValue();
-        Path modelPath = Paths.get(entry.path());
+        int requestedCtx = ((Number) ctxSpinner.getValue()).intValue();
+        final Path modelPath = Paths.get(entry.path());
 
-        // Build hardware plan and show confirmation
-        final LLMEngine.HardwarePlan plan = LLMEngine.buildHardwarePlan(modelPath, ctxLen);
-        String dialogTitle = plan.isRecommended() ? "Hardware Configuration" : "Warning: Not Recommended";
-        int msgType = plan.isRecommended() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
-        String confirmMsg = plan.summary() + "\n\nProceed with loading?";
+        // Build hardware plan and show the interactive fine-tune dialog.
+        final LLMEngine.HardwarePlan plan = LLMEngine.buildHardwarePlan(modelPath, requestedCtx);
+        if (!plan.isRecommended()) {
+            int warn = JOptionPane.showConfirmDialog(this,
+                plan.summary() + "\n\nOpen fine-tune dialog anyway?",
+                "Warning: Not Recommended", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (warn != JOptionPane.YES_OPTION) {
+                loadBtn.setEnabled(true);
+                modelCombo.setEnabled(true);
+                return;
+            }
+        }
 
-        int choice = JOptionPane.showConfirmDialog(this, confirmMsg, dialogTitle,
-            JOptionPane.YES_NO_OPTION, msgType);
-        if (choice != JOptionPane.YES_OPTION) {
+        ModelLoadDialog dialog = new ModelLoadDialog(this, modelPath, plan, requestedCtx);
+        boolean proceed = dialog.showAndWait();
+        if (!proceed) {
             loadBtn.setEnabled(true);
             modelCombo.setEnabled(true);
             return;
         }
 
-        // Build GPU config from plan or user overrides
+        final int ctxLen = dialog.getContextLength();
         final GpuConfig gpuConfig;
         if (gpuCheckbox.isSelected() && !gpuDeviceList.isEmpty()) {
-            // User has manually configured GPU settings - use those
+            // Legacy sidebar override: respected only when the GPU checkbox is explicitly toggled.
             gpuConfig = new GpuConfig();
             gpuConfig.setEnabled(true);
             gpuConfig.setDeviceId(gpuDeviceCombo.getSelectedIndex());
             gpuConfig.setGpuLayers(((Number) gpuLayersSpinner.getValue()).intValue());
-        } else if (plan.toGpuConfig() != null) {
-            // Use the auto-configured plan
-            gpuConfig = plan.toGpuConfig();
         } else {
-            gpuConfig = new GpuConfig(); // CPU only
+            GpuConfig fromDialog = dialog.getGpuConfigOrNull();
+            gpuConfig = fromDialog != null ? fromDialog : new GpuConfig(); // fallback: CPU only
         }
+
+        // KV Q8 is controlled by a system property read inside InferenceState — must be set
+        // BEFORE LLMEngine.load kicks off the inference state construction.
+        if (dialog.isKvQ8()) {
+            System.setProperty("kv.q8", "true");
+        } else {
+            System.clearProperty("kv.q8");
+        }
+
+        // Keep the sidebar context spinner in sync with what was actually used.
+        ctxSpinner.setValue(ctxLen);
 
         statusLabel.setText("Loading " + entry.name() + " (preloading weights)...");
 
