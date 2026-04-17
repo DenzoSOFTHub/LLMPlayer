@@ -531,7 +531,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         // Trade-off: 1 extra quantize launch per output projection (~46µs each = 3 per layer)
         // vs ~85µs saving on the matmul kernel (dp4a is 2× faster than plain Q4_K matmul).
         // Net: ~-50% per output projection, ~10ms/token saving on Qwen3.5-4B.
-        boolean dp4aOutReq = "true".equals(System.getProperty("cuda.dp4a.outputs", "false"));
+        // T1.2: dp4a for output projections (ssmOut in DeltaNet / wo in full-attn / ffnDown in FFN).
+        // Measured +9-11% on Qwen3.5 4B/9B with PPL within expected Q8_1 quantization envelope.
+        // Flipped from opt-in to default-on in v1.14.0 — opt-out via -Dcuda.dp4a.outputs=false.
+        boolean dp4aOutReq = !"false".equals(System.getProperty("cuda.dp4a.outputs", "true"));
         useDp4aOutputs = dp4aOutReq && useDp4a;
         if (useDp4aOutputs) {
             int maxInDim = Math.max(Math.max(qDim, innerSize), ffnDim);
