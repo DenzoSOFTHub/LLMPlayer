@@ -60,10 +60,14 @@ Same structure as Q4_K, but with the wider 5-bit quantization grid (32 levels in
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_q5_k.cu` |
+| Kernel file (FP32) | `matmul_q5_k.cu` |
+| Kernel file (dp4a) | `matmul_q5_k_dp4a.cu` -- default-on via `-Dcuda.dp4a=true` (since v1.11.0) |
+| Kernel file (smem) | `matmul_q5_k_smem.cu` -- default-on via `-Dcuda.q5k.smem=true`, +7 % throughput |
 | Strategy | Warp-per-row |
 | Cache hints | `__ldg` for all reads through texture cache |
 | Alignment | 176 bytes IS 4-byte aligned -- safe for vectorized loads |
+
+The dp4a kernel quantizes the input vector to Q8_1 once per matmul and then uses `__dp4a` int8 dot products against the unpacked 5-bit weights. The shared-memory variant additionally caches the Q8_1 input vector in shared memory. Both variants are wired across all three GPU forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`).
 
 ## SIMD Optimization
 

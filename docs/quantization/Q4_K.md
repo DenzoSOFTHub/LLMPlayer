@@ -68,9 +68,12 @@ Q4_K has the most CUDA kernel variants of any quantization type:
 
 | Kernel file | Purpose | Notes |
 |-------------|---------|-------|
-| `matmul_q4_k.cu` | Default matmul | Vectorized `uint32` weight loads, `float4` input loads, `__restrict__` + `__ldg`, group-level striping |
+| `matmul_q4_k.cu` | Default FP32 matmul | Vectorized `uint32` weight loads, `float4` input loads, `__restrict__` + `__ldg`, group-level striping |
+| `matmul_q4_k_dp4a.cu` | Default dp4a matmul | Quantizes the input vector to Q8_1, then uses `__dp4a` int8 dot products. Default-on via `-Dcuda.dp4a=true`. The canonical Q4_K path on `CudaForwardPass`, `Qwen35CudaForwardPass`, and `NemotronHCudaForwardPass` since v1.11.0. |
 | `matmul_q4_k_coalesced.cu` | Alternative coalesced | All 32 threads process same group with single byte reads. 8% slower -- opt-in via `-Dcuda.q4k.coalesced=true` |
 | `matmul_q4_k_fused_gate_up.cu` | Fused FFN gate+up | Single kernel launch for both gate and up projections when both are Q4_K. Reads input once, halves kernel launches for FFN phase |
+| `matmul_q4_k_dp4a_mr4.cu` | Multi-row dp4a | 4 rows per warp, 4 warps per block. Opt-in via `-Dcuda.q4k.mr4=true`; default OFF because mr4 trades per-block overhead for weight reuse, which is a net loss on small models. Already present on `Qwen35CudaForwardPass`; mirrored into `CudaForwardPass` in v1.13.0. |
+| `matmul_q4_k_dp4a_mw.cu` | llama.cpp-style multi-warp dp4a | 4 warps × 32 lanes per row. Opt-in via `-Dcuda.dp4a.mw=true`. Slower for small models (1B regresses ~25 %), may help much larger models. |
 
 **Alignment:** 144 bytes IS 4-byte aligned, enabling safe vectorized `uint32` `__ldg` loads. This is a significant advantage over Q3_K (110B) and Q6_K (210B) which must use byte-level reads.
 
@@ -84,9 +87,9 @@ Q4_K has the most CUDA kernel variants of any quantization type:
 
 ## Performance Characteristics
 
-Q4_K is the best-tested and best-optimized quantization type in LLMPlayer. Key performance numbers (NVIDIA RTX 4050 Laptop, 6 GB VRAM):
+Q4_K is the best-tested and best-optimized quantization type in LLMPlayer. Key performance numbers (NVIDIA RTX 4050 Laptop, 6 GB VRAM, v1.13.0):
 
-- **Llama-3.2-1B Q4_K_M**: 53-56 tok/s (CUDA graph mode)
+- **Llama-3.2-1B Q4_K_M**: 55.8 tok/s (CUDA graph mode + dp4a default-on). The dp4a wiring (v1.11.0) was the single biggest GPU win on this workload: 47 → 63 tok/s (+34 %) before subsequent tuning settled at the current figure.
 - FFN phase (gate+up+SiLU+down): ~9.0 ms/tok for Q4_K layers
 - The fused gate+up kernel saves one kernel launch per layer for models using Q4_K on both gate and up projections
 

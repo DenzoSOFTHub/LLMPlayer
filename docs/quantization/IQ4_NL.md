@@ -64,9 +64,24 @@ value = d * KVALUES_IQ4NL[nibble]
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_iq4_nl.cu` |
+| Kernel file (FP32) | `matmul_iq4_nl.cu` |
+| Kernel file (dp4a) | `matmul_iq4_nl_dp4a.cu` (added v1.11.0) |
+| Kernel file (dp4a + smem) | `matmul_iq4_nl_dp4a_smem.cu` (added v1.13.0, **opt-in only**) |
 | Strategy | Warp-per-row |
-| Available since | v1.5.1 |
+| Alignment | 18 bytes -- NOT 4-byte aligned, forces byte `__ldg` |
+| Available since | v1.5.1; dp4a since v1.11.0 |
+| Default | dp4a path on via `-Dcuda.dp4a=true`; smem variant off via `-Dcuda.iq4nl.smem=false` |
+
+### dp4a path (v1.11.0)
+
+The dp4a variant quantizes the input vector to Q8_1 and uses `__dp4a` int8 dot products against the IQ4_NL weights after lookup-table reconstruction. Wired across all three GPU forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`), and as of v1.13.0 also through `launchOutputMatmul` for the final-output projection.
+
+**Measured (RTX 4050 Laptop GPU):**
+- **Phi-3-mini IQ4_NL: 8.4 → 11.9 tok/s (+42 %)** -- the largest gain in the v1.11.0 dp4a wave, because Phi-3-mini stores essentially all its weights as IQ4_NL and the FP32 fallback was the dominant cost.
+
+### Shared-memory variant (v1.13.0)
+
+`matmul_iq4_nl_dp4a_smem.cu` caches the Q8_1 input vector in shared memory. It was written for the same reason as the Q5_0 smem variant, but measured **neutral** on Phi-3-mini in CUDA graph mode (12.0 vs 12.07 tok/s) -- graph mode already amortizes the kernel-launch overhead the smem variant was meant to save. The kernel is therefore kept opt-in only via `-Dcuda.iq4nl.smem=true`, retained for no-graph fallback and for hardware with different cache characteristics where it might still help.
 
 ## SIMD Optimization
 
@@ -74,6 +89,8 @@ value = d * KVALUES_IQ4NL[nibble]
 |----------|-------|
 | Fused SIMD class | None |
 | CPU dot path | Dequantize via lookup table to buffer, then SIMD dot |
+
+IQ4_NL was explicitly **not** covered by the v1.12.0 CPU SIMD B2I/I2F sweep because its dequantization is a non-linear table lookup (`KVALUES_IQ4NL[16]`) rather than a linear `(quant - zero) * scale` operation. Going fully lane-parallel here requires `VectorShuffle.rearrange` over a pre-multiplied lookup table -- not yet implemented. Phi-3-mini IQ4_NL at ~1.0 tok/s on CPU remains the worst CPU performer in the LLMPlayer test fleet for this reason; the v1.11.0 GPU dp4a kernel above is the practical path forward for this format.
 
 ## Performance Characteristics
 

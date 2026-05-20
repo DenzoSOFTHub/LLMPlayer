@@ -90,6 +90,8 @@ The kernel uses `*(unsigned int*)` casts for reading `scales_and_signs` data. Si
 | Fused SIMD class | None |
 | CPU dot path | Dequantize via grid lookup to buffer, then SIMD dot |
 
+The v1.12.0 CPU SIMD sweep skipped IQ3_XXS for the same reason as the other importance-weighted formats: two compounded table lookups per sub-group (`IQ3XXS_GRID` for magnitudes, `KSIGNS_IQ2XS` for sign patterns) do not fit the lane-parallel `B2I/I2F` mask-and-shift pattern used to rewrite Q3_K / Q5_0 / Q5_K / Q6_K / Q8_0. A lane-parallel path here requires `VectorShuffle.rearrange` over a pre-multiplied table -- deferred until a workload makes the engineering cost worthwhile.
+
 ## Performance Characteristics
 
 IQ3_XXS achieves aggressive compression at 3.0625 bpw through grid-based quantization with shared sign tables. The "XXS" suffix indicates this is the smallest variant of 3-bit importance quantization.

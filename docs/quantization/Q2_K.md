@@ -55,13 +55,15 @@ result += d * sc * sum(q[i] * input[i]) - dmin * m * sum(input[i])
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_q2_k.cu` |
-| Strategy | Warp-per-row, `__ldg` texture cache reads |
-| Alignment | 84 bytes -- not 4-byte aligned |
+| Kernel file | **None** — no `matmul_q2_k.cu` exists on disk |
+| Tensor wrapper | **None** — no `Q2_KCudaTensor` class |
+| Status | CPU-only at both the kernel and the tensor layer |
+
+As of v1.13.0, Q2_K is the only supported quantization without GPU acceleration. Every other quant in the supported set (17 of 18: F32, F16, BF16, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4) has both a `matmul_*.cu` kernel and a `*CudaTensor` wrapper. MXFP4 was the previous gap and got both pieces wired in v1.13.0; Q2_K still lacks both, so any Q2_K model runs on the CPU SIMD path. Block size is 84 bytes (not 4-byte aligned), which would force byte-level `__ldg` if a GPU kernel were ever written.
 
 ## SIMD Optimization
 
-No fused dequant+dot SIMD variant. The CPU path dequantizes into a temporary float buffer, then uses `VectorOpsFactory.get().dot()` for the SIMD dot product.
+No fused dequant+dot SIMD variant. The CPU path dequantizes into a temporary float buffer, then uses `VectorOpsFactory.get().dot()` for the SIMD dot product. Q2_K was not included in the v1.12.0 B2I/I2F lane-parallel sweep (the rewrite covered Q3_K, Q5_0, Q5_K, Q6_K, and Q8_0).
 
 | Property | Value |
 |----------|-------|
