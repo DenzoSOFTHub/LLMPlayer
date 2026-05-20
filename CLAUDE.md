@@ -8,7 +8,7 @@ When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CA
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine (v1.13.0, latest release v1.12.0) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 17 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine (v1.14.0-dev, latest release v1.13.0) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 17 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -137,6 +137,8 @@ Classes in `java21/` and `java25/` are **never imported directly** from base cod
 - **`--fine-tune`** → LoRA fine-tuning pipeline (requires `--target-model` and one of `--source`, `--documents`, `--data`, or `--train-dataset`)
 - **`--gpu-list`** → enumerate CUDA and OpenCL devices and exit
 - **`--download <repo>`** → download GGUF model from HuggingFace (`owner/repo` or `owner/repo/file.gguf`)
+
+By convention, GGUF model files live under `gguf/` at the repo root (paths like `gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf` appear throughout test scripts and the web UI); `gguf/` is gitignored and `--download` writes there by default. The `chats/` directory holds chat persistence JSON files when running with `--web` (created on first save).
 
 ### REST API (web mode)
 
@@ -394,6 +396,8 @@ Reference implementations (cross-check when adding a new quant type):
 - `SimdQ5_0FloatTensor` — nibble + 1-bit qh broadcast via constant shift-vector
 - `SimdQ3_KFloatTensor` — 2-bit low + 1-bit hmask (16 sub-blocks)
 - `SimdQ8_0FloatTensor` — no bit-packing, simplest B2I/I2F chain
+
+The 2026-04-15 SIMD sweep rewrote all five of these (Q6_K, Q8_0, Q5_K, Q5_0, Q3_K) following this template. Measured CPU tok/s gains on small/medium models: Llama-3.2-1B Q4_K_M +80-100 %, Qwen3-4B-Thinking Q8_0 +327 %, Qwen3-1.7B Q8_0 +190 %, Llama-3.2-3B Q3_K_L +192 %, gemma-3-1B +127-293 %. PPL bit-identical across the board. JFR method sampling was the key tool for identifying which Simd*FloatTensor.dot was the active hotspot for each model's quant mix (e.g. Q4_K_M ships Q6_K for `output.weight` + some `ffn_down`/`attn_v`, so Q6_K dominated Llama-1B even though it's nominally a "Q4_K" model).
 
 **Types still on scalar lookup-table path** (not covered by B2I/I2F): IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S — these use non-linear k-means centroids or grid codebooks and need `VectorShuffle.rearrange` over a pre-multiplied table to go fully lane-parallel. Phi-3-mini IQ4_NL at 1.0 tok/s CPU is the worst CPU performer for this reason; GPU dp4a kernels (v1.11.0) already cover these types.
 

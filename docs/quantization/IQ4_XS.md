@@ -72,9 +72,22 @@ The non-linear mapping (derived from K-means clustering) provides better reconst
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_iq4_xs.cu` |
+| Kernel file (FP32) | `matmul_iq4_xs.cu` |
+| Kernel file (dp4a) | `matmul_iq4_xs_dp4a.cu` (added v1.11.0) |
+| Kernel file (dp4a multi-row) | `matmul_iq4_xs_dp4a_mw.cu` |
 | Strategy | Warp-per-row |
-| Available since | v1.5.1 |
+| Alignment | 136 bytes IS 4-byte aligned -- safe for vectorized `uint32` `__ldg` |
+| Available since | v1.5.1; dp4a since v1.11.0 |
+| Default | dp4a path on via `-Dcuda.dp4a=true` |
+
+### dp4a path (v1.11.0)
+
+The dp4a variant quantizes the input vector to Q8_1 and uses `__dp4a` int8 dot products against the IQ4_XS weights after `KVALUES_IQ4NL` lookup reconstruction. Wired across all three GPU forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`), and as of v1.13.0 also through `launchOutputMatmul` for the final-output projection.
+
+**Measured (RTX 4050 Laptop GPU):**
+- Gemma-2-2B IQ4_XS: 8.6 → 9.0 tok/s (+5 %) -- modest because each row has only 9 super-blocks, limiting the parallelism the dp4a kernel can extract per row.
+
+The multi-row dp4a kernel (`matmul_iq4_xs_dp4a_mw.cu`) trades per-block overhead for additional row-level parallelism and is available as an alternative dispatch path on Qwen35CudaForwardPass for workloads where it helps.
 
 ## SIMD Optimization
 
@@ -82,6 +95,8 @@ The non-linear mapping (derived from K-means clustering) provides better reconst
 |----------|-------|
 | Fused SIMD class | None |
 | CPU dot path | Dequantize via lookup table to buffer, then SIMD dot |
+
+IQ4_XS was explicitly **not** covered by the v1.12.0 CPU SIMD B2I/I2F sweep because, like IQ4_NL, its dequantization is a non-linear `KVALUES_IQ4NL[16]` table lookup. Going fully lane-parallel here requires `VectorShuffle.rearrange` over a pre-multiplied lookup table -- deferred until a workload makes the engineering cost worthwhile. GPU dp4a (above) is the recommended path for IQ4_XS workloads today.
 
 ## Performance Characteristics
 

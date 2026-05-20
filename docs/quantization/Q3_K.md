@@ -82,11 +82,22 @@ The scale offset of 32 centers the 6-bit scale range (0-63) around zero, giving 
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_q3_k.cu` |
+| Kernel file (FP32) | `matmul_q3_k.cu` |
+| Kernel file (dp4a) | `matmul_q3_k_dp4a.cu` (new in v1.13.0) |
 | Strategy | Warp-per-row, efficient scale decode |
 | Key optimization | Only the 2 needed scales are decoded per sub-block, not all 16 |
 | Cache hints | `__ldg` for texture cache |
 | Alignment | 110 bytes -- NOT 4-byte aligned, uses byte-level `__ldg` only |
+| Default | dp4a path on via `-Dcuda.dp4a.q3=true` (default) |
+
+### dp4a path (new in v1.13.0)
+
+The dp4a variant quantizes the input vector to Q8_1 once per matmul and then uses `__dp4a` int8 dot products against the unpacked 3-bit weights. Because the Q3_K block is 110 bytes (not 4-byte aligned), the kernel must use byte-level `__ldg` for weight loads — but unlike Q6_K (where this overhead overwhelms the dp4a benefit and the kernel stays opt-in), Q3_K's scale decode is cheap enough that the int8 path still wins. The dp4a dispatch is wired across all three GPU forward passes (`CudaForwardPass`, `Qwen35CudaForwardPass`, `NemotronHCudaForwardPass`).
+
+**Measured (RTX 4050 Laptop GPU):**
+- **Llama-3.2-3B Q3_K_L: 12.5 → 14.5 tok/s (+15.5 %)** vs the FP32 fallback, PPL bit-equivalent within Q8_1 quantization noise.
+
+Opt out with `-Dcuda.dp4a.q3=false` if a regression is observed on a future model.
 
 ## SIMD Optimization
 

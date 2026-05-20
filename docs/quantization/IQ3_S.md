@@ -88,6 +88,8 @@ The scale formula `(1 + 2 * nibble)` gives odd values 1, 3, 5, ..., 31 -- a diff
 | Fused SIMD class | None |
 | CPU dot path | Dequantize via grid lookup to buffer, then SIMD dot |
 
+The v1.12.0 CPU SIMD sweep skipped IQ3_S for the same reason as IQ2_S and IQ3_XXS: the format is grid-indexed (`IQ3S_GRID` 512-entry table) plus explicit per-weight sign bits, which does not fit the `ByteVector → IntVector → FloatVector` B2I/I2F pattern used by the block K-quant rewrites. Going lane-parallel here requires `VectorShuffle.rearrange` over a pre-multiplied table -- not yet implemented. Where IQ3_S is bottlenecking CPU inference, the path forward today is the dedicated CUDA kernel rather than a CPU SIMD rewrite.
+
 ## Performance Characteristics
 
 IQ3_S provides higher quality than IQ3_XXS at the same 3.4375 bpw (same block byte count as Q3_K, coincidentally). The key differences from IQ3_XXS:

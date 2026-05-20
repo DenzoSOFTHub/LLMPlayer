@@ -91,10 +91,14 @@ value = FP4_TABLE[nibble] * scale
 
 | Property | Value |
 |----------|-------|
-| Kernel file | None (no dedicated CUDA kernel) |
-| Status | CPU-only |
+| Kernel file | `matmul_mxfp4.cu` |
+| Tensor wrapper | `MXFP4CudaTensor` (added v1.13.0) |
+| Strategy | Warp-per-row |
+| Alignment | 17 bytes -- NOT 4-byte aligned, uses byte-level `__ldg` |
 
-MXFP4 does not have a dedicated CUDA matmul kernel. Inference uses CPU dequantization with SIMD dot product.
+### v1.13.0 wiring
+
+Prior to v1.13.0 the `matmul_mxfp4.cu` kernel existed but was only invoked indirectly by the MoE expert path (`ExpertGpuCache`); there was no `MXFP4CudaTensor` class, so any standalone MXFP4 weight in the tensor layer fell back to CPU. As of v1.13.0 the `MXFP4CudaTensor` wrapper is registered in `TensorFactory.loadGpuClassName`, bringing MXFP4 in line with the other 16 supported quantization formats that have dedicated `*CudaTensor` classes. The only remaining quant without GPU tensor wiring is Q2_K. This means MXFP4 weights now run on GPU regardless of whether the surrounding architecture is MoE or dense.
 
 ## SIMD Optimization
 
