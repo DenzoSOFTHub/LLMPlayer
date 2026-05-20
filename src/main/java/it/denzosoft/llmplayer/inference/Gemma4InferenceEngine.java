@@ -956,6 +956,7 @@ public class Gemma4InferenceEngine {
         final float[] keyCache = state.gemma4KvCache.keyLayer(kvLayer);
         final float[] valueCache = state.gemma4KvCache.valueLayer(kvLayer);
 
+        final float attnScale = 1.0f;
         java.util.stream.IntStream.range(0, headCount).parallel().forEach(h -> {
             int kvHead = h / kvMul;
             int qOffset = h * hs;
@@ -965,7 +966,7 @@ public class Gemma4InferenceEngine {
                 for (int i = 0; i < hs; i++) {
                     score += qBuf[qOffset + i] * keyCache[kOffset + i];
                 }
-                state.att[h * maxSeqLen + t] = score;
+                state.att[h * maxSeqLen + t] = score * attnScale;
             }
             // Softmax
             float maxVal = Float.NEGATIVE_INFINITY;

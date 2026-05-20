@@ -157,6 +157,19 @@ public class Qwen3MoEInferenceEngine {
         return new Qwen3MoEState(config, maxSeqLen);
     }
 
+    // Mirrors Attention.isGlobalLayer for the MoE-routed architectures.
+    // Returns true when this layer should use full attention (no sliding window).
+    private boolean isSwaGlobalLayer(int layer) {
+        ModelArchitecture arch = config.architecture();
+        if (arch == ModelArchitecture.GPT_OSS) {
+            // GPT-OSS: alternating, even = global, odd = local (SWA).
+            return layer % 2 == 0;
+        }
+        // QWEN3MOE / LLAMA4 MoE / GLM4 MoE: no SWA pattern today — if slidingWindow > 0 is set
+        // in GGUF metadata, treat every layer as windowed (same as the pre-refactor default).
+        return false;
+    }
+
     public float[] forward(Qwen3MoEState state, int token, int position) {
         return forwardInternal(state, token, position, true);
     }
@@ -278,10 +291,12 @@ public class Qwen3MoEInferenceEngine {
         float mscale = rope.getMscale();
         final float scaleFactor = mscale * mscale / (float) Math.sqrt(headSize);
 
-        // ISWA: even layers use sliding window, odd layers use full attention
-        // startPos is the first position to attend to
+        // ISWA: dispatch matches Attention.isGlobalLayer so each MoE-routed arch gets the right pattern.
+        // GPT-OSS routes here for the MoE variant — its convention is even=global, odd=local.
+        // Other archs through this engine (QWEN3MOE, LLAMA4 MoE, GLM4 MoE) don't ship SWA today,
+        // but the dispatch is centralized for future-proofing.
         final int startPos;
-        if (slidingWindow > 0 && (layer % 2 == 0)) {
+        if (slidingWindow > 0 && !isSwaGlobalLayer(layer)) {
             startPos = Math.max(0, position - slidingWindow + 1);
         } else {
             startPos = 0;

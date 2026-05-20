@@ -247,6 +247,10 @@ public class NemotronHInferenceEngine {
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
+        if (logitScale > 0f) {
+            float scale = 1.0f / logitScale;
+            for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
+        }
         return state.logits;
     }
 
