@@ -93,17 +93,23 @@ public class DeepSeek2State {
         this.qCompressedNorm = new float[Math.max(qLoraRank, 1)];
 
         // KV cache: asymmetric MLA cache with separate K/V dimensions (keyLength vs valueLength).
-        // Honors -Dkv.q8=true for Q8_0 quantization. MLA has huge KV (~5 GB at ctx=2k for
-        // DS-V2-Lite) so Q8 gives massive savings.
-        KVCache.Mode ds2KvMode = "true".equals(System.getProperty("kv.q8"))
-            && (totalKeyDim % KVCache.Q8_BLOCK == 0) && (totalValDim % KVCache.Q8_BLOCK == 0)
-            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
+        // Honors -Dkv.q8=true for Q8_0 and -Dkv.q4=true for Q4_1 (the latter wins when both set).
+        // MLA has huge KV (~5 GB at ctx=2k for DS-V2-Lite) so quantization gives massive savings.
+        KVCache.Mode ds2KvMode;
+        if ("true".equals(System.getProperty("kv.q4"))
+                && totalKeyDim % KVCache.Q4_BLOCK == 0 && totalValDim % KVCache.Q4_BLOCK == 0) {
+            ds2KvMode = KVCache.Mode.Q4_1;
+        } else if ("true".equals(System.getProperty("kv.q8"))
+                && totalKeyDim % KVCache.Q8_BLOCK == 0 && totalValDim % KVCache.Q8_BLOCK == 0) {
+            ds2KvMode = KVCache.Mode.Q8_0;
+        } else {
+            ds2KvMode = KVCache.Mode.FLOAT32;
+        }
         this.kvCache = new KVCache(blockCount, totalKeyDim, totalValDim, maxSeqLen, ds2KvMode);
-        if (ds2KvMode == KVCache.Mode.Q8_0) {
-            long q8Bytes = kvCache.memoryBytes();
-            long f32Bytes = 2L * blockCount * maxSeqLen * (totalKeyDim + totalValDim) * 2L; // approx
-            System.out.println("  DeepSeek2 MLA KV cache: Q8_0 mode (~"
-                + (q8Bytes / (1024 * 1024)) + " MB, vs ~"
+        if (ds2KvMode != KVCache.Mode.FLOAT32) {
+            long quantBytes = kvCache.memoryBytes();
+            System.out.println("  DeepSeek2 MLA KV cache: " + ds2KvMode + " mode (~"
+                + (quantBytes / (1024 * 1024)) + " MB, vs ~"
                 + ((long) blockCount * maxSeqLen * (totalKeyDim + totalValDim) * 4 / (1024 * 1024))
                 + " MB in FLOAT32)");
         }
