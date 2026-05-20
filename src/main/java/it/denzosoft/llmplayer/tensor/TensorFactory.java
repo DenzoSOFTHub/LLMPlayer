@@ -79,7 +79,15 @@ public final class TensorFactory {
         if (type == GGMLType.IQ3_S) return new IQ3_SFloatTensor(data, elementCount);
         if (type == GGMLType.IQ2_S) return new IQ2_SFloatTensor(data, elementCount);
         if (type == GGMLType.MXFP4) return new MXFP4FloatTensor(data, elementCount);
-        throw new UnsupportedOperationException("Unsupported tensor type: " + type);
+        // Declared in GGMLType enum but no FloatTensor implementation:
+        // Q4_1, Q8_1, Q8_K, IQ2_XXS, IQ2_XS, IQ1_S, IQ1_M.
+        // These types appear in some legacy or experimental GGUF files; if you hit
+        // this, the model uses a quantization format LLMPlayer does not implement.
+        throw new UnsupportedOperationException(
+            "Unsupported tensor type: " + type +
+            " (no FloatTensor implementation). Supported: F32, F16, BF16, "
+            + "Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, "
+            + "IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4.");
     }
 
     private static FloatTensor tryCreateSimdTensor(GGMLType type, TensorData data, long elementCount) {

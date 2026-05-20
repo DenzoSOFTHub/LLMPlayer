@@ -232,7 +232,19 @@ public class OpenAIHandler {
         // Compute conversation cache key from messages (hash of all messages)
         String cacheKey = computeCacheKey(messages);
 
-        SamplerConfig samplerConfig = new SamplerConfig(temperature, topK, topP, repPenalty, System.nanoTime());
+        // Optional advanced sampler fields (silently ignored before — see audit MED #6).
+        float minP = body.containsKey("min_p") ? ((Number) body.get("min_p")).floatValue() : 0f;
+        int mirostat = body.containsKey("mirostat") ? ((Number) body.get("mirostat")).intValue() : 0;
+        float mirostatTau = body.containsKey("mirostat_tau") ? ((Number) body.get("mirostat_tau")).floatValue() : 5.0f;
+        float mirostatEta = body.containsKey("mirostat_eta") ? ((Number) body.get("mirostat_eta")).floatValue() : 0.1f;
+        long seed = body.containsKey("seed") ? ((Number) body.get("seed")).longValue() : System.nanoTime();
+
+        SamplerConfig samplerConfig = SamplerConfig.builder()
+                .temperature(temperature).topK(topK).topP(topP)
+                .repetitionPenalty(repPenalty).seed(seed)
+                .minP(minP)
+                .mirostat(mirostat, mirostatTau, mirostatEta)
+                .build();
         GenerationRequest request = GenerationRequest.builder()
             .prompt(formattedPrompt)
             .maxTokens(maxTokens)
