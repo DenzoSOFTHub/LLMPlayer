@@ -1,11 +1,17 @@
 /**
- * Full attention kernel: scores + softmax + weighted V sum.
+ * Full / sliding-window attention kernel: scores + softmax + weighted V sum.
  * One block per query head. Threads cooperate on time steps.
  *
  * For GQA: multiple query heads share the same KV head (kvMul = headCount / headCountKV).
  * Uses shared memory for attention scores (requires maxSeqLen + 32 floats).
  *
  * tokenParams[0] = position, tokenParams[1] = seqLen (from GPU global memory for graph compat).
+ *
+ * Sliding-window: when slidingWindow > 0, only positions in
+ *     [max(0, position - slidingWindow + 1), seqLen)
+ * contribute. Earlier positions are masked to -inf in the score loop (softmax → 0)
+ * and skipped in the value-sum loop. slidingWindow = 0 disables windowing (= full
+ * attention, identical to the pre-windowing behavior).
  */
 extern "C" __global__ void attention_full(
     float* output,              // [headCount * headSize] — attention output (xb2)
@@ -16,12 +22,15 @@ extern "C" __global__ void attention_full(
     const int headCountKV,
     const int headSize,
     const int kvDim,
-    const int* tokenParams)     // GPU buffer: tokenParams[0] = position, tokenParams[1] = seqLen
+    const int* tokenParams,     // GPU buffer: tokenParams[0] = position, tokenParams[1] = seqLen
+    const int slidingWindow)    // 0 = full attention, >0 = sliding window size
 {
     int h = blockIdx.x;
     if (h >= headCount) return;
 
     int seqLen = tokenParams[1];
+    int position = tokenParams[0];
+    int startPos = (slidingWindow > 0) ? max(0, position - slidingWindow + 1) : 0;
 
     int kvMul = headCount / headCountKV;
     int kvHead = h / kvMul;
@@ -37,8 +46,12 @@ extern "C" __global__ void attention_full(
     int lane = threadIdx.x & 31;
     int numWarps = blockDim.x / 32;
 
-    // === Step 1: Compute attention scores Q·K^T ===
+    // === Step 1: Compute attention scores Q·K^T (mask t < startPos) ===
     for (int t = threadIdx.x; t < seqLen; t += blockDim.x) {
+        if (t < startPos) {
+            att[t] = -1e38f;
+            continue;
+        }
         float score = 0.0f;
         int kOffset = t * kvDim + kvHead * headSize;
         for (int i = 0; i < headSize; i++) {
@@ -96,11 +109,11 @@ extern "C" __global__ void attention_full(
     }
     __syncthreads();
 
-    // === Step 3: Weighted V sum ===
+    // === Step 3: Weighted V sum (skip t < startPos — their att[] is zero anyway) ===
     int outOffset = h * headSize;
     for (int i = threadIdx.x; i < headSize; i += blockDim.x) {
         float val = 0.0f;
-        for (int t = 0; t < seqLen; t++) {
+        for (int t = startPos; t < seqLen; t++) {
             val += att[t] * valueCache[t * kvDim + kvHead * headSize + i];
         }
         output[outOffset + i] = val;
