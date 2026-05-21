@@ -1,6 +1,18 @@
-# LLMPlayer v1.13.0
+# LLMPlayer v1.14.0-dev
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 21 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), and **Olmo 3** (ChatML variant). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), cuBLAS support (opt-in), thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.14.0-dev (in progress)
+
+**Audit-driven correctness fixes plus one new optimization shipped.**
+
+- **CUDA sliding-window attention for Gemma 2/3/GPT-OSS** — HIGH correctness fix. `CudaForwardPass` had no SWA logic; the kernel iterated over the full history every layer regardless of architecture. CPU/GPU divergence on long context (above 1024–4096 tokens depending on architecture). New `attention.cu` kernel parameter `slidingWindow` (0 = full attention, identical to pre-fix behavior; >0 = mask `t < startPos`). Per-layer dispatch in `CudaForwardPass` mirrors `Attention.isGlobalLayer`. Verified: `CUDA: SWA enabled — 22/26 layers windowed at 512 tokens` on Gemma 3 1B, bit-identical PPL vs pre-fix on short context.
+- **Q4_1 KV cache mode** (`-Dkv.q4=true`) — new opt-in. Block-quantized 4-bit unsigned with per-block FP32 d (scale) and m (min). 0.75 bytes/elem = **5.33× smaller than FP32, 1.5× smaller than Q8_0**. Measured on DeepSeek-Coder-V2-Lite Q4_K_M CPU ctx=512: F32 2.5 → Q8 2.2 → **Q4 3.2 tok/s (+28 % vs F32, +45 % vs Q8)**, all three EXCELLENT-quality. Wins because MLA attention is DRAM-bandwidth bound.
+- **NemotronH / Granite Hybrid CPU fallback logit scale** — bug latent in `forwardGpu`. When `gpuForwardFinalLogits` fell back to CPU re-computation, the `1/logitScale` divide was missing. Granite Hybrid (`logitScale = 8.0`) would have collapsed sampler toward argmax. Fixed.
+- **Gemma 3n inner-path attention symmetry, Qwen3MoE SWA dispatch, OpenAI/Anthropic sampler-field wiring, TensorFactory error message, `--moe-optimized` CLI flag** — five MEDIUM audit items closed.
+- **Documentation**: CLAUDE.md / PERFORMANCE-ANALYSIS.md / 15 `docs/quantization/*.md` files synced to v1.13.0 reality. `docs/quantization/Q2_K.md` corrected — there is no `matmul_q2_k.cu` kernel on disk; Q2_K is the only quant with no GPU path at all.
+
+See `WHATS-NEW.md` for the full per-item writeup (numbers, file paths, before/after comparisons) and `BENCHMARKS.md` for the v1.13.0 release sweep that the v1.14 work builds on.
 
 ### What's new in v1.13.0 (released 2026-04-17)
 
