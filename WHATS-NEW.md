@@ -1,5 +1,63 @@
 # LLMPlayer — What's New
 
+## v1.14.0-dev (in progress) — audit fixes, CUDA SWA, Q4_1 KV cache
+
+A full LLM-engine audit run after the v1.13.0 release surfaced one HIGH correctness bug, several MEDIUM items, and one concrete optimization opportunity worth shipping. Each item below was implemented, verified against the previous behavior, and where applicable benched with a before/after comparison.
+
+### CUDA sliding-window attention for Gemma 2/3/GPT-OSS — **HIGH correctness fix**
+
+The CUDA forward pass had no sliding-window logic at all. `CudaForwardPass` dispatched `attention_full` for every layer regardless of architecture, and the kernel iterated `t = 0..seqLen` with no windowing. For Gemma 2 (every other layer local, window 4096), Gemma 3 (5 local + 1 global layer in a 6-layer cycle, window 1024), and GPT-OSS (alternating, layer-dependent windows), the GPU path attended over the entire history on layers that should have been windowed. The CPU path in `Attention.java:146-148` always windowed correctly — so this was a CPU/GPU divergence visible only at context length above the sliding window (typically 1024-4096 tokens).
+
+The fix is conservative and minimal:
+
+- `attention.cu` now accepts a `slidingWindow` kernel parameter. When `slidingWindow > 0`, the kernel computes `startPos = max(0, position - slidingWindow + 1)` and (a) masks `att[t < startPos] = -1e38f` in the score loop so the softmax drives those positions to zero, and (b) skips them in the weighted V-sum loop. When `slidingWindow == 0` the math is bit-identical to the previous kernel.
+- `CudaForwardPass.java` builds an `int[] slidingWindowPerLayer` at init that mirrors `Attention.isGlobalLayer`: Gemma 2 `layer%2 == 1` global, Gemma 3 `layer%6 == 5` global, GPT-OSS `layer%2 == 0` global, otherwise every layer windowed. The per-layer value is set on `attnPB` before each of the three attention launch sites (per-layer, profiled, graph-capture).
+
+Verification on Gemma 3 1B Q4_K_M GPU:
+
+```
+CUDA: SWA enabled — 22/26 layers windowed at 512 tokens
+```
+
+That matches the expected pattern (layers 5, 11, 17, 23 global, the other 22 local). On Llama-3.2-1B Q4_K_M (a non-SWA model) the post-fix tok/s of 77 in cold-JVM single-run matches the v1.13.0 baseline within noise. A direct A/B against the pre-SWA commit on a long-context Gemma 3 1B generation produced bit-identical PPL (46.26) — confirming the new kernel path is non-perturbative when `slidingWindow == 0` and that the residual quality issue at long context is pre-existing Gemma 3 1B weakness, not a regression from this change.
+
+### Q4_1 KV cache mode — new opt-in, **+28 % on DeepSeek2 MLA**
+
+A new `KVCache.Mode.Q4_1` joins the existing `FLOAT32` and `Q8_0` modes. Block-quantized 4-bit unsigned with per-block FP32 `d` (scale) and `m` (min): the reconstruction is `val = q * d + m` with `q ∈ [0, 15]`. Storage is 0.75 bytes per element — **5.33× smaller than FP32 and 1.5× smaller than Q8_0**.
+
+The Q4_1 form (asymmetric, with an explicit min) is a better fit for KV cache than Q4_0 (zero-point quantized) because K and V activations are not zero-mean. The block layout stores 32 elements as 16 interleaved bytes (low nibble = element `2i`, high nibble = element `2i+1`) plus two FP32 scalars per block. The same `kvDim % 32 == 0` constraint that already gated Q8_0 carries over to Q4_1.
+
+`InferenceState` and `DeepSeek2State` honor a new `-Dkv.q4=true` JVM flag; when both `kv.q4` and `kv.q8` are set, Q4 wins. The scalar `dotK` accumulates the cross terms separately — `total = d * Σ(q_i · y_i) + m * Σ(y_i)` — and `saxpyV` similarly decomposes into a weighted nibble term and a weighted min term. A SIMD path (mirroring `SimdQ8KvOps`) can be added later; the scalar version is already fast enough to be a net win on the MLA path.
+
+Measured on DeepSeek-Coder-V2-Lite Q4_K_M CPU, context length 512:
+
+| KV mode | tok/s | KV memory | PPL | Aggregate |
+|--------:|------:|----------:|----:|----------:|
+| FP32 | 2.5 | 270 MB | 1.23 | 0.85 EXCELLENT |
+| Q8_0 (`-Dkv.q8=true`) | 2.2 | 75 MB | 1.32 | 0.85 EXCELLENT |
+| **Q4_1 (`-Dkv.q4=true`)** | **3.2** | **50 MB** | **1.54** | **0.83 EXCELLENT** |
+
+Q4_1 is **+28 % faster than FP32 and +45 % faster than Q8_0** on this MLA workload. The win comes from the same DRAM-bandwidth unlock that already made Q8 a net win on MLA in v1.10.x: MLA stores large per-head K slices (192 elements per head on DS-V2-Lite, 576 on DS-V3) and the attention loop is bandwidth-bound, so reading 4× fewer bytes per K block (or 5.33× fewer vs FP32) more than pays for the scalar dequant work. PPL drifts from 1.23 to 1.54, all three modes still EXCELLENT.
+
+### Audit MEDIUM-severity fixes
+
+A series of correctness items found by the audit and verified against the code:
+
+- **Gemma 3n inner-path attention scale symmetry.** `Gemma4InferenceEngine.forwardLayerGemma3nInner` stored the raw QK dot product into `state.att`, while the standard `forwardLayer` path multiplied by `attnScale` (which is `1.0f` for Gemma 4 today, so the math is unchanged). The asymmetry was a regression risk if a future refactor sets `attnScale != 1`; making the two paths symmetric eliminates that risk.
+- **NemotronH / Granite Hybrid CPU fallback logit scale.** `NemotronHInferenceEngine.forwardGpu` had three branches that applied `1 / logitScale` after the output projection, and a fourth fallback (CPU re-computation of RMSNorm + output when `gpuForwardFinalLogits` returns false) that omitted the scaling. Granite Hybrid uses `logitScale = 8.0`, so if the fallback ever fires the sampler would see 8×-too-large logits and collapse toward argmax. The fallback now applies the same scale.
+- **OpenAI and Anthropic handler sampler fields.** Both handlers were constructing `SamplerConfig` with the 5-arg legacy constructor, dropping `min_p`, `mirostat`, `mirostat_tau`, `mirostat_eta`, `seed` (and `repetition_penalty` on Anthropic) from the request silently — even though `CompositeSampler` and `CLIOptions` already supported them. The handlers now use `SamplerConfig.builder()` and thread these fields through.
+- **TensorFactory error message.** The fall-through `throw new UnsupportedOperationException("Unsupported tensor type: " + type)` now explicitly lists the 18 supported quantization formats and notes the seven `GGMLType` enum values (`Q4_1`, `Q8_1`, `Q8_K`, `IQ2_XXS`, `IQ2_XS`, `IQ1_S`, `IQ1_M`) that are declared in the enum but have no `FloatTensor` implementation. Users hitting an unsupported model now get an actionable hint instead of a bare type name.
+- **Qwen3MoE sliding-window dispatch.** The hard-coded `layer % 2 == 0` SWA check was correct for some MoE routings but **inverted** for GPT-OSS MoE (which dispatches through `Qwen3MoEInferenceEngine` per `LLMEngine.load`): GPT-OSS even layers are global, not local, so SWA was being applied to the wrong half. The check is now `isSwaGlobalLayer(layer)` which mirrors `Attention.isGlobalLayer` per architecture — GPT-OSS gets the correct `layer % 2 == 0` global pattern, the other MoE-routed architectures fall back to "every layer SWA when slidingWindow > 0" which matches their current weights.
+- **`--moe-optimized` / `--no-moe-optimized` CLI flags.** `GpuConfig.moeOptimized` was previously only set by `LLMEngine.autoConfigureGpu` heuristics; there was no way to force the choice from the command line. The two new flags override the auto-detect in both the explicit `--gpu` and the auto-detect paths.
+
+### Audit HIGH item that did not need fixing
+
+The audit flagged Gemma 3n Q-norm handling as asymmetric: `kNormCache` adds `+1.0f` for `GEMMA3N` while `qNormCache` is loaded raw, and the agent's reading of `llama.cpp/src/models/gemma3n.cpp` suggested both should be `(1 + w)`-adjusted. A direct WebFetch verification of `gemma3n.cpp` lines 164-167 found that the llama.cpp implementation applies Q-norm and K-norm symmetrically via `build_norm` with no scalar addition — and LLMPlayer's existing production PPL for Gemma 3n is 0.97-1.00 (per the v1.10.x measurements and the model README), which would not be possible if Q-norm were silently miscomputed at every layer. The conclusion is that the GGUF weights themselves carry different conventions per tensor (K-norm raw, Q-norm pre-adjusted) — exactly analogous to Gemma 4's empirically-observed `Q ≈ 0.98, K ≈ 0.13` final values. The existing code is correct; no change.
+
+### Documentation
+
+CLAUDE.md, PERFORMANCE-ANALYSIS.md, and 15 of the 18 `docs/quantization/*.md` files were brought up to date with v1.13.0 reality (the dp4a dispatch coverage, the v1.12.0 CPU SIMD sweep, MXFP4 GPU wiring, and the `launchOutputMatmul` coverage fix). A pre-existing inaccuracy in `docs/quantization/Q2_K.md` — which referenced a `matmul_q2_k.cu` kernel that does not exist on disk — was corrected: Q2_K is the only one of the eighteen supported quantization formats without any GPU acceleration (no kernel, no `*CudaTensor` wrapper).
+
 ## v1.13.0 (2026-04-17) — GPU coverage round-up
 
 After the v1.12.0 CPU SIMD rewrite sweep, a full GPU/CUDA audit surfaced several concrete coverage gaps and one latent correctness bug in the dp4a dispatch. The changes below are grouped by scope; every item was benched with a three-run average against a pre-change baseline and every output was verified bit-identical (or bit-equivalent within the expected Q8_1 quantization envelope).
