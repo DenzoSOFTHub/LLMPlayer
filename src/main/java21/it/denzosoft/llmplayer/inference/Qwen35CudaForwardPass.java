@@ -685,7 +685,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         kvPB.setInt(4, kvDim);
         kvPB.setLong(5, gpuTokenParams);
 
-        attnPB = new ParamBuffer(arena, 9);
+        // attention_full takes 10 args: arg9 = slidingWindow (0 = full attention).
+        // Qwen3.5 full-attention layers use full attention; arg9 must still be present
+        // since attention.cu reads 10 params (regression fix: was 9, crashed cuLaunchKernel).
+        attnPB = new ParamBuffer(arena, 10);
         attnPB.setLong(0, gpuXb2);
         attnPB.setLong(1, gpuQCompact);
         attnPB.setInt(4, headCount);
@@ -693,6 +696,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         attnPB.setInt(6, headSize);
         attnPB.setInt(7, kvDim);
         attnPB.setLong(8, gpuTokenParams);
+        attnPB.setInt(9, 0);
 
         siluPB = new ParamBuffer(arena, 2);
         siluMulPB = new ParamBuffer(arena, 3);

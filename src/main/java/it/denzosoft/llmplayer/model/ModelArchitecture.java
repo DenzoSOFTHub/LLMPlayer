@@ -22,7 +22,10 @@ public enum ModelArchitecture {
     GRANITE("granite"),
     GEMMA4("gemma4"),
     GEMMA3N("gemma3n"),
-    GRANITE_HYBRID("granitehybrid");
+    GRANITE_HYBRID("granitehybrid"),
+    ERNIE4_5("ernie4_5"),
+    LFM2("lfm2"),
+    FALCON_H1("falcon-h1");
 
     private final String ggufName;
 

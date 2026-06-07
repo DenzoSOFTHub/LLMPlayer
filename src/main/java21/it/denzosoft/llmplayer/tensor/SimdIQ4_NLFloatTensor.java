@@ -38,50 +38,43 @@ public class SimdIQ4_NLFloatTensor extends IQ4_NLFloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherIdx = otherOffset;
 
+        // 16 is block-clean only for F_LEN in {4,8,16}; fall back otherwise.
+        if ((16 % F_LEN) != 0) return super.dot(thisOffset, other, otherOffset, length);
+
         FloatVector acc = FloatVector.zero(F_SPECIES);
-        byte[] qs = new byte[16];
-        float[] dqLo = new float[16];
-        float[] dqHi = new float[16];
+        final byte[] qs = new byte[16];
+        // Per-block scaled codebook: sk[i] = scale*KVALUES[i]. The nibble->value mapping then
+        // becomes a SIMD gather (vgatherdps) over sk instead of 32 scalar table lookups.
+        final float[] sk = new float[16];
+        final int[] lo = new int[16];
+        final int[] hi = new int[16];
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;
             float scale = Float.float16ToFloat(segment.get(SHORT_LE, bo));
-
-            // Bulk copy packed nibbles
             MemorySegment.copy(segment, BYTE_LE, bo + 2, qs, 0, 16);
 
-            // Dequantize using non-linear lookup table
             for (int i = 0; i < 16; i++) {
-                int lo = qs[i] & 0x0F;
-                int hi = (qs[i] >> 4) & 0x0F;
-                dqLo[i] = scale * KVALUES_IQ4NL[lo];
-                dqHi[i] = scale * KVALUES_IQ4NL[hi];
+                sk[i] = scale * KVALUES_IQ4NL[i];
+                int v = qs[i] & 0xFF;
+                lo[i] = v & 0x0F;   // -> positions 0..15
+                hi[i] = v >>> 4;    // -> positions 16..31
             }
 
-            // SIMD FMA for elements 0..15
-            int loopBound = F_SPECIES.loopBound(16);
-            for (int j = 0; j < loopBound; j += F_LEN) {
-                FloatVector vw = FloatVector.fromArray(F_SPECIES, dqLo, j);
+            // Elements 0..15 (low nibbles): gather sk[lo[]] then FMA with input
+            for (int j = 0; j < 16; j += F_LEN) {
+                FloatVector vw = FloatVector.fromArray(F_SPECIES, sk, 0, lo, j);
                 FloatVector vIn = FloatVector.fromArray(F_SPECIES, other, otherIdx + j);
                 acc = vw.fma(vIn, acc);
             }
-            for (int j = loopBound; j < 16; j++) {
-                acc = acc.withLane(0, acc.lane(0) + dqLo[j] * other[otherIdx + j]);
-            }
-
-            // SIMD FMA for elements 16..31
-            for (int j = 0; j < loopBound; j += F_LEN) {
-                FloatVector vw = FloatVector.fromArray(F_SPECIES, dqHi, j);
+            // Elements 16..31 (high nibbles)
+            for (int j = 0; j < 16; j += F_LEN) {
+                FloatVector vw = FloatVector.fromArray(F_SPECIES, sk, 0, hi, j);
                 FloatVector vIn = FloatVector.fromArray(F_SPECIES, other, otherIdx + 16 + j);
                 acc = vw.fma(vIn, acc);
             }
-            for (int j = loopBound; j < 16; j++) {
-                acc = acc.withLane(0, acc.lane(0) + dqHi[j] * other[otherIdx + 16 + j]);
-            }
-
             otherIdx += BLOCK_SIZE;
         }
-
         return acc.reduceLanes(VectorOperators.ADD);
     }
 }

@@ -13,6 +13,10 @@ import it.denzosoft.llmplayer.inference.Qwen35InferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen35State;
 import it.denzosoft.llmplayer.inference.Gemma4InferenceEngine;
 import it.denzosoft.llmplayer.inference.Gemma4State;
+import it.denzosoft.llmplayer.inference.LFM2InferenceEngine;
+import it.denzosoft.llmplayer.inference.LFM2State;
+import it.denzosoft.llmplayer.inference.FalconH1InferenceEngine;
+import it.denzosoft.llmplayer.inference.FalconH1State;
 import it.denzosoft.llmplayer.gguf.GGUFTensorInfo;
 import it.denzosoft.llmplayer.model.ArchitectureRegistry;
 import it.denzosoft.llmplayer.model.ModelArchitecture;
@@ -48,6 +52,9 @@ public class LLMEngine implements AutoCloseable {
     private final Qwen35InferenceEngine q35Engine;        // Qwen3.5 only
     private final NemotronHInferenceEngine nemHEngine;   // Nemotron-H only
     private final Gemma4InferenceEngine gemma4Engine;    // Gemma 4 only
+    // Non-final (default null): set only in their own dispatch branch, avoiding per-branch null churn.
+    private LFM2InferenceEngine lfm2Engine;              // LFM2 only
+    private FalconH1InferenceEngine falconH1Engine;      // Falcon-H1 only
     private final Tokenizer tokenizer;
     private final ChatTemplate chatTemplate;
     private final SpecialTokens specialTokens;
@@ -96,6 +103,18 @@ public class LLMEngine implements AutoCloseable {
             this.q35Engine = null;
             this.nemHEngine = null;
             this.gemma4Engine = createGemma4Engine(loadedModel, maxContextLength);
+        } else if (arch == ModelArchitecture.LFM2) {
+            this.engine = null; this.ds2Engine = null; this.q3moeEngine = null;
+            this.q35Engine = null; this.nemHEngine = null; this.gemma4Engine = null;
+            this.lfm2Engine = new LFM2InferenceEngine(
+                loadedModel.config(), loadedModel.lfm2Weights(), maxContextLength,
+                loadedModel.lfm2Weights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.FALCON_H1) {
+            this.engine = null; this.ds2Engine = null; this.q3moeEngine = null;
+            this.q35Engine = null; this.nemHEngine = null; this.gemma4Engine = null;
+            this.falconH1Engine = new FalconH1InferenceEngine(
+                loadedModel.config(), loadedModel.falconH1Weights(), maxContextLength,
+                loadedModel.falconH1Weights().ropeFreqFactors());
         } else if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
             this.engine = null;
             this.ds2Engine = null;
@@ -194,6 +213,22 @@ public class LLMEngine implements AutoCloseable {
             Object bufMgr = TensorFactory.getGpuBufferManager();
             if (bufMgr != null) {
                 this.nemHEngine.tryInitGpuForwardPass(bufMgr);
+            }
+        }
+
+        // Try to initialize LFM2 GPU-resident forward pass
+        if (this.lfm2Engine != null && gpuChainEnabled && gpuResources != null) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.lfm2Engine.tryInitGpuForwardPass(bufMgr);
+            }
+        }
+
+        // Try to initialize Falcon-H1 GPU-resident forward pass
+        if (this.falconH1Engine != null && gpuChainEnabled && gpuResources != null) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.falconH1Engine.tryInitGpuForwardPass(bufMgr);
             }
         }
 
@@ -427,6 +462,18 @@ public class LLMEngine implements AutoCloseable {
                 : gemma4Engine.createState();
             stateForCache = state;
             response = generateGemma4(gemma4Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (lfm2Engine != null) {
+            LFM2State state = (cached != null)
+                ? (LFM2State) cached.state
+                : lfm2Engine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateLFM2(lfm2Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (falconH1Engine != null) {
+            FalconH1State state = (cached != null)
+                ? (FalconH1State) cached.state
+                : falconH1Engine.createState(maxContextLength);
+            stateForCache = state;
+            response = generateFalconH1(falconH1Engine, sampler, promptTokens, request, callback, state, prefillStart);
         } else if (nemHEngine != null) {
             NemotronHState state = (cached != null)
                 ? (NemotronHState) cached.state
@@ -506,6 +553,42 @@ public class LLMEngine implements AutoCloseable {
                 public float[] forward(int token, int position) {
                     return eng.forward(state, token, position);
                 }
+            });
+    }
+
+    private GenerationResponse generateLFM2(LFM2InferenceEngine eng, CompositeSampler sampler,
+                                             int[] promptTokens, GenerationRequest request,
+                                             StreamingCallback callback,
+                                             LFM2State state, int prefillStart) {
+        int promptLen = promptTokens.length;
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            if (i < promptLen - 1) eng.forwardNoOutput(state, promptTokens[i], i);
+            else logits = eng.forward(state, promptTokens[i], i);
+        }
+        long genStartTime = System.nanoTime();
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override public float[] forward(int token, int position) { return eng.forward(state, token, position); }
+            });
+    }
+
+    private GenerationResponse generateFalconH1(FalconH1InferenceEngine eng, CompositeSampler sampler,
+                                                 int[] promptTokens, GenerationRequest request,
+                                                 StreamingCallback callback,
+                                                 FalconH1State state, int prefillStart) {
+        int promptLen = promptTokens.length;
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            if (i < promptLen - 1) eng.forwardNoOutput(state, promptTokens[i], i);
+            else logits = eng.forward(state, promptTokens[i], i);
+        }
+        long genStartTime = System.nanoTime();
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override public float[] forward(int token, int position) { return eng.forward(state, token, position); }
             });
     }
 
@@ -841,6 +924,14 @@ public class LLMEngine implements AutoCloseable {
             NemotronHState state = nemHEngine.createState(maxContextLength);
             nemHEngine.prefill(state, tokens);
             return l2Normalize(state.xb, dim);
+        } else if (lfm2Engine != null) {
+            LFM2State state = lfm2Engine.createState(maxContextLength);
+            lfm2Engine.prefill(state, tokens);
+            return l2Normalize(state.nrm, dim);
+        } else if (falconH1Engine != null) {
+            FalconH1State state = falconH1Engine.createState(maxContextLength);
+            falconH1Engine.prefill(state, tokens);
+            return l2Normalize(state.nrm, dim);
         }
         throw new IllegalStateException("No inference engine available");
     }
@@ -1000,6 +1091,24 @@ public class LLMEngine implements AutoCloseable {
                 trainingState = state;
             }
             return nemHEngine.forward(state, token, position);
+        } else if (lfm2Engine != null) {
+            LFM2State state;
+            if (trainingState instanceof LFM2State) {
+                state = (LFM2State) trainingState;
+            } else {
+                state = lfm2Engine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return lfm2Engine.forward(state, token, position);
+        } else if (falconH1Engine != null) {
+            FalconH1State state;
+            if (trainingState instanceof FalconH1State) {
+                state = (FalconH1State) trainingState;
+            } else {
+                state = falconH1Engine.createState(maxContextLength);
+                trainingState = state;
+            }
+            return falconH1Engine.forward(state, token, position);
         }
         throw new IllegalStateException("No inference engine available for training");
     }
