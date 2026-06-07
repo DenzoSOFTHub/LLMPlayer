@@ -1046,6 +1046,40 @@ public class LLMEngine implements AutoCloseable {
 
     private volatile Object trainingState; // InferenceState or DeepSeek2State or Qwen3MoEState
 
+    // Batched GPU forward pass for forwardBatch() (speculative verify / batched prefill).
+    // Has its OWN stateful KV cache, so it is only used when forwardBatch drives a contiguous
+    // sequence (startPosition == batchedNextPos); otherwise we fall back to the sequential loop.
+    private volatile Object batchedGpuPass;
+    private volatile java.lang.reflect.Method batchedForwardMethod;
+    private volatile boolean batchedGpuTried;
+    private volatile int batchedNextPos;
+
+    private void tryInitBatchedGpu() {
+        batchedGpuTried = true;
+        // EXPERIMENTAL — opt-in only (-Dcuda.batched=true). The batched GPU forward (matmul_q4_k_dp4a_
+        // batched) currently fails at the quantize launch with CUDA error 400 when sharing the context
+        // with the single-token CudaForwardPass, and that poisons the context. Default OFF so the
+        // correct sequential forwardBatch (forwardSingleToken loop) is always used. See task #10.
+        if (!"true".equals(System.getProperty("cuda.batched", "false"))) return;
+        if (engine == null) return; // standard dense engine only
+        Object bufMgr = TensorFactory.getGpuBufferManager();
+        if (bufMgr == null) return;
+        try {
+            Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.BatchedCudaForwardPass");
+            java.lang.reflect.Method isSup = cls.getMethod("isSupported",
+                ModelConfig.class, it.denzosoft.llmplayer.model.ModelWeights.class);
+            if (!(Boolean) isSup.invoke(null, loadedModel.config(), loadedModel.weights())) return;
+            Object pass = cls.getConstructor(ModelConfig.class,
+                    it.denzosoft.llmplayer.model.ModelWeights.class, bufMgr.getClass(), int.class, int.class)
+                .newInstance(loadedModel.config(), loadedModel.weights(), bufMgr, maxContextLength, 8);
+            batchedForwardMethod = cls.getMethod("forwardBatch", int[].class, int.class);
+            batchedGpuPass = pass;
+            System.err.println("Batched GPU forward pass: enabled (forwardBatch / speculative verify)");
+        } catch (Throwable e) {
+            System.err.println("Batched GPU forward pass: unavailable — " + e.getMessage());
+        }
+    }
+
     /**
      * Forward a single token at a given position, returning logits.
      * Used by the LoRA training loop for teacher forcing.
@@ -1155,6 +1189,24 @@ public class LLMEngine implements AutoCloseable {
         }
         int K = tokens.length;
         int vocabSize = loadedModel.config().vocabSize();
+
+        // Batched GPU path: one pass over K tokens, each weight read amortized over K inputs.
+        // Used only when it can continue its own contiguous KV cache (not interleaved with
+        // forwardSingleToken/generate, and not during fine-tuning which owns trainingState).
+        if (!batchedGpuTried) tryInitBatchedGpu();
+        if (batchedGpuPass != null && K <= 8 && trainingState == null && startPosition == batchedNextPos) {
+            try {
+                float[][] r = (float[][]) batchedForwardMethod.invoke(batchedGpuPass, tokens, startPosition);
+                batchedNextPos = startPosition + K;
+                return r;
+            } catch (Exception e) {
+                Throwable c = e.getCause() != null ? e.getCause() : e;
+                System.err.println("Batched GPU forward failed: " + c);
+                if ("true".equals(System.getProperty("cuda.debug", "false"))) c.printStackTrace();
+                batchedGpuPass = null;
+            }
+        }
+
         float[][] result = new float[K][];
         for (int k = 0; k < K; k++) {
             float[] logits = forwardSingleToken(tokens[k], startPosition + k);
