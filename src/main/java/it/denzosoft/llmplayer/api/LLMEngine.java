@@ -232,6 +232,14 @@ public class LLMEngine implements AutoCloseable {
             }
         }
 
+        // Try to initialize Gemma 4 GPU-resident forward pass (PLE-only; Gemma 3n AltUp stays CPU)
+        if (this.gemma4Engine != null && gpuChainEnabled && gpuResources != null) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null) {
+                this.gemma4Engine.tryInitGpuForwardPass(bufMgr);
+            }
+        }
+
         // Try to initialize expert GPU cache for MoE models
         if (this.q3moeEngine != null && gpuResources != null && moeOptimizedGpu) {
             tryInitExpertGpuCache();

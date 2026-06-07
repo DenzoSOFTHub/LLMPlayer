@@ -6,6 +6,7 @@ import it.denzosoft.llmplayer.model.TransformerLayerWeights;
 import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.stream.IntStream;
 
@@ -81,6 +82,14 @@ public class Gemma4InferenceEngine {
     // Inference state
     private Gemma4State state;
 
+    // RoPE freq factors (kept for the GPU forward pass to rebuild its own cos/sin tables)
+    private final float[] ropeFreqFactorsArr;
+
+    // GPU-resident forward pass (Gemma 4 PLE-only; null on CPU / Gemma 3n AltUp / unsupported)
+    private AutoCloseable gpuForwardPass;
+    private int gpuLayerCount;
+    private Method gpuUploadX, gpuUploadPle, gpuForwardLayer, gpuForwardFinalLogits;
+
     public Gemma4InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen,
                                   FloatTensor pleTokenEmbd, FloatTensor pleModelProj,
                                   float[] pleProjNormWeights,
@@ -137,6 +146,7 @@ public class Gemma4InferenceEngine {
         float fullTheta = config.ropeFreqBase();
         this.ropeSwa = new RoPE(headSizeSwa, headSizeSwa, maxSeqLen, swaTheta, config.ropeType(), null);
         this.ropeFull = new RoPE(headSizeFull, headSizeFull, maxSeqLen, fullTheta, config.ropeType(), ropeFreqFactors);
+        this.ropeFreqFactorsArr = ropeFreqFactors;
 
         // Cache norm weights for fast access
         attnNormCache = new float[blockCount][];
@@ -188,6 +198,45 @@ public class Gemma4InferenceEngine {
         return layer % 6 != 5; // fallback: Gemma 3 pattern
     }
 
+    /** Try to enable the GPU-resident forward pass (Gemma 4 PLE-only; not Gemma 3n AltUp). */
+    public void tryInitGpuForwardPass(Object bufferManager) {
+        if (g3n != null && g3n.isFullyLoaded()) return; // Gemma 3n AltUp stays on CPU
+        try {
+            Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.Gemma4CudaForwardPass");
+            Method isSup = cls.getMethod("isSupported", ModelConfig.class, ModelWeights.class,
+                FloatTensor[].class, FloatTensor[].class);
+            if (!(Boolean) isSup.invoke(null, config, weights, pleInpGate, pleProj)) return;
+            Object fwd = cls.getConstructor(ModelConfig.class, ModelWeights.class,
+                    bufferManager.getClass(), int.class, FloatTensor[].class, FloatTensor[].class,
+                    float[][].class, float[].class, float[].class, int.class)
+                .newInstance(config, weights, bufferManager, maxSeqLen,
+                    pleInpGate, pleProj, plePostNorm, layerOutputScale, ropeFreqFactorsArr, pleDim);
+            gpuUploadX = cls.getMethod("uploadXAndUpdateParams", float[].class, int.class);
+            gpuUploadPle = cls.getMethod("uploadPleCombined", float[].class);
+            gpuForwardLayer = cls.getMethod("forwardLayer", int.class, int.class);
+            gpuForwardFinalLogits = cls.getMethod("forwardFinalLogits", float[].class);
+            gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
+            gpuForwardPass = (AutoCloseable) fwd;
+            System.err.println("Gemma 4 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
+        } catch (Throwable e) {
+            System.err.println("Gemma 4 CUDA forward pass: unavailable — " + e.getMessage());
+        }
+    }
+
+    private float[] forwardGpu(Gemma4State state, int position, boolean computeLogits, boolean doPle) throws Exception {
+        gpuUploadX.invoke(gpuForwardPass, state.x, position);
+        if (doPle) gpuUploadPle.invoke(gpuForwardPass, state.pleCombined);
+        for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
+        if (!computeLogits) return null;
+        gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
+        if (finalLogitSoftCap > 0f) {
+            for (int i = 0; i < vocabSize; i++) {
+                state.logits[i] = finalLogitSoftCap * (float) Math.tanh(state.logits[i] / finalLogitSoftCap);
+            }
+        }
+        return state.logits;
+    }
+
     public Gemma4State createState() {
         // Use max dimensions for buffers (full attention layers have larger Q/K/V).
         // If g3n is loaded, also allocate AltUp + Laurel buffers (4-stream activations).
@@ -230,6 +279,15 @@ public class Gemma4InferenceEngine {
             }
             // 3c. Merge streams back to single x via altup_unembd_proj + averaging
             altupMerge(state);
+        } else if (gpuForwardPass != null) {
+            // 3b. GPU-resident PLE-only path (falls back to CPU on any failure)
+            try {
+                return forwardGpu(state, position, computeLogits, doPle);
+            } catch (Exception e) {
+                System.err.println("Gemma 4 GPU forward failed: " + e.getMessage());
+                gpuForwardPass = null;
+                for (int layer = 0; layer < blockCount; layer++) forwardLayer(state, layer, position, doPle);
+            }
         } else {
             // 3. Forward through all layers (PLE-only path, no AltUp)
             for (int layer = 0; layer < blockCount; layer++) {
