@@ -1,8 +1,8 @@
-# LLMPlayer v1.14.0-dev
+# LLMPlayer v1.14.0
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), and **Falcon-H1** (parallel Mamba-2 + attention hybrid). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, cuBLAS support (opt-in), an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
 
-### What's new in v1.14.0-dev (in progress)
+### What's new in v1.14.0
 
 **Three new architectures, four new GPU-resident forward passes, an FP16 KV cache, and audit-driven correctness fixes.**
 
@@ -49,7 +49,7 @@ See `WHATS-NEW.md` for the full per-item writeup (numbers, file paths, before/af
 
 See `WHATS-NEW.md` for the detailed per-item writeup, `BENCHMARKS.md` for the v1.13.0 multi-model sweep, and `docs/optimization/llamacpp-comparison.md` for the full optimization journal.
 
-_Originally planned for v1.14; status as of v1.14.0-dev: **Gemma 4 PLE GPU is DONE** (`Gemma4CudaForwardPass`, see above) — only Gemma 3n's AltUp / Laurel path still runs on CPU. The `forwardBatch` / speculative-decoding work has experimental batched infrastructure in place but is gated off pending a fix. Qwen3MoE GPU attention path (consuming the v1.13.0 `forwardAttentionOnly` infrastructure) and the DeepSeek2 MLA + MoE GPU port remain outstanding._
+_Originally planned for v1.14; status as of v1.14.0: **Gemma 4 PLE GPU is DONE** (`Gemma4CudaForwardPass`, see above) — only Gemma 3n's AltUp / Laurel path still runs on CPU. The `forwardBatch` / speculative-decoding work has experimental batched infrastructure in place but is gated off pending a fix. Qwen3MoE GPU attention path (consuming the v1.13.0 `forwardAttentionOnly` infrastructure) and the DeepSeek2 MLA + MoE GPU port remain outstanding._
 
 ### What was new in v1.12.0
 
@@ -68,7 +68,7 @@ _Originally planned for v1.14; status as of v1.14.0-dev: **Gemma 4 PLE GPU is DO
 - **`-Dmatmul.tiled=true` measured −50%** on Llama-1B CPU; kept opt-in with a warning, not deleted.
 - **Still scalar on CPU** — IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S use non-linear lookup tables; B2I pattern doesn't apply. Phi-3-mini IQ4_NL at 1.0 tok/s CPU remains the worst CPU performer. GPU dp4a covers these (v1.11.0).
 
-_Status update (these items were "still planned" at v1.12.0): dedicated `Gemma4CudaForwardPass` (PLE on GPU) — **DONE in v1.14.0-dev**; MoE Granite Hybrid Tiny GPU support — **DONE in v1.14.0-dev** via `GraniteExpertGpu`; the batched `forwardBatch` API has experimental infrastructure in place but is gated off pending a fix. Still genuinely planned: Bonsai Q1_0 format, Q4_1 tensor support, and per-arch kernel tuning to close the remaining ~30% gap vs llama.cpp on RTX 4050._
+_Status update (these items were "still planned" at v1.12.0): dedicated `Gemma4CudaForwardPass` (PLE on GPU) — **DONE in v1.14.0**; MoE Granite Hybrid Tiny GPU support — **DONE in v1.14.0** via `GraniteExpertGpu`; the batched `forwardBatch` API has experimental infrastructure in place but is gated off pending a fix. Still genuinely planned: Bonsai Q1_0 format, Q4_1 tensor support, and per-arch kernel tuning to close the remaining ~30% gap vs llama.cpp on RTX 4050._
 
 ### What's new in v1.11.0 — Granite Hybrid full GPU + dp4a kernel fleet
 
@@ -79,7 +79,7 @@ Highlights:
 - **Speculative decoding (scaffolding)** — new `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al.). Standalone class driving target + draft `LLMEngine` via `forwardSingleToken`. Enabled with `--draft-model <gguf>`. **Sequential verification only** (~1.14× max with K=4); real 2-3× requires a batched `forwardBatch` API that doesn't exist yet. Kept shipped for algorithmic correctness testing. See `docs/optimization/speculative-decoding.md`.
 - **Optimization journal** — new `docs/optimization/` directory records kernel-level attempts with measured outcomes: cubin (Option A), cp.async prefetch (Option C), multi-warp Q4_K, mmvq port. All 0 to −22% on RTX 4050 Q4_K matvec at batch=1 — the hardware is at the bandwidth ceiling for this workload. `llamacpp-comparison.md` tracks the rolling tok/s vs llama.cpp across 17 models (avg ~72% of llama.cpp for standard Q4_K_M).
 
-Status update (these items were "still planned" at v1.11.0): dedicated `Gemma4CudaForwardPass` (PLE on GPU) and MoE Granite Hybrid Tiny GPU support are both **DONE in v1.14.0-dev** (see the v1.14.0-dev notes above); the batched `forwardBatch` path has experimental infrastructure in place but is gated off. Still planned: Gemma 4 E2B benchmark, Q4_1 tensor support, Bonsai Q1_0 format.
+Status update (these items were "still planned" at v1.11.0): dedicated `Gemma4CudaForwardPass` (PLE on GPU) and MoE Granite Hybrid Tiny GPU support are both **DONE in v1.14.0** (see the v1.14.0 notes above); the batched `forwardBatch` path has experimental infrastructure in place but is gated off. Still planned: Gemma 4 E2B benchmark, Q4_1 tensor support, Bonsai Q1_0 format.
 
 ### What's new in v1.10.2 — Gemma 4 fully working + Granite Hybrid GPU fix + Olmo 3 + autosearch
 
@@ -462,16 +462,16 @@ Advanced performance tuning via JVM system properties (`-Dproperty=value`). Thes
 | Property | Default | Description |
 |----------|---------|-------------|
 | `-Dkv.q8=true` | `false` | **Q8_0 KV cache** — block-quantized int8 storage with FP32 scales (3.56× memory reduction). Bit-identical greedy output on dense models, plausibly-equivalent on MoE (router top-K sensitivity). **Always enable for DeepSeek2 / GLM-4.7-Flash**: MLA's large per-head K/V is DRAM-bandwidth bound, so Q8 is both smaller AND faster (DS-Coder-V2-Lite: −72% memory, +28% tok/s). CPU mode only — GPU forward passes use their own VRAM KV buffers. |
-| `-Dkv.q4=true` | `false` | **Q4_1 KV cache** (v1.14.0-dev) — block-quantized 4-bit unsigned with per-block FP32 scale and min. 0.75 bytes/elem = 5.33× smaller than FP32, 1.5× smaller than Q8_0. Wins on bandwidth-bound MLA attention (DS-Coder-V2-Lite CPU: +28% vs F32, +45% vs Q8). Takes precedence over `kv.q8` when both are set. CPU mode only. |
-| `-Dcuda.kv.fp16=true` | `false` | **FP16 KV cache (GPU)** (v1.14.0-dev) — stores the GPU KV cache as 16-bit half, halving KV read bandwidth and VRAM. **+17 % at long context** (Llama-1B at ~400 tokens: 74.8 → 87.6 tok/s; the gain grows with context length), neutral at short context, PPL preserved. |
+| `-Dkv.q4=true` | `false` | **Q4_1 KV cache** (v1.14.0) — block-quantized 4-bit unsigned with per-block FP32 scale and min. 0.75 bytes/elem = 5.33× smaller than FP32, 1.5× smaller than Q8_0. Wins on bandwidth-bound MLA attention (DS-Coder-V2-Lite CPU: +28% vs F32, +45% vs Q8). Takes precedence over `kv.q8` when both are set. CPU mode only. |
+| `-Dcuda.kv.fp16=true` | `false` | **FP16 KV cache (GPU)** (v1.14.0) — stores the GPU KV cache as 16-bit half, halving KV read bandwidth and VRAM. **+17 % at long context** (Llama-1B at ~400 tokens: 74.8 → 87.6 tok/s; the gain grows with context length), neutral at short context, PPL preserved. |
 | `-Dattn.flash=true` | `false` | FlashAttention-style online-softmax single-pass attention. Bit-identical to the legacy 2-pass; on Java/CPU it's 6-15% **slower** than the SIMD-optimized 2-pass and is kept opt-in for future GPU HBM-bound use. |
 | `-Dcuda.nograph=true` | `false` | Disable CUDA graph; use per-layer kernel launches |
 | `-Dcuda.cublas=true` | `false` | Enable cuBLAS for matmul (dequantizes Q4_K to FP16, uses `libcublas.so`). Useful on high-bandwidth GPUs (A100, H100). On RTX 4050, custom Q4_K kernels + CUDA graph are faster |
 | `-Dcuda.cublas.fp32=true` | `false` | Use FP32 instead of FP16 for cuBLAS (requires 7x VRAM vs Q4_K) |
-| `-Dcuda.dp4a=true` | **`true`** | Enable `__dp4a` int8 dot product across `CudaForwardPass` + `Qwen35CudaForwardPass` + `NemotronHCudaForwardPass`, and (v1.14.0-dev) across `LFM2CudaForwardPass` and the `GraniteExpertGpu` MoE experts. Covers Q3_K (v1.13.0), Q4_K, Q5_K, Q5_0 (v1.11.0-dev), Q8_0 (v1.11.0-dev), IQ4_NL (v1.11.0-dev), IQ4_XS (v1.11.0-dev). Input is quantized to Q8_1 on the fly. **+34 % on Llama-1B Q4_K, +42 % on Phi-3-mini IQ4_NL, +92 % on Nemotron-3-Nano-4B, +15.5 % on Llama-3.2-3B Q3_K_L, +37 % on LFM2, +124 % on Granite MoE experts.** Q6_K stays on FP32 (dp4a slower due to unaligned 210-byte block). |
+| `-Dcuda.dp4a=true` | **`true`** | Enable `__dp4a` int8 dot product across `CudaForwardPass` + `Qwen35CudaForwardPass` + `NemotronHCudaForwardPass`, and (v1.14.0) across `LFM2CudaForwardPass` and the `GraniteExpertGpu` MoE experts. Covers Q3_K (v1.13.0), Q4_K, Q5_K, Q5_0 (v1.11.0-dev), Q8_0 (v1.11.0-dev), IQ4_NL (v1.11.0-dev), IQ4_XS (v1.11.0-dev). Input is quantized to Q8_1 on the fly. **+34 % on Llama-1B Q4_K, +42 % on Phi-3-mini IQ4_NL, +92 % on Nemotron-3-Nano-4B, +15.5 % on Llama-3.2-3B Q3_K_L, +37 % on LFM2, +124 % on Granite MoE experts.** Q6_K stays on FP32 (dp4a slower due to unaligned 210-byte block). |
 | `-Dcuda.dp4a.q3=true` | **`true`** | Q3_K dp4a kernel (v1.13.0). Opt-out. |
-| `-Dcuda.falcon.dp4a=true` | `false` | Enable dp4a (int8) matmuls in `FalconH1CudaForwardPass` (v1.14.0-dev). Default OFF — measured neutral-to-slower than FP32 on RTX 4050 because Falcon-H1's per-token cost is dominated by the Mamba-2 scan plus many small matmuls, so the per-matmul `quantize_q8` launch outweighs the int8 speedup. |
-| `-Dcuda.batched=true` | `false` | **Experimental** batched GPU forward pass / `forwardBatch` (v1.14.0-dev). The batched path currently has a runtime bug and is gated OFF; the default `forwardBatch` is the correct sequential loop. Kept for finishing the batched path that would unlock real speculative-decoding speedup. |
+| `-Dcuda.falcon.dp4a=true` | `false` | Enable dp4a (int8) matmuls in `FalconH1CudaForwardPass` (v1.14.0). Default OFF — measured neutral-to-slower than FP32 on RTX 4050 because Falcon-H1's per-token cost is dominated by the Mamba-2 scan plus many small matmuls, so the per-matmul `quantize_q8` launch outweighs the int8 speedup. |
+| `-Dcuda.batched=true` | `false` | **Experimental** batched GPU forward pass / `forwardBatch` (v1.14.0). The batched path currently has a runtime bug and is gated OFF; the default `forwardBatch` is the correct sequential loop. Kept for finishing the batched path that would unlock real speculative-decoding speedup. |
 | `-Dcuda.q5_0.smem=true` | **`true`** | Shared-memory Q8_1 input cache for Q5_0 dp4a (v1.13.0). Target: Gemma-3 (ships Q5_0 for Q/K/gate/up). Measured +2-3 %. |
 | `-Dcuda.iq4nl.smem=true` | `false` | Shared-memory Q8_1 input cache for IQ4_NL dp4a (v1.13.0). Kernel written; measured neutral on Phi-3-mini in graph mode. |
 | `-Dcuda.fuse.qkv=true` | `false` | Runtime QKV weight fusion (v1.13.0). Concatenates separate Q/K/V into a merged GPU buffer so the merged-matmul + `split_qkv.cu` path fires universally. Measured neutral in graph mode, ~+2 % no-graph. |
