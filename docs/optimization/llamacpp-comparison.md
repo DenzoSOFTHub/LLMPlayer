@@ -370,6 +370,39 @@ Run-to-run thermal variance on this RTX 4050 Laptop is significant (±15-30%). F
 6. **`__launch_bounds__` is not free magic.** NVCC's automatic register allocation often beats manual hints. Only use launch_bounds when you've measured a specific occupancy issue.
 7. **Honest negative results have value.** Multiple "this should help" hypotheses were disproven by measurement. Documenting WHY each failed prevents future sessions from re-trying the same approaches.
 
+## v1.14.0-dev — untested-surface optimization pass (2026-06-07)
+
+After adding ERNIE 4.5 / LFM2 / Falcon-H1 and fixing the Granite-Hybrid/Nemotron/Qwen3.5 GPU crash, a focused comparison vs llama.cpp was run on the optimization surface NOT covered by the v1.11–v1.13 dense-Q4_K work. Method: parallel llama.cpp comparison agents (CPU + GPU) + `cpu.profile` / `cuda.profile` measurement, excluding the known-dead list.
+
+**Profiling finding (CPU, Nemotron-3-Nano-4B):** `mamba=140 ms/tok (53 %)`, `ffn=81`, `attn=31`, `output=10`. But within the Mamba phase the **`ssm_in`/`ssm_out` matmuls dominate** — the SSD scan is ~4 % of it (the scan does `nheads·headDim·stateSize` FMAs ≈ `ssmInner·128`, vs the `ssm_in` matmul's `dim·2·ssmInner` ≈ 24× more). So the workload is matmul-bound on CPU just as on GPU.
+
+**Implemented:**
+- **SIMD Mamba-2 scan** (`VectorOps.ssmStateUpdate` + `SimdVectorOps` override, used by `NemotronHInferenceEngine` and `FalconH1InferenceEngine`). Vectorizes the per-state FMA loop (`S[n]=dA·S[n]+B[n]·x; acc+=S[n]·C[n]`) over `stateSize`. **Measured neutral** — the scan is not the bottleneck (matmuls are) and the C2 JIT already auto-vectorizes the simple loop. Kept as default because it makes the scan consistent with every other hot op (all route through `VectorOps` SIMD) and is ≥ scalar on AVX-512 / larger-state models. PPL preserved.
+- **Shared-memory Mamba-2 scan GPU kernel** (`mamba2_scan_smem.cu`, opt-in `-Dcuda.mamba.smem=true`). Within run-to-run thermal noise on RTX 4050 (the GPU Mamba phase is also matmul-bound; the scan kernel is a small fraction of per-token time). Kept opt-in.
+
+**Measurement caveat:** RTX 4050 Laptop thermal variance is ±15-30 % (identical-config runs measured 16.5–27.1 tok/s on Nemotron-4B). Sub-10 % optimizations are not distinguishable on this hardware; only ≥2× structural wins show clearly above the noise.
+
+**The real untested wins — all ≥2×, ALL IMPLEMENTED & VALIDATED 2026-06-07:**
+| Opportunity | Target | Expected | Effort | Why deferred |
+|---|---|---|---|---|
+| ~~GPU-resident forward pass for **Falcon-H1**~~ — **DONE 2026-06-07: ~12 → 40-42 tok/s (~3×)** | falcon-h1 (0.5B + 1.5B) | — | `FalconH1CudaForwardPass` | implemented + validated (0.5B gate-only & 1.5B gate+norm both PPL 0.98-0.99) |
+| ~~GPU-resident forward pass for **LFM2**~~ — **DONE 2026-06-07: ~33 → 56 tok/s (+70 %)** | lfm2 | — | `LFM2CudaForwardPass` | implemented + validated (output bit-identical to CPU) |
+| ~~Q4_K-expert GPU for Granite Hybrid MoE~~ — **DONE 2026-06-07: ~3-4 → 9 tok/s (~2.5×)** | granite-4.0-h-tiny | — | `GraniteExpertGpu` | implemented + validated (PPL 0.98; routed+shared experts on GPU via offset-pointer matmuls reusing each tensor's FP32 kernel, router top-K on CPU; does not touch the validated `NemotronHCudaForwardPass`) |
+| ~~Full SIMD **IQ4_NL/IQ4_XS** CPU dot~~ — **DONE 2026-06-07** | Phi-3-mini IQ4_NL, gemma-2-2B IQ4_XS | — | — | implemented |
+
+**IQ4_NL/IQ4_XS SIMD codebook (DONE 2026-06-07):** `SimdIQ4_NLFloatTensor` and `SimdIQ4_XSFloatTensor` previously did a scalar codebook lookup (`dq[i]=scale*KVALUES[nibble]`) then SIMD FMA ("SIMD only in the final FMA"). Rewrote to build a per-block scaled codebook (`sk[i]=scale*KVALUES[i]`, 16 muls vs the old 32) and resolve the nibble→value map with a SIMD **gather** (`FloatVector.fromArray(species, sk, 0, idx, j)`). PPL bit-preserved (IQ4_NL 0.98, IQ4_XS 1.00). Perf delta not cleanly measurable on the test laptop (thermal throttling under sustained CPU load: 39 s/16 tok); the change is fewer scalar ops + a vectorized lookup, so ≥ the previous path. (Note: on Intel, `vgatherdps` can be no faster than scalar L1 lookups for a 16-entry table — a `VectorShuffle.rearrange` two-half-blend variant may be faster still, but requires shuffle-type casting and was not pursued given the unmeasurability.)
+
+These are the genuinely high-value untested optimizations; each is a focused multi-hundred-line effort, best implemented and validated one at a time.
+
+### dp4a for the new GPU passes (2026-06-07, follow-up)
+
+Added an int8 dp4a path (quantize FP32 input → Q8_1, then per-type dp4a matmul; FP32 fallback for ineligible types) to `LFM2CudaForwardPass`, `FalconH1CudaForwardPass`, and `GraniteExpertGpu`. Measured (best-of-3, RTX 4050, PPL preserved):
+- **LFM2: 48.8 → 66.8 tok/s (+37 %)** — default ON. (LFM2 GPU total: ~33 per-tensor → 56 FP32 pass → 67 dp4a.)
+- **Granite MoE experts: 4.5 → 10.1 tok/s (+124 %)** — default ON (the Q4_K gate/up expert matmuls are the bottleneck; Q6_K down stays FP32).
+- **Falcon-H1: neutral-to-slower** — made **opt-in** (`-Dcuda.falcon.dp4a=true`, default off). Falcon's per-token cost is dominated by the Mamba-2 scan + 9 small matmuls/layer, so the extra per-matmul `quantize_q8` launch outweighs the int8 speedup. Per-arch result — exactly the kind of thing measurement reveals (cf. the dp4a-helps-LFM2 / hurts-Falcon split).
+
+**Still future:** CUDA graph capture for the LFM2/Falcon passes (amortizes per-launch overhead; estimated ~+8-10 % given ~240 kernel launches/token — modest, and needs fixed-max attention shared-mem handling like `NemotronHCudaForwardPass.graphAttnSharedMem`). The small per-op CPU/GPU SIMD tweaks (grouped-norm, per-head QK-norm, conv-gating) were measured/estimated <2 % and are not worth the complexity given the thermal-noise floor.
+
 ## Project policy going forward
 
 - **Default config**: dp4a Q4_K + dp4a Q5_K. No Q6_K dp4a (slower than FP32). No multi-warp / fused / cp.async / mmvq port. Standard launch params (blockDim=256, 8 rows/block).
