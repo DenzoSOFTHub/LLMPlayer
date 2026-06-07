@@ -13,6 +13,12 @@ public final class ArchitectureRegistry {
     public static final String OUTPUT_NORM = "output_norm.weight";
     public static final String OUTPUT = "output.weight";
     public static final String OUTPUT_BIAS = "output.bias"; // E12: optional, some Qwen2 variants
+    public static final String TOKEN_EMBD_NORM = "token_embd_norm.weight"; // LFM2 final norm
+
+    // LFM2 short-convolution tensors (conv mixer layers)
+    public static String shortconvInProj(int layer)  { return "blk." + layer + ".shortconv.in_proj.weight"; }
+    public static String shortconvConv(int layer)    { return "blk." + layer + ".shortconv.conv.weight"; }
+    public static String shortconvOutProj(int layer) { return "blk." + layer + ".shortconv.out_proj.weight"; }
 
     // Per-layer tensor name patterns (N = layer index)
     public static String attnNorm(int layer) { return "blk." + layer + ".attn_norm.weight"; }

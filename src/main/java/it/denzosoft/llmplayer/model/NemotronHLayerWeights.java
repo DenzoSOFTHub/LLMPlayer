@@ -16,19 +16,66 @@ public final class NemotronHLayerWeights {
     private final FloatTensor ssmIn, ssmConv1d, ssmConv1dBias, ssmDtBias, ssmA, ssmD, ssmNorm, ssmOut;
     private final FloatTensor wq, wk, wv, wo;
     private final FloatTensor ffnNorm, ffnGate, ffnUp, ffnDown;
+    // Granite Hybrid MoE (null on dense layers): router + routed experts + shared expert
+    private final FloatTensor ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps, ffnGateShexp, ffnUpShexp, ffnDownShexp;
 
-    // All-fields constructor
+    // All-fields constructor (dense — no MoE)
     private NemotronHLayerWeights(int type, FloatTensor attnNorm,
             FloatTensor ssmIn, FloatTensor ssmConv1d, FloatTensor ssmConv1dBias,
             FloatTensor ssmDtBias, FloatTensor ssmA, FloatTensor ssmD, FloatTensor ssmNorm, FloatTensor ssmOut,
             FloatTensor wq, FloatTensor wk, FloatTensor wv, FloatTensor wo,
             FloatTensor ffnNorm, FloatTensor ffnGate, FloatTensor ffnUp, FloatTensor ffnDown) {
+        this(type, attnNorm, ssmIn, ssmConv1d, ssmConv1dBias, ssmDtBias, ssmA, ssmD, ssmNorm, ssmOut,
+             wq, wk, wv, wo, ffnNorm, ffnGate, ffnUp, ffnDown, null, null, null, null, null, null, null);
+    }
+
+    // All-fields constructor (with MoE)
+    private NemotronHLayerWeights(int type, FloatTensor attnNorm,
+            FloatTensor ssmIn, FloatTensor ssmConv1d, FloatTensor ssmConv1dBias,
+            FloatTensor ssmDtBias, FloatTensor ssmA, FloatTensor ssmD, FloatTensor ssmNorm, FloatTensor ssmOut,
+            FloatTensor wq, FloatTensor wk, FloatTensor wv, FloatTensor wo,
+            FloatTensor ffnNorm, FloatTensor ffnGate, FloatTensor ffnUp, FloatTensor ffnDown,
+            FloatTensor ffnGateInp, FloatTensor ffnGateExps, FloatTensor ffnUpExps, FloatTensor ffnDownExps,
+            FloatTensor ffnGateShexp, FloatTensor ffnUpShexp, FloatTensor ffnDownShexp) {
         this.layerType = type; this.attnNorm = attnNorm;
         this.ssmIn = ssmIn; this.ssmConv1d = ssmConv1d; this.ssmConv1dBias = ssmConv1dBias;
         this.ssmDtBias = ssmDtBias; this.ssmA = ssmA; this.ssmD = ssmD; this.ssmNorm = ssmNorm; this.ssmOut = ssmOut;
         this.wq = wq; this.wk = wk; this.wv = wv; this.wo = wo;
         this.ffnNorm = ffnNorm; this.ffnGate = ffnGate; this.ffnUp = ffnUp; this.ffnDown = ffnDown;
+        this.ffnGateInp = ffnGateInp; this.ffnGateExps = ffnGateExps; this.ffnUpExps = ffnUpExps;
+        this.ffnDownExps = ffnDownExps; this.ffnGateShexp = ffnGateShexp; this.ffnUpShexp = ffnUpShexp;
+        this.ffnDownShexp = ffnDownShexp;
     }
+
+    /** Mamba-2 + MoE FFN layer (Granite Hybrid MoE) */
+    public static NemotronHLayerWeights mambaWithMoE(FloatTensor attnNorm,
+            FloatTensor ssmIn, FloatTensor ssmConv1d, FloatTensor ssmConv1dBias,
+            FloatTensor ssmDtBias, FloatTensor ssmA, FloatTensor ssmD, FloatTensor ssmNorm, FloatTensor ssmOut,
+            FloatTensor ffnNorm, FloatTensor ffnGateInp, FloatTensor ffnGateExps, FloatTensor ffnUpExps,
+            FloatTensor ffnDownExps, FloatTensor ffnGateShexp, FloatTensor ffnUpShexp, FloatTensor ffnDownShexp) {
+        return new NemotronHLayerWeights(TYPE_MAMBA, attnNorm, ssmIn, ssmConv1d, ssmConv1dBias, ssmDtBias,
+            ssmA, ssmD, ssmNorm, ssmOut, null, null, null, null, ffnNorm, null, null, null,
+            ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps, ffnGateShexp, ffnUpShexp, ffnDownShexp);
+    }
+
+    /** Attention + MoE FFN layer (Granite Hybrid MoE) */
+    public static NemotronHLayerWeights attentionWithMoE(FloatTensor attnNorm,
+            FloatTensor wq, FloatTensor wk, FloatTensor wv, FloatTensor wo,
+            FloatTensor ffnNorm, FloatTensor ffnGateInp, FloatTensor ffnGateExps, FloatTensor ffnUpExps,
+            FloatTensor ffnDownExps, FloatTensor ffnGateShexp, FloatTensor ffnUpShexp, FloatTensor ffnDownShexp) {
+        return new NemotronHLayerWeights(TYPE_ATTENTION, attnNorm, null, null, null, null, null, null, null, null,
+            wq, wk, wv, wo, ffnNorm, null, null, null,
+            ffnGateInp, ffnGateExps, ffnUpExps, ffnDownExps, ffnGateShexp, ffnUpShexp, ffnDownShexp);
+    }
+
+    public boolean isMoE() { return ffnGateInp != null; }
+    public FloatTensor ffnGateInp() { return ffnGateInp; }
+    public FloatTensor ffnGateExps() { return ffnGateExps; }
+    public FloatTensor ffnUpExps() { return ffnUpExps; }
+    public FloatTensor ffnDownExps() { return ffnDownExps; }
+    public FloatTensor ffnGateShexp() { return ffnGateShexp; }
+    public FloatTensor ffnUpShexp() { return ffnUpShexp; }
+    public FloatTensor ffnDownShexp() { return ffnDownShexp; }
 
     /** Pure Mamba-2 layer (Nemotron-H) */
     public NemotronHLayerWeights(FloatTensor attnNorm,

@@ -57,6 +57,9 @@ public class CLIRunner {
             gpuConfig.setEnabled(true);
             gpuConfig.setDeviceId(options.getGpuDeviceId());
             gpuConfig.setGpuLayers(options.getGpuLayers());
+            if (options.getMoeOptimized() != null) {
+                gpuConfig.setMoeOptimized(options.getMoeOptimized());
+            }
             gpuConfig.setBackend(parseGpuBackend(options.getGpuBackend()));
             gpuConfig.setMemoryMode(options.getGpuMemoryMode());
         } else {
@@ -64,6 +67,9 @@ public class CLIRunner {
             gpuConfig = LLMEngine.autoConfigureGpu(modelPath);
             if (gpuConfig == null) {
                 gpuConfig = new GpuConfig(); // no GPU found
+            }
+            if (options.getMoeOptimized() != null) {
+                gpuConfig.setMoeOptimized(options.getMoeOptimized());
             }
             gpuConfig.setBackend(parseGpuBackend(options.getGpuBackend()));
             gpuConfig.setMemoryMode(options.getGpuMemoryMode());

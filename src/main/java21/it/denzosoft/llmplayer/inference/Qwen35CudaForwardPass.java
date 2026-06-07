@@ -531,7 +531,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         // Trade-off: 1 extra quantize launch per output projection (~46µs each = 3 per layer)
         // vs ~85µs saving on the matmul kernel (dp4a is 2× faster than plain Q4_K matmul).
         // Net: ~-50% per output projection, ~10ms/token saving on Qwen3.5-4B.
-        boolean dp4aOutReq = "true".equals(System.getProperty("cuda.dp4a.outputs", "false"));
+        // T1.2: dp4a for output projections (ssmOut in DeltaNet / wo in full-attn / ffnDown in FFN).
+        // Measured +9-11% on Qwen3.5 4B/9B with PPL within expected Q8_1 quantization envelope.
+        // Flipped from opt-in to default-on in v1.14.0 — opt-out via -Dcuda.dp4a.outputs=false.
+        boolean dp4aOutReq = !"false".equals(System.getProperty("cuda.dp4a.outputs", "true"));
         useDp4aOutputs = dp4aOutReq && useDp4a;
         if (useDp4aOutputs) {
             int maxInDim = Math.max(Math.max(qDim, innerSize), ffnDim);
@@ -682,7 +685,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         kvPB.setInt(4, kvDim);
         kvPB.setLong(5, gpuTokenParams);
 
-        attnPB = new ParamBuffer(arena, 9);
+        // attention_full takes 10 args: arg9 = slidingWindow (0 = full attention).
+        // Qwen3.5 full-attention layers use full attention; arg9 must still be present
+        // since attention.cu reads 10 params (regression fix: was 9, crashed cuLaunchKernel).
+        attnPB = new ParamBuffer(arena, 10);
         attnPB.setLong(0, gpuXb2);
         attnPB.setLong(1, gpuQCompact);
         attnPB.setInt(4, headCount);
@@ -690,6 +696,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         attnPB.setInt(6, headSize);
         attnPB.setInt(7, kvDim);
         attnPB.setLong(8, gpuTokenParams);
+        attnPB.setInt(9, 0);
 
         siluPB = new ParamBuffer(arena, 2);
         siluMulPB = new ParamBuffer(arena, 3);
@@ -904,11 +911,56 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
 
     /** Execute one layer on GPU. Dispatches to DeltaNet or attention based on layer type. */
     public void forwardLayer(int layerIdx, int position) {
+        if (PROFILING) {
+            forwardLayerProfiled(layerIdx, position);
+            return;
+        }
         if (isDeltaNet[layerIdx]) {
             forwardDeltaNetLayer(layerIdx);
         } else {
             forwardAttentionLayer(layerIdx, position);
         }
+    }
+
+    // ---- -Dcuda.profile=true support (coarse per-layer-type timing) ----
+
+    private static final boolean PROFILING = Boolean.getBoolean("cuda.profile");
+    private long profDeltaNs, profAttnNs, profTotalNs;
+    private int profTokens;
+
+    /** Profiled variant of {@link #forwardLayer}. Adds a finish() barrier per layer to attribute
+     *  time; prints a summary every 10 tokens.  The finish() calls add 15-25 % overhead, so
+     *  profiling is opt-in via the {@code -Dcuda.profile=true} system property. */
+    private void forwardLayerProfiled(int layerIdx, int position) {
+        if (layerIdx == 0) {
+            profTokens++;
+            if (profTokens > 1 && profTokens % 10 == 0) printProfile();
+        }
+        long t0 = System.nanoTime();
+        if (isDeltaNet[layerIdx]) {
+            forwardDeltaNetLayer(layerIdx);
+            cudaContext.finish();
+            long dt = System.nanoTime() - t0;
+            profDeltaNs += dt;
+            profTotalNs += dt;
+        } else {
+            forwardAttentionLayer(layerIdx, position);
+            cudaContext.finish();
+            long dt = System.nanoTime() - t0;
+            profAttnNs += dt;
+            profTotalNs += dt;
+        }
+    }
+
+    /** Print the rolling profile summary and reset counters. */
+    public void printProfile() {
+        if (profTokens == 0) return;
+        double n = profTokens;
+        System.err.printf("Qwen35 CUDA profile (%d tokens, %d GPU layers):%n", profTokens, gpuLayerCount);
+        System.err.printf("  deltanet (per token total): %6.2f ms  |  full-attn (per token total): %6.2f ms  |  TOTAL: %6.2f ms/tok%n",
+            profDeltaNs / 1e6 / n, profAttnNs / 1e6 / n, profTotalNs / 1e6 / n);
+        profDeltaNs = profAttnNs = profTotalNs = 0;
+        profTokens = 0;
     }
 
     /** Execute all GPU layers + output projection via CUDA graph. */

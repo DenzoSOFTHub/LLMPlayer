@@ -233,7 +233,8 @@ public class CudaForwardPass implements AutoCloseable {
     private final ParamBuffer normPB;     // 5 args: out, in, weights, size, eps
     private final ParamBuffer ropePB;     // 8 args: vec, cos, sin, nHeads, headSize, halfRope, tokenParams(ptr), ropeType
     private final ParamBuffer kvPB;       // 6 args: kCache, vCache, k, v, kvDim, tokenParams(ptr)
-    private final ParamBuffer attnPB;     // 9 args: out, q, kCache, vCache, headCount, headCountKV, headSize, kvDim, tokenParams(ptr)
+    private final ParamBuffer attnPB;     // 10 args: out, q, kCache, vCache, headCount, headCountKV, headSize, kvDim, tokenParams(ptr), slidingWindow
+    private final int[] slidingWindowPerLayer; // per-layer SWA window size (0 = global / full attention)
     private final ParamBuffer siluPB;     // 3 args: a, b, size
     private final ParamBuffer biasPB;    // 3 args: y, x, size (for QKV bias accumulate)
     private final ParamBuffer fusedGateUpPB; // 8 args: gateWeights, upWeights, input, gateOutput, upOutput, gateRows, cols, addToOutput
@@ -276,6 +277,9 @@ public class CudaForwardPass implements AutoCloseable {
     // a quantize_q8 kernel converts it to Q8_1 in a scratch buffer, then matmuls whose
     // weight type is Q4_K/Q5_K/Q6_K read the Q8_1 input and use __dp4a int8x4 dot product.
     private final boolean useDp4a;
+    // FP16 KV cache (opt-in): K/V stored as __half to halve attention read bandwidth. Inline-init
+    // so it is set before the constructor body allocates the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
     private final long gpuXbQ8;        // Q8_1 buffer for gpuXb input (size: dim/32 * 40)
     private final long gpuXb2Q8;       // Q8_1 buffer for gpuXb2 input (size: qDim/32 * 40)
     private final long gpuHbQ8;        // Q8_1 buffer for gpuHb input (size: ffnDim/32 * 40)
@@ -404,10 +408,11 @@ public class CudaForwardPass implements AutoCloseable {
         // Determine how many layers are on GPU (partial offload support)
         this.gpuLayerCount = countGpuLayers(weights);
 
-        // Allocate GPU KV cache (only for GPU layers)
+        // Allocate GPU KV cache (only for GPU layers). FP16 (-Dcuda.kv.fp16) halves the KV read
+        // bandwidth during attention; K/V stored as __half, Q/scores/output stay FP32.
         gpuKeyCache = new long[gpuLayerCount];
         gpuValueCache = new long[gpuLayerCount];
-        long kvLayerBytes = (long) maxSeqLen * kvDim * fb;
+        long kvLayerBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
         for (int i = 0; i < gpuLayerCount; i++) {
             gpuKeyCache[i] = bufferManager.createBuffer(kvLayerBytes);
             gpuValueCache[i] = bufferManager.createBuffer(kvLayerBytes);
@@ -509,11 +514,50 @@ public class CudaForwardPass implements AutoCloseable {
         rmsnormFusedFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         ropeFunc = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        if (useFp16Kv) {
+            kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16");
+            attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "attention_full_f16");
+            System.err.println("CUDA: FP16 KV cache enabled (-Dcuda.kv.fp16)");
+        } else {
+            kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
+            attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        }
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         argmaxPartialFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_partial");
         argmaxFinalFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_final");
+
+        // Sliding-window per-layer table (0 = global / full attention). Mirrors Attention.isGlobalLayer.
+        // CudaForwardPass is not used for Gemma 4 / Gemma 3n (PLE paths run on CPU); Cohere2 is blocked
+        // by useLayerNorm() in isSupported(). Remaining SWA architectures are Gemma 2, Gemma 3, GPT-OSS.
+        {
+            int sw = config.slidingWindow();
+            int blocks = config.blockCount();
+            int[] swPerLayer = new int[blocks];
+            it.denzosoft.llmplayer.model.ModelArchitecture arch = config.architecture();
+            for (int li = 0; li < blocks; li++) {
+                if (sw <= 0) { swPerLayer[li] = 0; continue; }
+                boolean isGlobal;
+                if (arch == it.denzosoft.llmplayer.model.ModelArchitecture.GEMMA2) {
+                    isGlobal = (li % 2 == 1);
+                } else if (arch == it.denzosoft.llmplayer.model.ModelArchitecture.GEMMA3) {
+                    isGlobal = (li % 6 == 5);
+                } else if (arch == it.denzosoft.llmplayer.model.ModelArchitecture.GPT_OSS) {
+                    isGlobal = (li % 2 == 0);
+                } else {
+                    // Architectures with a single uniform window (no per-layer pattern): every layer SWA.
+                    isGlobal = false;
+                }
+                swPerLayer[li] = isGlobal ? 0 : sw;
+            }
+            this.slidingWindowPerLayer = swPerLayer;
+            boolean anySwa = false;
+            for (int v : swPerLayer) if (v > 0) { anySwa = true; break; }
+            if (anySwa) {
+                int swaCount = 0;
+                for (int v : swPerLayer) if (v > 0) swaCount++;
+                System.err.println("CUDA: SWA enabled — " + swaCount + "/" + blocks + " layers windowed at " + sw + " tokens");
+            }
+        }
 
         // Granite scaling
         graniteResidualScale = config.residualScale();
@@ -655,7 +699,7 @@ public class CudaForwardPass implements AutoCloseable {
         normPB = new ParamBuffer(arena, 5);
         ropePB = new ParamBuffer(arena, 8);
         kvPB = new ParamBuffer(arena, 6);
-        attnPB = new ParamBuffer(arena, 9);
+        attnPB = new ParamBuffer(arena, 10);
         siluPB = new ParamBuffer(arena, 3);
         biasPB = new ParamBuffer(arena, 3);
         fusedGateUpPB = new ParamBuffer(arena, 8);
@@ -1566,6 +1610,7 @@ public class CudaForwardPass implements AutoCloseable {
         // 5. Full attention (seqLen read from gpuTokenParams[1] by kernel)
         attnPB.setLong(2, gpuKeyCache[layerIdx]);
         attnPB.setLong(3, gpuValueCache[layerIdx]);
+        attnPB.setInt(9, slidingWindowPerLayer[layerIdx]);
         int attnSharedMem = (position + 1 + 32) * Float.BYTES;
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, attnSharedMem, attnPB.ptrs);
 
@@ -1685,6 +1730,7 @@ public class CudaForwardPass implements AutoCloseable {
 
         attnPB.setLong(2, gpuKeyCache[layerIdx]);
         attnPB.setLong(3, gpuValueCache[layerIdx]);
+        attnPB.setInt(9, slidingWindowPerLayer[layerIdx]);
         int attnSharedMem = (position + 1 + 32) * Float.BYTES;
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, attnSharedMem, attnPB.ptrs);
         cudaContext.finish(); t1 = System.nanoTime(); profAttn += t1 - t0; t0 = t1;
@@ -1881,6 +1927,7 @@ public class CudaForwardPass implements AutoCloseable {
         // Full attention (shared mem fixed at maxSeqLen for graph compatibility)
         attnPB.setLong(2, gpuKeyCache[layerIdx]);
         attnPB.setLong(3, gpuValueCache[layerIdx]);
+        attnPB.setInt(9, slidingWindowPerLayer[layerIdx]);
         launchKernel(attentionFullFunc, headCount, (int) attnBlockSize, graphAttnSharedMem, attnPB.ptrs);
 
         // dp4a: pre-quantize gpuXb2 (attention output) → gpuXb2Q8 for the Wo projection

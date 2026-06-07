@@ -162,7 +162,22 @@ public class AnthropicHandler {
         String formattedPrompt = engine.getChatTemplate().formatConversation(messages);
         String cacheKey = computeCacheKey(messages);
 
-        SamplerConfig samplerConfig = new SamplerConfig(temperature, topK, topP, 1.1f, System.nanoTime());
+        // Anthropic spec lacks repetition_penalty / mirostat / min_p — accept them as extension fields
+        // (we already accept top_k which is also an Anthropic extension). Audit MED #6.
+        float repPenalty = body.containsKey("repetition_penalty")
+                ? ((Number) body.get("repetition_penalty")).floatValue() : 1.1f;
+        float minP = body.containsKey("min_p") ? ((Number) body.get("min_p")).floatValue() : 0f;
+        int mirostat = body.containsKey("mirostat") ? ((Number) body.get("mirostat")).intValue() : 0;
+        float mirostatTau = body.containsKey("mirostat_tau") ? ((Number) body.get("mirostat_tau")).floatValue() : 5.0f;
+        float mirostatEta = body.containsKey("mirostat_eta") ? ((Number) body.get("mirostat_eta")).floatValue() : 0.1f;
+        long seed = body.containsKey("seed") ? ((Number) body.get("seed")).longValue() : System.nanoTime();
+
+        SamplerConfig samplerConfig = SamplerConfig.builder()
+                .temperature(temperature).topK(topK).topP(topP)
+                .repetitionPenalty(repPenalty).seed(seed)
+                .minP(minP)
+                .mirostat(mirostat, mirostatTau, mirostatEta)
+                .build();
         GenerationRequest request = GenerationRequest.builder()
                 .prompt(formattedPrompt)
                 .maxTokens(maxTokens)

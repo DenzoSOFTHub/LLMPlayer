@@ -38,20 +38,30 @@ public class InferenceState {
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];
         this.logits = new float[config.vocabSize()];
-        // KV cache mode: FLOAT32 (default) or Q8_0 (via -Dkv.q8=true JVM property).
-        // Q8_0 saves ~72% of KV memory (1.125 vs 4 bytes/elem) with near-zero quality loss,
-        // enabling longer contexts. Only applies to the standard InferenceEngine path.
-        KVCache.Mode kvMode = "true".equals(System.getProperty("kv.q8"))
-            ? KVCache.Mode.Q8_0 : KVCache.Mode.FLOAT32;
-        // Q8_0 requires kvDim divisible by 32; fallback to F32 if this model's kvDim is odd.
+        // KV cache mode: FLOAT32 (default), Q8_0 (-Dkv.q8=true), or Q4_1 (-Dkv.q4=true; takes precedence
+        // when both are set). Q8_0 saves ~72 % KV memory at ~0 quality loss; Q4_1 saves ~81 % at slightly
+        // higher quant noise (val = q*d + m, q in [0,15]). Both are opt-in.
+        KVCache.Mode kvMode;
+        if ("true".equals(System.getProperty("kv.q4"))) {
+            kvMode = KVCache.Mode.Q4_1;
+        } else if ("true".equals(System.getProperty("kv.q8"))) {
+            kvMode = KVCache.Mode.Q8_0;
+        } else {
+            kvMode = KVCache.Mode.FLOAT32;
+        }
         if (kvMode == KVCache.Mode.Q8_0 && kvDim % KVCache.Q8_BLOCK != 0) {
             System.err.println("[kv.q8] kvDim=" + kvDim + " not divisible by "
                 + KVCache.Q8_BLOCK + " — falling back to FLOAT32 KV cache.");
             kvMode = KVCache.Mode.FLOAT32;
         }
+        if (kvMode == KVCache.Mode.Q4_1 && kvDim % KVCache.Q4_BLOCK != 0) {
+            System.err.println("[kv.q4] kvDim=" + kvDim + " not divisible by "
+                + KVCache.Q4_BLOCK + " — falling back to FLOAT32 KV cache.");
+            kvMode = KVCache.Mode.FLOAT32;
+        }
         this.kvCache = new KVCache(config.blockCount(), kvDim, maxSeqLen, kvMode);
-        if (kvMode == KVCache.Mode.Q8_0) {
-            System.out.println("  KV cache: Q8_0 mode (~" + (kvCache.memoryBytes() / (1024 * 1024))
+        if (kvMode != KVCache.Mode.FLOAT32) {
+            System.out.println("  KV cache: " + kvMode + " mode (~" + (kvCache.memoryBytes() / (1024 * 1024))
                 + " MB, vs ~" + (2L * config.blockCount() * maxSeqLen * kvDim * 4 / (1024 * 1024))
                 + " MB in FLOAT32)");
         }

@@ -84,6 +84,8 @@ The grid lookup table is stored in CUDA constant memory for fast cached access a
 | Fused SIMD class | None |
 | CPU dot path | Dequantize to buffer via grid lookup, then SIMD dot |
 
+The v1.12.0 CPU SIMD sweep (which rewrote Q3_K, Q5_0, Q5_K, Q6_K, and Q8_0 using the `ByteVector → IntVector → FloatVector` lane-parallel B2I/I2F pattern) explicitly skipped IQ2_S. The reason is structural: IQ2_S's quantization is grid-based -- each group of 8 weights is reconstructed by looking up a precomputed `IQ2S_GRID` entry indexed by a 10-bit value, then applying explicit sign bits. The B2I pattern depends on lane-parallel `LSHR`/`AND` extraction of fixed-width fields, which does not map directly to a 1024-entry table lookup. Going fully lane-parallel here requires `VectorShuffle.rearrange` over a pre-multiplied table -- not yet implemented. GPU dp4a kernels (where available) cover this gap on supported hardware.
+
 ## Performance Characteristics
 
 IQ2_S achieves extreme compression (2.5625 bpw) through importance-weighted grid quantization. The grid-based approach maps groups of 8 weights to one of 1024 precomputed patterns, which is more expressive than simple scalar quantization at the same bit rate.

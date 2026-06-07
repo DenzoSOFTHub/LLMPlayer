@@ -6,9 +6,75 @@
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
 - **Prompt:** varies per sweep — see each section header
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
-- **Dates:** v1.13.0 GPU sweep 2026-04-17 • v1.12.0 CPU rewrite sweep 2026-04-15 • v1.11.0 GPU sweep 2026-04-14 • older sections carry their own dates
+- **Dates:** v1.14.0-dev GPU sweep 2026-06-07 • v1.13.0 GPU sweep 2026-04-17 • v1.12.0 CPU rewrite sweep 2026-04-15 • v1.11.0 GPU sweep 2026-04-14 • older sections carry their own dates
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## Results v1.14.0-dev — three new architectures (2026-06-07)
+
+Three architectures were added: **ERNIE 4.5** (`ernie4_5`, dense transformer), **LFM2** (`lfm2`, gated short-convolution + GQA hybrid, Liquid AI), and **Falcon-H1** (`falcon-h1`, parallel Mamba-2 + attention hybrid, TII). All produce coherent output with EXCELLENT perplexity on both CPU and GPU.
+
+**Settings:** `--max-tokens 32 --temperature 0`, RTX 4050 Laptop GPU (6 GB) / Core Ultra 7 155H CPU. Prompt: `"The capital of France is"`.
+
+**Measurement caveat (applies to all v1.14.0-dev GPU numbers below):** the RTX 4050 Laptop GPU has ±15-30 % thermal variance run-to-run, so all single-run figures are best-of-N. Only differences of roughly 2× or larger are confidently measurable; smaller deltas should be read as directional.
+
+| Model | Quant | Arch | GPU tok/s | CPU tok/s | PPL | Verdict |
+|-------|-------|------|----------:|----------:|----:|---------|
+| ERNIE-4.5-0.3B-PT | Q8_0 | ernie4_5 | **117–127** | 39.6 | 1.15 | EXCELLENT |
+| LFM2-1.2B | Q8_0 | lfm2 | **~67** ¹ | 23.0 | 1.22–1.55 | EXCELLENT |
+| Falcon-H1-0.5B-Instruct | Q8_0 | falcon-h1 | **40** ¹ | 13.8 | 1.18 | EXCELLENT |
+| Falcon-H1-1.5B-Instruct | Q4_K_M | falcon-h1 | **42** ¹ | 9.3 | 1.02 | EXCELLENT |
+
+¹ Dedicated GPU-resident forward passes were added 2026-06-07 (no longer per-tensor matmul). **`LFM2CudaForwardPass`** raised LFM2-1.2B Q8_0 from ~33 tok/s (per-tensor matmul) → 56 tok/s (FP32 GPU-resident pass, output bit-identical to CPU) → **~67 tok/s with dp4a (default on, +37 % from dp4a)**. **`FalconH1CudaForwardPass`** raised Falcon-H1 from ~12 to **40-42 tok/s (~3×)** (parallel Mamba-2+attention on GPU; 0.5B gate-only & 1.5B gate+norm paths both PPL 0.98-0.99). dp4a for Falcon-H1 is opt-in (`-Dcuda.falcon.dp4a`, measured neutral because per-token cost is dominated by the Mamba-2 scan, so the per-matmul `quantize_q8` launch outweighs the int8 speedup).
+
+**GPU acceleration mode:**
+- **ERNIE 4.5** is a standard dense transformer (RMSNorm + GQA with explicit head_dim=128 + RoPE NORM + SwiGLU, tied embeddings), so it runs through the full CUDA-graph GPU-resident forward pass (`CudaForwardPass`) — the large GPU speedup (~3× over CPU) reflects this.
+- **LFM2** and **Falcon-H1** now each have a dedicated per-layer GPU-resident forward pass (`LFM2CudaForwardPass`, `FalconH1CudaForwardPass`): the short-conv / Mamba-2 scan, attention, RoPE, QK-norm and SwiGLU all run as kernels, with FP32 matmuls and no CUDA graph yet. Both are gated by `isSupported`, falling back to per-tensor matmul when an unsupported tensor mix appears. This mirrors how Nemotron-H / Qwen3.5 graduated from per-tensor to full residency. LFM2 takes the global `cuda.dp4a` path (default on, +37 %); Falcon-H1 keeps dp4a opt-in (`-Dcuda.falcon.dp4a`, measured neutral). CUDA graph capture for both passes remains a future optimization.
+
+### Regression fixed during the v1.14.0 benchmark sweep
+
+The sweep surfaced a hard `cuLaunchKernel` crash (native libcuda SIGSEGV) on **every Nemotron-H, Granite-Hybrid, and Qwen3.5 model on GPU**. Root cause: the v1.13.x sliding-window-attention commit widened `attention.cu`'s `attention_full` kernel from 9 to 10 parameters (added `slidingWindow`) and updated `CudaForwardPass`, but `NemotronHCudaForwardPass` and `Qwen35CudaForwardPass` still allocated a 9-element parameter buffer — so `cuLaunchKernel` read an out-of-bounds 10th pointer. Fixed by widening both buffers to 10 and setting `slidingWindow=0` (these architectures' attention layers are full-attention). Post-fix GPU throughput:
+
+| Model | Arch | Before | After |
+|-------|------|-------:|------:|
+| Nemotron-3-Nano-4B Q4_K_M | nemotron-h | crash | **24.9 tok/s** |
+| Qwen3.5-4B Q4_K_M | qwen35 | crash | **20.7 tok/s** |
+| granite-4.0-h-micro Q4_K_M | granitehybrid | crash | **33.2 tok/s** |
+
+### Granite Hybrid MoE support (granite-4.0-h-tiny)
+
+A broader architecture-coverage sweep found `granite-4.0-h-tiny` producing garbage (PPL 1637) on GPU. It is a **Granite Hybrid MoE** (64 experts, top-6, 1 shared expert, n_embd=1536, routed-expert FFN 512, shared FFN 1024) — the hybrid engine previously handled only the dense integrated FFN, so the MoE FFN was silently skipped. Added MoE FFN support to the CPU `NemotronHInferenceEngine` (`runIntegratedMoEFFN`): softmax → top-K → renormalize → routed experts + shared expert. The dedicated dense GPU forward pass stays disabled for MoE (no GPU expert routing in `NemotronHCudaForwardPass`), so the dense attention/Mamba projections run on the CPU engine with per-tensor GPU matmul.
+
+The expert FFN itself is now GPU-accelerated via **`GraniteExpertGpu`** (`runIntegratedMoEFFN()` does the router softmax → top-K → renormalize on CPU, then `GraniteExpertGpu.computeMoE()` runs the routed + shared experts on GPU). Each expert's 2D slice of the 3D `ffn_*_exps` tensor is matmul'd through an **offset weight pointer**, reusing each tensor's own matmul kernel (works for Q4_K / Q6_K, no new kernel) with dp4a on by default. This is contained — it does not touch the validated dense `NemotronHCudaForwardPass`. Result: **garbage (PPL 1637) → coherent (PPL 0.98 EXCELLENT)**, and throughput went from **~3-4 → ~9-10 tok/s with dp4a (+124 %)**.
+
+### Gemma 4 GPU forward pass (`Gemma4CudaForwardPass`)
+
+The entire Gemma 4 family was CPU-only before this release because of its PLE (Per-Layer Embeddings) architecture. A dedicated GPU-resident forward pass (`Gemma4CudaForwardPass`) now runs the PLE injection, dual head-size attention (256 SWA / 512 full), shared KV cache (the last layers reuse earlier layers' KV), and GeGLU FFN entirely on GPU.
+
+| Model | Quant | Arch | CPU tok/s | GPU tok/s | PPL | Verdict |
+|-------|-------|------|----------:|----------:|----:|---------|
+| gemma-4-E4B-it | Q4_K_M | gemma4 | ~4 | **~18** (~4.5×) | 1.00 | EXCELLENT |
+
+Output matches the CPU forward pass. **Gemma 3n** (which adds AltUp / Laurel / activation sparsity on top of PLE) still runs on CPU — only the simpler Gemma 4 PLE path is GPU-resident so far.
+
+### FP16 KV cache (opt-in, `-Dcuda.kv.fp16`)
+
+A half-precision GPU KV cache that halves KV VRAM with no measurable quality loss. Because the win is bandwidth-bound, it grows with context length and is neutral at very short contexts:
+
+| Model | Quant | Context | Default KV | FP16 KV | Δ |
+|-------|-------|--------:|-----------:|--------:|---:|
+| Llama-3.2-1B | Q4_K_M | ~80 tokens | ~80 tok/s | ~80 tok/s | neutral (within thermal noise) |
+| Llama-3.2-1B | Q4_K_M | ~400 tokens | 74.8 tok/s | **87.6 tok/s** | **+17 %** |
+
+PPL preserved (0.95). Opt-in; the larger the context, the larger the gain.
+
+### Batched GPU verify / speculative decoding (experimental)
+
+Infrastructure for batched GPU verification (`forwardBatch`, the building block for real speculative-decoding speedups) exists but is **gated off** behind `-Dcuda.batched` (default OFF) because of a runtime bug in the batched GPU path. The default `forwardBatch` implementation is the correct sequential loop, so behaviour is unchanged. No speedup is claimed yet; this is recorded only as work-in-progress.
+
+### Coverage-sweep note: large models need `--force`
+
+deepseek2-lite (9.7 GB), phi-4 (8.5 GB), and sonar-oss-20b (12 GB) initially showed as "FAIL" in the non-interactive sweep — they trigger the `"This configuration is not recommended. Continue? [y/N]"` RAM/swap safety prompt, which auto-aborts with no stdin. They are **not** broken: with `--force`/`-y` they run correctly (e.g. DeepSeek-Coder-V2-Lite Q4_K_M → "Paris", PPL 0.94, 4.4 tok/s). Benchmark scripts should pass `--force` for models that approach the RAM/VRAM budget.
 
 ## Results v1.13.0 — GPU sweep (2026-04-17)
 
@@ -126,7 +192,7 @@ Q4_K_M control models also show jumps vs v1.10.1 single-model numbers — the dp
 
 **Granite Hybrid validation:** paired CPU/GPU dumps via `-Ddebug.iffn=true` (debug scaffolding since removed) confirmed bit-equivalence to ±2 ULP at every layer stage when dp4a is disabled. With dp4a on, the ~1-15% per-layer divergence is the expected Q8_1 quantization noise — final output hash is deterministic across all 3 runs (`780d62a7` for granite-4.0-h-micro, `ea7d3497` for granite-4.0-h-tiny).
 
-**Speculative decoding** (`SpeculativeDecoder`, `--draft-model`) — sequential verification only, ~1.14× max at K=4. Real speedup awaits a `forwardBatch` API.
+**Speculative decoding** (`SpeculativeDecoder`, `--draft-model`) — sequential verification only, ~1.14× max at K=4. A `forwardBatch` API now exists for batched GPU verification, but the batched GPU path is gated off (`-Dcuda.batched`, default OFF) pending a runtime-bug fix; the default `forwardBatch` is the correct sequential loop, so no real speedup is claimed yet (see the v1.14.0-dev "Batched GPU verify" subsection).
 
 See `docs/optimization/llamacpp-comparison.md` for the rolling comparison vs llama.cpp across 17 models.
 
@@ -247,7 +313,7 @@ Prompt: `"Explain photosynthesis briefly"`. Single-run per model (no warm-up), c
 
 ★ `granite-3.3-2B` was re-run with a shorter prompt (`"Hi"`, 10 tokens); it timed out at the 30-token harness budget on the cold run, reflecting its heavier scale-factor arithmetic on CPU rather than a quality issue.
 
-**Skipped for time budget / size:** DeepSeek-Coder-V2-Lite (9.7G, MoE MLA), Qwen3-Coder-30B-A3B (17G, MoE), GLM-4.7-Flash (17G), Qwen2.5-Coder-32B (18G), Devstral-24B (13G), GLM-4-32B (18G), MiniMax-55B (22G), gemma-3n-E4B and gemma-4-E4B (CPU-only PLE path, runs but at ~0.5-1 tok/s), qwen2.5-coder-14b variants.
+**Skipped for time budget / size:** DeepSeek-Coder-V2-Lite (9.7G, MoE MLA), Qwen3-Coder-30B-A3B (17G, MoE), GLM-4.7-Flash (17G), Qwen2.5-Coder-32B (18G), Devstral-24B (13G), GLM-4-32B (18G), MiniMax-55B (22G), gemma-3n-E4B and gemma-4-E4B (PLE path; ~0.5-1 tok/s on CPU — gemma-4 has since gained a GPU forward pass, see the v1.14.0-dev "Gemma 4 GPU forward pass" subsection), qwen2.5-coder-14b variants.
 
 ### Observations
 
@@ -535,7 +601,7 @@ Key changes vs v1.8.0:
 | Model / Quant | Issue | Status |
 |---------------|-------|--------|
 | Command-R/Cohere (Aya-23) | CUDA forward pass not supported | Per-tensor CUDA matmul fallback |
-| Gemma 4 / Gemma 3n (PLE) | CUDA forward pass not yet implemented | CPU forward pass with per-tensor CUDA matmul |
+| Gemma 3n (AltUp/Laurel) | CUDA forward pass not yet implemented | CPU forward pass with per-tensor CUDA matmul |
 | IQ3_XXS GGUF models | Mixed quant types (IQ2_S for Q/K, IQ3_S for Wo) — no CUDA kernels | Per-tensor CUDA for IQ3_XXS tensors only |
 | Granite Hybrid (Mamba-2) | CUDA graph not yet supported (DtoD copies) | Per-layer GPU forward pass |
 | 32B+ models on 8 GB RAM | Timeout due to excessive swap | Requires 16+ GB RAM |

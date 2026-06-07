@@ -155,6 +155,7 @@ public class InferenceEngine {
             return false;
         } catch (Exception e) {
             System.out.println("GPU chain (" + label + "): initialization failed — " + e.getMessage());
+            if ("true".equals(System.getProperty("cuda.debug", "false"))) e.printStackTrace();
             return false;
         }
     }

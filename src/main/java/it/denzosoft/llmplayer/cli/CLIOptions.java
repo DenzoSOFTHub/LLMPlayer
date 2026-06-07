@@ -37,6 +37,7 @@ public class CLIOptions {
     private int gpuDeviceId;
     private boolean gpuList;
     private int gpuLayers = -1;
+    private Boolean moeOptimized = null;       // null = auto-detect (MoE arch + VRAM fit), TRUE/FALSE = explicit
     private boolean gpuChainEnabled = true;  // GPU kernel chaining (default: enabled)
     private String gpuBackend = "auto";      // auto, cuda, opencl
     private String gpuMemoryMode = "device"; // device, managed, host-mapped
@@ -127,6 +128,10 @@ public class CLIOptions {
                 opts.gpuDeviceId = Integer.parseInt(args[++i]);
             } else if ("--gpu-layers".equals(arg)) {
                 opts.gpuLayers = Integer.parseInt(args[++i]);
+            } else if ("--moe-optimized".equals(arg)) {
+                opts.moeOptimized = Boolean.TRUE;
+            } else if ("--no-moe-optimized".equals(arg)) {
+                opts.moeOptimized = Boolean.FALSE;
             } else if ("--gpu-list".equals(arg)) {
                 opts.gpuList = true;
             } else if ("--gpu-chain".equals(arg)) {
@@ -226,6 +231,7 @@ public class CLIOptions {
     public boolean isGpuList() { return gpuList; }
     public boolean isNoGpu() { return noGpu; }
     public int getGpuLayers() { return gpuLayers; }
+    public Boolean getMoeOptimized() { return moeOptimized; }
     public boolean isGpuChainEnabled() { return gpuChainEnabled; }
     public String getGpuBackend() { return gpuBackend; }
     public String getGpuMemoryMode() { return gpuMemoryMode; }
@@ -288,6 +294,8 @@ public class CLIOptions {
         System.out.println("  --no-gpu                 Disable GPU, CPU only");
         System.out.println("  --gpu-device <id>        Select GPU device by index (default: best)");
         System.out.println("  --gpu-layers <n>         GPU layers: -1=auto, 0=all, N=first N (default: -1)");
+        System.out.println("  --moe-optimized          Force MoE-optimized GPU placement (attention on GPU, experts on CPU)");
+        System.out.println("  --no-moe-optimized       Force first-N-layers GPU placement even for MoE models");
         System.out.println("  --gpu-list               List available GPU devices and exit");
         System.out.println("  --gpu-chain              Enable GPU kernel chaining (default: on)");
         System.out.println("  --no-gpu-chain           Disable GPU kernel chaining");

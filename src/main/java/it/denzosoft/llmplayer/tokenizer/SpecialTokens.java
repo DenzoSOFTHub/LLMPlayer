@@ -83,7 +83,8 @@ public class SpecialTokens {
                 "<|end_of_turn|>",    // some Gemma variants
                 "<|end|>",            // GPT-OSS / Phi
                 "<|eot_id|>",         // Llama 3 / SmolLM3
-                "<|im_end|>",         // Qwen / ChatML
+                "<|im_end|>",         // Qwen / ChatML / LFM2 / Falcon-H1
+                "<|end_of_sentence|>",// ERNIE 4.5
                 "<|endoftext|>"       // GPT-2 family fallback
             };
             for (String name : candidates) {

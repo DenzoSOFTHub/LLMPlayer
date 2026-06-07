@@ -65,10 +65,17 @@ The zero-point of 32 centers the 6-bit range, giving an effective signed range o
 
 | Property | Value |
 |----------|-------|
-| Kernel file | `matmul_q6_k.cu` |
-| Strategy | **Coalesced kernel** (restructured in v1.4.0) |
+| Kernel file (default) | `matmul_q6_k.cu` |
+| Kernel file (tiled smem) | `matmul_q6_k_tiled.cu` -- default-on via `-Dcuda.q6k.tiled=true`, +9 % throughput, 256-element tiles in shared memory |
+| Kernel file (smem variant) | `matmul_q6_k_smem.cu` -- alternative shared-memory variant, opt-in via `-Dcuda.q6k.smem=true` |
+| Kernel file (dp4a) | `matmul_q6_k_dp4a.cu` -- **opt-in only** via `-Dcuda.dp4a.q6=true`, default OFF |
+| Strategy | **Coalesced kernel** (restructured in v1.4.0), tiled shared-memory variant by default |
 | Key optimization | All 32 warp threads process the same half-block with consecutive byte addresses |
 | Alignment | 210 bytes -- NOT 4-byte aligned, uses byte-level `__ldg` |
+
+### Why Q6_K dp4a stays opt-in
+
+The Q6_K dp4a kernel exists and is bit-equivalent to the FP32 fallback (the 2026-04-14 rewrite verified this), but on the same RTX 4050 reference hardware it measures **slower** than the FP32 kernel (70.6 vs 72.85 tok/s on Llama-1B). The Q6_K block is 210 bytes (not 4-byte aligned), so the dp4a kernel is forced to use byte loads -- and that load overhead overwhelms the int8 multiply-accumulate savings. The kernel is retained for correctness checks and for future hardware where the trade-off might flip. This is the same alignment problem that made the IQ4_NL shared-memory variant a wash; Q3_K's dp4a (also 110 bytes, not aligned) won despite the byte-load penalty because its scale decode is much cheaper.
 
 ### Performance Impact
 
