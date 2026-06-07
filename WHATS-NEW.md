@@ -1,8 +1,8 @@
 # LLMPlayer — What's New
 
-## v1.14.0-dev — GPU forward passes for LFM2/Falcon-H1/Gemma 4, dp4a, FP16 KV, batched-verify scaffolding (2026-06-07)
+## v1.14.0 — GPU forward passes for LFM2/Falcon-H1/Gemma 4, dp4a, FP16 KV, batched-verify scaffolding (2026-06-07)
 
-A second round of GPU work for the v1.14.0-dev cycle, focused on closing the GPU coverage gaps left open by the first round (the three new architectures below) and on new opt-in throughput/memory features. Every item was benched on RTX 4050 and verified against the CPU path where applicable.
+A second round of GPU work for the v1.14.0 cycle, focused on closing the GPU coverage gaps left open by the first round (the three new architectures below) and on new opt-in throughput/memory features. Every item was benched on RTX 4050 and verified against the CPU path where applicable.
 
 ### GPU-resident forward passes for LFM2 and Falcon-H1
 
@@ -49,7 +49,7 @@ The GPU KV cache can now be stored as 16-bit half precision (Q, attention scores
 
 Groundwork for real speculative-decoding verification. There is a new batched Q4_K dp4a matmul kernel (`matmul_q4_k_dp4a_batched.cu`) that reads each weight row once and reuses it across K inputs, plus a `BatchedCudaForwardPass` (the K-query attention needs no new kernel — each query runs `attention_full` at its own position once all K KV entries are written). The batched path currently fails at the quantize launch with CUDA error 400 when it shares the context with the single-token pass, so it is gated off; the default `forwardBatch` remains the correct sequential `forwardSingleToken` loop. The kernel itself is correct standalone — the remaining work is the runtime sharing bug and the full `SpeculativeDecoder` KV-cache sharing.
 
-## v1.14.0-dev — three new architectures: ERNIE 4.5, LFM2, Falcon-H1 (2026-06-07)
+## v1.14.0 — three new architectures: ERNIE 4.5, LFM2, Falcon-H1 (2026-06-07)
 
 Three more GGUF architectures are supported (24 total), each validated on CPU and GPU with EXCELLENT perplexity:
 
@@ -67,7 +67,7 @@ The sweep surfaced a hard native `cuLaunchKernel` crash (libcuda SIGSEGV) affect
 
 The coverage sweep also found `granite-4.0-h-tiny` emitting garbage (PPL 1637) — it is a **Granite Hybrid MoE** (64 experts, top-6, shared expert) and the hybrid engine only handled the dense integrated FFN, silently skipping the MoE FFN. Added MoE FFN support to the CPU hybrid engine (router → softmax → top-K → routed experts + shared expert); the GPU-resident forward pass is disabled for MoE so the model runs on the CPU engine with per-tensor GPU matmul for the dense projections. Result: garbage → coherent (PPL 0.98 EXCELLENT). (The three large dense models that showed as "FAIL" in the sweep — deepseek2-lite, phi-4, sonar-oss-20b — were false alarms: they hit the interactive RAM-safety prompt and run fine with `--force`.)
 
-## v1.14.0-dev (in progress) — audit fixes, CUDA SWA, Q4_1 KV cache
+## v1.14.0 — audit fixes, CUDA SWA, Q4_1 KV cache
 
 A full LLM-engine audit run after the v1.13.0 release surfaced one HIGH correctness bug, several MEDIUM items, and one concrete optimization opportunity worth shipping. Each item below was implemented, verified against the previous behavior, and where applicable benched with a before/after comparison.
 
@@ -324,7 +324,7 @@ Granite Hybrid is now the headline architectural win of v1.11.0-dev. Combined wi
 
 ### Speculative decoding — scaffolding only
 
-New `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al. 2023). Standalone class that drives a target + draft `LLMEngine` pair via `forwardSingleToken`, using rejection sampling. Enabled with `--draft-model <gguf>`. **Current implementation is sequential verification** — the target runs K separate forwards to verify K draft tokens. Maximum theoretical speedup at K=4 with ratio 0.1: ~1.14×. Real 2-3× speedup requires a batched `forwardBatch(tokens, startPos)` API. Experimental batched infrastructure now exists (a batched Q4_K dp4a kernel plus `BatchedCudaForwardPass`, behind `-Dcuda.batched`) but is gated off pending a runtime fix — see the v1.14.0-dev GPU section at the top of this file. See `docs/optimization/speculative-decoding.md`.
+New `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al. 2023). Standalone class that drives a target + draft `LLMEngine` pair via `forwardSingleToken`, using rejection sampling. Enabled with `--draft-model <gguf>`. **Current implementation is sequential verification** — the target runs K separate forwards to verify K draft tokens. Maximum theoretical speedup at K=4 with ratio 0.1: ~1.14×. Real 2-3× speedup requires a batched `forwardBatch(tokens, startPos)` API. Experimental batched infrastructure now exists (a batched Q4_K dp4a kernel plus `BatchedCudaForwardPass`, behind `-Dcuda.batched`) but is gated off pending a runtime fix — see the v1.14.0 GPU section at the top of this file. See `docs/optimization/speculative-decoding.md`.
 
 ### New optimization journal — `docs/optimization/`
 
