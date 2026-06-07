@@ -277,6 +277,9 @@ public class CudaForwardPass implements AutoCloseable {
     // a quantize_q8 kernel converts it to Q8_1 in a scratch buffer, then matmuls whose
     // weight type is Q4_K/Q5_K/Q6_K read the Q8_1 input and use __dp4a int8x4 dot product.
     private final boolean useDp4a;
+    // FP16 KV cache (opt-in): K/V stored as __half to halve attention read bandwidth. Inline-init
+    // so it is set before the constructor body allocates the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
     private final long gpuXbQ8;        // Q8_1 buffer for gpuXb input (size: dim/32 * 40)
     private final long gpuXb2Q8;       // Q8_1 buffer for gpuXb2 input (size: qDim/32 * 40)
     private final long gpuHbQ8;        // Q8_1 buffer for gpuHb input (size: ffnDim/32 * 40)
@@ -405,10 +408,11 @@ public class CudaForwardPass implements AutoCloseable {
         // Determine how many layers are on GPU (partial offload support)
         this.gpuLayerCount = countGpuLayers(weights);
 
-        // Allocate GPU KV cache (only for GPU layers)
+        // Allocate GPU KV cache (only for GPU layers). FP16 (-Dcuda.kv.fp16) halves the KV read
+        // bandwidth during attention; K/V stored as __half, Q/scores/output stay FP32.
         gpuKeyCache = new long[gpuLayerCount];
         gpuValueCache = new long[gpuLayerCount];
-        long kvLayerBytes = (long) maxSeqLen * kvDim * fb;
+        long kvLayerBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
         for (int i = 0; i < gpuLayerCount; i++) {
             gpuKeyCache[i] = bufferManager.createBuffer(kvLayerBytes);
             gpuValueCache[i] = bufferManager.createBuffer(kvLayerBytes);
@@ -510,8 +514,14 @@ public class CudaForwardPass implements AutoCloseable {
         rmsnormFusedFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         ropeFunc = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        if (useFp16Kv) {
+            kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16");
+            attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "attention_full_f16");
+            System.err.println("CUDA: FP16 KV cache enabled (-Dcuda.kv.fp16)");
+        } else {
+            kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
+            attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        }
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         argmaxPartialFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_partial");
         argmaxFinalFunc = cudaContext.compileKernel("kernels/cuda/argmax.cu", "argmax_final");
