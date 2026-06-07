@@ -403,6 +403,23 @@ Added an int8 dp4a path (quantize FP32 input → Q8_1, then per-type dp4a matmul
 
 **Still future:** CUDA graph capture for the LFM2/Falcon passes (amortizes per-launch overhead; estimated ~+8-10 % given ~240 kernel launches/token — modest, and needs fixed-max attention shared-mem handling like `NemotronHCudaForwardPass.graphAttnSharedMem`). The small per-op CPU/GPU SIMD tweaks (grouped-norm, per-head QK-norm, conv-gating) were measured/estimated <2 % and are not worth the complexity given the thermal-noise floor.
 
+### 360° analysis round — three more wins (2026-06-07)
+
+A second pass ran a six-agent 360° analysis across all 24 architectures, explicitly excluding the dead-listed and already-done items. It discarded roughly twenty candidate items as already-captured, dead, or below the ±15-30 % thermal-noise floor (RoPE/QK-norm fusion, per-(arch,quant,dim) launch tuning, IQ3/Q2_K SIMD on unused models, KV-layout transpose, head-major KV, etc.), and surfaced the genuine remaining levers. Three were implemented:
+
+| Optimization | Result | Status |
+|---|---|---|
+| **Gemma 4 GPU forward pass** (`Gemma4CudaForwardPass`) | gemma-4-E4B-it Q4_K_M **~4 → ~18 tok/s (~4.5×)**, PPL 1.00, output matches CPU | DONE — biggest single win (the whole Gemma 4 family was CPU-only) |
+| **FP16 KV cache** (`-Dcuda.kv.fp16`) | Llama-3.2-1B Q4_K_M ~400-token context **74.8 → 87.6 tok/s (+17 %)**, grows with context; neutral at short context; KV VRAM halved; PPL preserved | DONE — opt-in (default off) |
+| **Batched `forwardBatch` / speculative verify** (`-Dcuda.batched`) | infrastructure built (`matmul_q4_k_dp4a_batched.cu` + `BatchedCudaForwardPass`); batched path hits CUDA error 400 at the quantize launch when sharing the context with the single-token pass | EXPERIMENTAL — gated off; default `forwardBatch` stays the correct sequential loop |
+
+Notes on the two shipped wins:
+- **Gemma 4** needed only one new kernel (`gelu.cu`). V-norm reuses `rmsnorm_per_head` with a ones-vector, and Gemma's attention scale of 1.0 is obtained by pre-scaling Q by √headSize so the attention kernel's hardcoded 1/√headSize cancels. PLE projections (`pleInpGate`/`pleProj`) stay GPU-resident; `pleCombined` is computed on CPU once per token and uploaded. Gemma 3n's AltUp/Laurel path remains on CPU.
+- **FP16 KV** stores K/V as 16-bit half (Q/scores/output stay FP32) using inline-PTX `cvt.f32.f16`/`cvt.rn.f16.f32` — deliberately *not* `cuda_fp16.h`, because NVRTC has no CUDA-toolkit include path configured (`#include <cuda_fp16.h>` fails "no directories in search list"); the inline-PTX route keeps the engine driver-only. The win scales with context length (KV reads are negligible at ~80 tokens, dominant at thousands).
+- **forwardBatch** is the one that needed a genuinely new batched kernel suite rather than reusing existing kernels — its K-query attention is free (per-query `attention_full` at each position after all K KV are written), but the batched matmul (read each weight row once, K dp4a dots) is new. The remaining work is the context/launch 400 bug and full SpeculativeDecoder KV-sharing (the batched pass owns its KV and cannot interleave with `forwardSingleToken`).
+
+Also fixed during this round: the **Qwen3-Coder-30B GPU crash** — `ExpertGpuCache` runs the `matmul_mxfp4` kernel and was being initialized for non-MXFP4 (Q4_K) experts, hitting a runtime cache error and a corrupted CPU fallback; it is now gated to MXFP4 experts, so Q4_K MoE models use the CPU expert path with attention still GPU-resident.
+
 ## Project policy going forward
 
 - **Default config**: dp4a Q4_K + dp4a Q5_K. No Q6_K dp4a (slower than FP32). No multi-warp / fused / cp.async / mmvq port. Standard launch params (blockDim=256, 8 rows/block).

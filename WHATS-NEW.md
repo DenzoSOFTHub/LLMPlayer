@@ -1,5 +1,54 @@
 # LLMPlayer — What's New
 
+## v1.14.0-dev — GPU forward passes for LFM2/Falcon-H1/Gemma 4, dp4a, FP16 KV, batched-verify scaffolding (2026-06-07)
+
+A second round of GPU work for the v1.14.0-dev cycle, focused on closing the GPU coverage gaps left open by the first round (the three new architectures below) and on new opt-in throughput/memory features. Every item was benched on RTX 4050 and verified against the CPU path where applicable.
+
+### GPU-resident forward passes for LFM2 and Falcon-H1
+
+The first v1.14 round left LFM2 and Falcon-H1 on a per-tensor GPU matmul path with the conv / Mamba-2 scan on CPU, and called a dedicated GPU-resident forward pass "a future optimization". That optimization is now done.
+
+- **`LFM2CudaForwardPass`** keeps every layer GPU-resident for the gated short-convolution and GQA attention mixers — the conv, attention, RoPE, QK-norm, and SwiGLU all run as kernels and the activations never leave the GPU between layers. It reuses existing kernels (`conv1d_short`, `attention_full`, `rope_apply`, `rmsnorm_per_head`, `silu_mul`, `elementwise_mul`). Throughput goes from ~33 to **56 tok/s**, with output bit-identical to the CPU path.
+- **`FalconH1CudaForwardPass`** runs the parallel Mamba-2 + attention design on GPU: both paths run as kernels on the shared pre-normed input, their outputs are summed, then the SwiGLU FFN. It reuses `mamba2_scan`, `conv1d_short`, `mamba2_dt_softplus`, `mamba2_gate_norm`, `attention_full`, and `rope_apply`, taking the gate-only path when `ssm_norm` is absent (0.5B) and the grouped-norm path when present (1.5B). Throughput goes from ~12 to **40–42 tok/s** (~3×), PPL 0.98–0.99.
+
+Both passes are gated by an `isSupported` check with a per-tensor fallback for unsupported configurations, and both use FP32 matmuls plus int8 dp4a (see below).
+
+### dp4a (int8) on the new forward passes
+
+Both new passes can quantize their FP32 activations to Q8_1 and then use the per-type dp4a matmul kernels for the eligible weight types, the same path the standard forward pass already uses.
+
+- **LFM2: +37 %** (48.8 → 66.8 tok/s) — default-on under the global `-Dcuda.dp4a` flag.
+- **Granite Hybrid MoE experts: +124 %** (4.5 → 10.1 tok/s) — also default-on under `-Dcuda.dp4a`.
+- **Falcon-H1** is the exception and is made opt-in via `-Dcuda.falcon.dp4a` (default off). Falcon-H1's per-token cost is dominated by the Mamba-2 scan plus a large number of small matmuls, so the extra per-matmul `quantize_q8` launch outweighs the int8 speedup; it measured neutral-to-slower on the RTX 4050.
+
+### Granite Hybrid MoE — GPU experts (`GraniteExpertGpu`)
+
+Granite Hybrid MoE models (e.g. `granite-4.0-h-tiny`: 64 experts, top-6, shared expert) previously ran their expert FFN entirely on the CPU. `GraniteExpertGpu` moves the routed and shared experts onto the GPU: each expert's 2-D slice of the 3-D `ffn_*_exps` tensor is matmul'd with an offset weight pointer (`getGpuWeights() + e·(getWeightsBytes()/expertCount)`), reusing each tensor's own matmul kernel — so there is no new kernel and it works for Q4_K and Q6_K experts alike. The router softmax → top-K → renormalize stays on the CPU. `granite-4.0-h-tiny` goes from ~3–4 to **~9–10 tok/s**, PPL 0.98. The change is fully contained — it does not touch the validated `NemotronHCudaForwardPass` dense path, which still handles attention and Mamba on GPU.
+
+### Gemma 4 — full GPU forward pass (`Gemma4CudaForwardPass`)
+
+The Gemma 4 PLE path ran 100 % on the CPU. `Gemma4CudaForwardPass` makes it fully GPU-resident, handling all of the architecture's quirks on the GPU:
+
+- dual per-layer head size (256 for sliding-window layers, 512 for full-attention layers) and dual RoPE,
+- shared KV cache (the last layers reuse earlier layers' KV),
+- GeGLU FFN,
+- PLE injection — `pleCombined` is uploaded once per token and the per-layer `inp_gate` / `proj` matmuls run on GPU,
+- the per-layer `layer_output_scale.weight` scalar.
+
+It needs only one new kernel (`gelu.cu`); V-norm is implemented via `rmsnorm_per_head` against a ones vector; and Gemma's attention scale of 1.0 is obtained by pre-scaling Q by `sqrt(headSize)` so the kernel's hardcoded `1/sqrt(headSize)` cancels. Throughput goes from ~4 to **~18 tok/s** (~4.5×), PPL 1.00, output matching the CPU path. Gemma 3n's AltUp path remains on the CPU.
+
+### FP16 KV cache (opt-in, `-Dcuda.kv.fp16`)
+
+The GPU KV cache can now be stored as 16-bit half precision (Q, attention scores, and output stay FP32), halving both KV read bandwidth and KV VRAM. A new `attention_f16.cu` kernel does the conversions inline with PTX (`cvt.f32.f16` / `cvt.rn.f16.f32`), so there is no dependency on `cuda_fp16.h` and NVRTC needs no CUDA-toolkit include path — the engine stays driver-only. On Llama-3.2-1B at a ~400-token context, throughput goes from 74.8 to **87.6 tok/s (+17 %)**, and the gain grows with context length; it is neutral at short context, and PPL is preserved. Default off to keep bit-exactness for regression testing.
+
+### Qwen3-Coder-30B GPU fix
+
+`ExpertGpuCache` (which is `matmul_mxfp4`-only) was being initialized for non-MXFP4 (Q4_K) experts, which crashed Qwen3-Coder-30B on GPU. It is now gated to MXFP4 experts only, so Q4_K MoE models use the CPU expert path while attention stays GPU-resident.
+
+### Batched `forwardBatch` — experimental scaffolding (`-Dcuda.batched`, default off)
+
+Groundwork for real speculative-decoding verification. There is a new batched Q4_K dp4a matmul kernel (`matmul_q4_k_dp4a_batched.cu`) that reads each weight row once and reuses it across K inputs, plus a `BatchedCudaForwardPass` (the K-query attention needs no new kernel — each query runs `attention_full` at its own position once all K KV entries are written). The batched path currently fails at the quantize launch with CUDA error 400 when it shares the context with the single-token pass, so it is gated off; the default `forwardBatch` remains the correct sequential `forwardSingleToken` loop. The kernel itself is correct standalone — the remaining work is the runtime sharing bug and the full `SpeculativeDecoder` KV-cache sharing.
+
 ## v1.14.0-dev — three new architectures: ERNIE 4.5, LFM2, Falcon-H1 (2026-06-07)
 
 Three more GGUF architectures are supported (24 total), each validated on CPU and GPU with EXCELLENT perplexity:
@@ -8,7 +57,7 @@ Three more GGUF architectures are supported (24 total), each validated on CPU an
 - **LFM2** (`lfm2`, Liquid AI) — hybrid of gated short-convolution mixers and GQA attention mixers (10 conv / 6 attention layers for the 1.2B), each with a SwiGLU FFN. The short-conv mixer splits an `in_proj` into `[b|c|x]`, gates `bx = b*x`, runs a depthwise causal conv1d (width 3, rolling state 2), gates `y = c*conv_out`, and projects out. Attention layers use per-head QK-norm + RoPE NEOX. **27–33 tok/s** for the 1.2B.
 - **Falcon-H1** (`falcon-h1`, TII) — parallel hybrid: every layer runs a GQA attention path **and** a Mamba-2 SSM path on the same pre-normed input, sums their outputs, then a SwiGLU FFN. The HF channel/attention multiplier scalars are baked into the GGUF weights at conversion, so the forward pass applies none. Grouped `ssm_norm` is present on the 1.5B (absent on the 0.5B). Validated on both 0.5B (PPL 1.18) and 1.5B (PPL 1.02).
 
-LFM2 and Falcon-H1 currently use per-tensor GPU matmul (linear projections on GPU; the conv / Mamba-2 scan on CPU); a dedicated GPU-resident forward pass for the conv/SSM mixers is a future optimization.
+LFM2 and Falcon-H1 originally shipped with per-tensor GPU matmul (linear projections on GPU; the conv / Mamba-2 scan on CPU). Dedicated GPU-resident forward passes for both (`LFM2CudaForwardPass` and `FalconH1CudaForwardPass`) landed in the second v1.14 GPU round — see the section at the top of this file for the per-layer details and measured numbers.
 
 ### Regression fix found during the new-arch benchmark sweep — GPU crash on Nemotron-H / Granite-Hybrid / Qwen3.5
 
@@ -275,7 +324,7 @@ Granite Hybrid is now the headline architectural win of v1.11.0-dev. Combined wi
 
 ### Speculative decoding — scaffolding only
 
-New `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al. 2023). Standalone class that drives a target + draft `LLMEngine` pair via `forwardSingleToken`, using rejection sampling. Enabled with `--draft-model <gguf>`. **Current implementation is sequential verification** — the target runs K separate forwards to verify K draft tokens. Maximum theoretical speedup at K=4 with ratio 0.1: ~1.14×. Real 2-3× speedup requires a batched `forwardBatch(tokens, startPos)` API that does not exist yet. See `docs/optimization/speculative-decoding.md`.
+New `it.denzosoft.llmplayer.spec.SpeculativeDecoder` (Leviathan et al. 2023). Standalone class that drives a target + draft `LLMEngine` pair via `forwardSingleToken`, using rejection sampling. Enabled with `--draft-model <gguf>`. **Current implementation is sequential verification** — the target runs K separate forwards to verify K draft tokens. Maximum theoretical speedup at K=4 with ratio 0.1: ~1.14×. Real 2-3× speedup requires a batched `forwardBatch(tokens, startPos)` API. Experimental batched infrastructure now exists (a batched Q4_K dp4a kernel plus `BatchedCudaForwardPass`, behind `-Dcuda.batched`) but is gated off pending a runtime fix — see the v1.14.0-dev GPU section at the top of this file. See `docs/optimization/speculative-decoding.md`.
 
 ### New optimization journal — `docs/optimization/`
 
