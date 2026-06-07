@@ -110,6 +110,19 @@ public class Qwen3MoEInferenceEngine {
      */
     public void initExpertGpuCache(Object cudaContext, long maxCacheBytes) {
         try {
+            // ExpertGpuCache runs the matmul_mxfp4 kernel — it is only valid for MXFP4 experts.
+            // For other expert quant types (e.g. Q4_K in Qwen3-Coder-30B) initializing it leads to a
+            // runtime cache error and a corrupted CPU fallback (IndexOutOfBounds). Skip it for
+            // non-MXFP4 experts: the CPU expert path handles those correctly (attention still on GPU).
+            it.denzosoft.llmplayer.tensor.GGMLType expertType = null;
+            for (Qwen3MoELayerWeights lw : weights.layers()) {
+                if (lw.ffnGateExps() != null) { expertType = lw.ffnGateExps().type(); break; }
+            }
+            if (expertType != it.denzosoft.llmplayer.tensor.GGMLType.MXFP4) {
+                System.out.println("  Expert GPU cache: experts are " + expertType
+                    + " (not MXFP4) — using CPU expert path");
+                return;
+            }
             int expertFfnDim = config.expertFfnLength();
             int dim = config.embeddingLength();
             long elementsPerSlice = (long) expertFfnDim * dim;
