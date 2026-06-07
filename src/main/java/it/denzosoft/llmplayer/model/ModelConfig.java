@@ -63,6 +63,11 @@ public final class ModelConfig {
     private int[] perLayerKvHeads;    // 0=Mamba/FFN, >0=attention
     private int[] perLayerFfnLength;  // 0=Mamba/attention, >0=FFN
 
+    // Granite Hybrid MoE: shared-expert FFN length (mutable — set after construction)
+    private int expertSharedFeedForwardLength;
+    public int expertSharedFeedForwardLength() { return expertSharedFeedForwardLength; }
+    public void setExpertSharedFeedForwardLength(int v) { this.expertSharedFeedForwardLength = v; }
+
     // Gemma 4: per-layer sliding window pattern and PLE config (mutable — set after construction)
     private boolean[] slidingWindowPattern; // true=SWA, false=full attention per layer
     private int sharedKvLayers;             // number of top layers sharing KV cache
@@ -235,6 +240,11 @@ public final class ModelConfig {
         return (perLayerKvHeads != null && layer < perLayerKvHeads.length) ? perLayerKvHeads[layer] : headCountKV;
     }
 
+    /** LFM2: a layer is GQA attention when its per-layer kv-head count > 0, else a short-conv layer. */
+    public boolean lfm2IsAttentionLayer(int layer) {
+        return perLayerKvHeads != null && layer < perLayerKvHeads.length && perLayerKvHeads[layer] > 0;
+    }
+
     public int nemotronLayerFfnLength(int layer) {
         return (perLayerFfnLength != null && layer < perLayerFfnLength.length) ? perLayerFfnLength[layer] : intermediateSize;
     }
@@ -301,13 +311,15 @@ public final class ModelConfig {
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
                 || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
                 || arch == ModelArchitecture.GRANITE || arch == ModelArchitecture.GEMMA4
-                || arch == ModelArchitecture.GEMMA3N) {
+                || arch == ModelArchitecture.GEMMA3N
+                || arch == ModelArchitecture.ERNIE4_5) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
                 || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
                 || arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.OLMO2
                 || arch == ModelArchitecture.GPT_OSS
-                || arch == ModelArchitecture.GRANITE_HYBRID) {
+                || arch == ModelArchitecture.GRANITE_HYBRID
+                || arch == ModelArchitecture.LFM2 || arch == ModelArchitecture.FALCON_H1) {
             ropeType = 2;  // ROPE_TYPE_NEOX
         } else if (arch == ModelArchitecture.QWEN35) {
             ropeType = 2;  // ROPE_TYPE_NEOX (IMROPE uses split-half pairing like NEOX)
@@ -361,6 +373,8 @@ public final class ModelConfig {
         int expertUsedCount = metadata.getInt(prefix + "expert_used_count", 0);
         int expertSharedCount = metadata.getInt(prefix + "expert_shared_count", 0);
         int expertFfnLength = metadata.getInt(prefix + "expert_feed_forward_length", 0);
+        // Granite Hybrid MoE: shared-expert FFN size is given directly (no expert_shared_count key).
+        int expertSharedFfnLength = metadata.getInt(prefix + "expert_shared_feed_forward_length", 0);
 
         // Dense/MoE split: default to 0 dense blocks when experts are present
         int defaultDenseBlocks = (expertCount > 0) ? 0 : blockCount;
@@ -411,6 +425,11 @@ public final class ModelConfig {
         int ssmInnerSize = metadata.getInt(prefix + "ssm.inner_size", 0);
         int fullAttentionInterval = metadata.getInt(prefix + "full_attention_interval", 0);
 
+        // LFM2 short convolution: reuse ssmConvKernel field to carry shortconv.l_cache (kernel width).
+        if (arch == ModelArchitecture.LFM2) {
+            ssmConvKernel = metadata.getInt(prefix + "shortconv.l_cache", 3);
+        }
+
         // iRoPE / NoPE: every Nth layer is a NoPE (no RoPE) layer
         // Default 4 for Llama4 and SmolLM3 (layers where layer % 4 == 3 skip RoPE), 0 for all others
         int noRopeLayerInterval = (arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3) ? 4 : 0;
@@ -443,6 +462,8 @@ public final class ModelConfig {
         // Set per-layer arrays for Nemotron-H
         if (perLayerKvHeads != null) config.perLayerKvHeads = perLayerKvHeads;
         if (perLayerFfnLength != null) config.perLayerFfnLength = perLayerFfnLength;
+
+        if (expertSharedFfnLength > 0) config.setExpertSharedFeedForwardLength(expertSharedFfnLength);
 
         // Set Granite scaling factors (must be mutable fields since constructor has too many params)
         if (embeddingScale != 0) config.setEmbeddingScale(embeddingScale);

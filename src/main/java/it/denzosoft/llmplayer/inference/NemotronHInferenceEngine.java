@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.model.ModelConfig;
 import it.denzosoft.llmplayer.model.NemotronHLayerWeights;
 import it.denzosoft.llmplayer.model.NemotronHWeights;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.lang.reflect.Method;
@@ -108,7 +109,31 @@ public class NemotronHInferenceEngine {
             config.ropeFreqBase(), config.ropeType(), ropeFreqFactors);
     }
 
+    // Granite Hybrid MoE: GPU expert helper (reflection-loaded; null on CPU/dense)
+    private Object gpuMoeHelper;
+    private Method gpuMoeCompute;
+
+    /** Granite Hybrid MoE: route expert FFN through the GPU (dense attn/mamba run on the CPU engine
+     *  with per-tensor GPU matmul). The dedicated dense GPU pass is skipped for MoE (isSupported=false). */
+    private void tryInitGpuMoE(Object bufferManager) {
+        try {
+            Class<?> cls = Class.forName("it.denzosoft.llmplayer.gpu.GraniteExpertGpu");
+            gpuMoeHelper = cls.getConstructor(ModelConfig.class, bufferManager.getClass())
+                .newInstance(config, bufferManager);
+            gpuMoeCompute = cls.getMethod("computeMoE",
+                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
+                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
+                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
+                float[].class, int[].class, float[].class, int.class, float[].class);
+            System.err.println("Granite MoE GPU experts: enabled");
+        } catch (Throwable e) {
+            System.err.println("Granite MoE GPU experts: unavailable — " + e.getMessage());
+            gpuMoeHelper = null;
+        }
+    }
+
     public void tryInitGpuForwardPass(Object bufferManager) {
+        if (config.expertCount() > 0) { tryInitGpuMoE(bufferManager); return; }
         try {
             Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.NemotronHCudaForwardPass");
             Method isSup = cls.getMethod("isSupported", ModelConfig.class, NemotronHWeights.class);
@@ -320,8 +345,10 @@ public class NemotronHInferenceEngine {
         // Residual (with Granite scaling if configured)
         applyResidual(state);
 
-        // Integrated FFN (Granite Hybrid: Mamba layers also have SwiGLU FFN)
-        if (lw.ffnUp() != null) {
+        // Integrated FFN (Granite Hybrid: Mamba layers also have SwiGLU FFN; MoE variant for h-tiny)
+        if (lw.isMoE()) {
+            runIntegratedMoEFFN(state, lw, layer);
+        } else if (lw.ffnUp() != null) {
             runIntegratedFFN(state, lw, layer);
         }
     }
@@ -355,6 +382,7 @@ public class NemotronHInferenceEngine {
     private void mamba2Scan(NemotronHState state, NemotronHLayerWeights lw, int layer, float[] dt) {
         int bOffset = ssmInnerSize;
         int cOffset = ssmInnerSize + ssmGroupCount * ssmStateSize;
+        final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
 
         IntStream.range(0, ssmTimeStepRank).parallel().forEach(h -> {
             int group = h / (ssmTimeStepRank / ssmGroupCount); // which B/C group this head belongs to
@@ -370,21 +398,14 @@ public class NemotronHInferenceEngine {
             int bOff = bOffset + group * ssmStateSize;
             int cOff = cOffset + group * ssmStateSize;
 
-            // For each element in this head's output
+            // For each element in this head's output (SIMD inner loop over stateSize)
             for (int d = 0; d < headDim; d++) {
                 float x_val = state.ssm_x[xOff + d] * dtH;
                 int sOff = d * ssmStateSize; // each head_dim element has its own state vector
-
-                // SSM state update: S[d,n] = dA * S[d,n] + dt * B[n] * x[d]
-                // Output: y[d] = sum_n(S[d,n] * C[n])
-                float y_val = 0;
-                for (int n = 0; n < ssmStateSize; n++) {
-                    S[sOff + n] = dA * S[sOff + n] + state.xBC[bOff + n] * x_val;
-                    y_val += S[sOff + n] * state.xBC[cOff + n];
-                }
-
-                // D residual
-                state.ssm_y[xOff + d] = y_val + dH * state.ssm_x[xOff + d];
+                // S[d,n] = dA*S[d,n] + B[n]*x_val ; y[d] = sum_n S[d,n]*C[n]
+                float y_val = ops.ssmStateUpdate(S, sOff, state.xBC, bOff, state.xBC, cOff,
+                                                 ssmStateSize, dA, x_val);
+                state.ssm_y[xOff + d] = y_val + dH * state.ssm_x[xOff + d]; // D residual
             }
         });
     }
@@ -447,8 +468,10 @@ public class NemotronHInferenceEngine {
         // Residual (with Granite scaling if configured)
         applyResidual(state);
 
-        // Integrated FFN (Granite Hybrid: attention layers also have SwiGLU FFN)
-        if (lw.ffnUp() != null) {
+        // Integrated FFN (Granite Hybrid: attention layers also have SwiGLU FFN; MoE variant for h-tiny)
+        if (lw.isMoE()) {
+            runIntegratedMoEFFN(state, lw, layer);
+        } else if (lw.ffnUp() != null) {
             runIntegratedFFN(state, lw, layer);
         }
     }
@@ -521,6 +544,113 @@ public class NemotronHInferenceEngine {
 
         // Residual (with Granite scaling if configured)
         applyResidual(state);
+    }
+
+    // ==================== Integrated MoE FFN (Granite Hybrid MoE, e.g. granite-4.0-h-tiny) ====================
+
+    /**
+     * SwiGLU Mixture-of-Experts FFN with shared expert, run after a Mamba or Attention mixer.
+     * Mirrors Qwen3MoEInferenceEngine.moeFFN: softmax over experts -> top-K -> renormalize ->
+     * weighted sum of routed experts + shared expert. Output lands in state.xb for applyResidual.
+     */
+    private void runIntegratedMoEFFN(NemotronHState state, NemotronHLayerWeights lw, int layer) {
+        float[] normW = ffnNormPerLayer[layer] != null ? ffnNormPerLayer[layer] : attnNormPerLayer[layer];
+        // Normed input -> state.xb2 (free during FFN); experts/router read from it.
+        VectorOpsFactory.get().rmsnorm(state.xb2, state.x, normW, dim, normEps);
+
+        final int expertCount = config.expertCount();
+        final int expertUsed = config.expertUsedCount();
+        final int eFfn = config.expertFfnLength() > 0 ? config.expertFfnLength() : config.intermediateSize();
+        final int shFfn = config.expertSharedFeedForwardLength();
+
+        // Router -> softmax over all experts -> top-K -> renormalize
+        Arrays.fill(state.routerLogits, 0, expertCount, 0f);
+        lw.ffnGateInp().matmul(state.xb2, state.routerLogits, expertCount, dim);
+        VectorOpsFactory.get().softmax(state.routerLogits, 0, expertCount);
+        selectTopK(state.routerLogits, expertCount, expertUsed, state.selectedExperts, state.selectedWeights);
+        float wsum = 0f;
+        for (int k = 0; k < expertUsed; k++) wsum += state.selectedWeights[k];
+        if (wsum > 6.103515625e-5f) for (int k = 0; k < expertUsed; k++) state.selectedWeights[k] /= wsum;
+
+        // GPU expert path (Granite Hybrid MoE): routed + shared experts on GPU. Router top-K stays
+        // on CPU above. Writes the full MoE output to state.xb; falls back to CPU on any failure.
+        if (gpuMoeHelper != null) {
+            try {
+                gpuMoeCompute.invoke(gpuMoeHelper, lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps(),
+                    lw.ffnGateShexp(), lw.ffnUpShexp(), lw.ffnDownShexp(),
+                    state.xb2, state.selectedExperts, state.selectedWeights, expertUsed, state.xb);
+                applyResidual(state);
+                return;
+            } catch (Exception e) {
+                System.err.println("Granite MoE GPU failed: " + e.getMessage());
+                gpuMoeHelper = null;
+            }
+        }
+
+        // Routed experts (parallel; each reads normed input from xb2)
+        final FloatTensor gateExps = lw.ffnGateExps(), upExps = lw.ffnUpExps(), downExps = lw.ffnDownExps();
+        IntStream.range(0, expertUsed).parallel().forEach(k -> {
+            int e = state.selectedExperts[k];
+            float[] gate = state.moeGatePerExpert[k];
+            float[] up = state.moeUpPerExpert[k];
+            float[] out = state.moeOutPerExpert[k];
+            Arrays.fill(gate, 0, eFfn, 0f);
+            Arrays.fill(up, 0, eFfn, 0f);
+            expertMatmul(gateExps, state.xb2, gate, e, dim, eFfn);
+            expertMatmul(upExps, state.xb2, up, e, dim, eFfn);
+            for (int i = 0; i < eFfn; i++) {
+                float g = gate[i];
+                gate[i] = (g / (1.0f + (float) Math.exp(-g))) * up[i];
+            }
+            Arrays.fill(out, 0, dim, 0f);
+            expertMatmul(downExps, gate, out, e, eFfn, dim);
+        });
+
+        // Weighted accumulation into state.xb (the FFN output that applyResidual adds)
+        Arrays.fill(state.xb, 0, dim, 0f);
+        for (int k = 0; k < expertUsed; k++) {
+            float w = state.selectedWeights[k];
+            float[] out = state.moeOutPerExpert[k];
+            for (int i = 0; i < dim; i++) state.xb[i] += w * out[i];
+        }
+
+        // Shared expert (always active)
+        if (lw.ffnGateShexp() != null && shFfn > 0) {
+            Arrays.fill(state.sharedHb, 0, shFfn, 0f);
+            Arrays.fill(state.sharedHb2, 0, shFfn, 0f);
+            lw.ffnGateShexp().matmulParallel(state.xb2, state.sharedHb, shFfn, dim);
+            lw.ffnUpShexp().matmulParallel(state.xb2, state.sharedHb2, shFfn, dim);
+            for (int i = 0; i < shFfn; i++) {
+                float g = state.sharedHb[i];
+                state.sharedHb[i] = (g / (1.0f + (float) Math.exp(-g))) * state.sharedHb2[i];
+            }
+            Arrays.fill(state.moeOut, 0, dim, 0f);
+            lw.ffnDownShexp().matmulParallel(state.sharedHb, state.moeOut, dim, shFfn);
+            for (int i = 0; i < dim; i++) state.xb[i] += state.moeOut[i];
+        }
+
+        applyResidual(state);
+    }
+
+    private static void expertMatmul(FloatTensor weights3D, float[] input, float[] output,
+                                      int expert, int inDim, int outDim) {
+        long expertOffset = (long) expert * outDim * inDim;
+        for (int row = 0; row < outDim; row++) {
+            output[row] += weights3D.dot(expertOffset + (long) row * inDim, input, 0, inDim);
+        }
+    }
+
+    private static void selectTopK(float[] logits, int n, int k, int[] outIdx, float[] outWeights) {
+        for (int i = 0; i < k; i++) { outIdx[i] = -1; outWeights[i] = Float.NEGATIVE_INFINITY; }
+        for (int e = 0; e < n; e++) {
+            float v = logits[e];
+            int pos = -1;
+            for (int i = 0; i < k; i++) { if (v > outWeights[i]) { pos = i; break; } }
+            if (pos >= 0) {
+                for (int j = k - 1; j > pos; j--) { outWeights[j] = outWeights[j - 1]; outIdx[j] = outIdx[j - 1]; }
+                outWeights[pos] = v; outIdx[pos] = e;
+            }
+        }
     }
 
     // ==================== Residual ====================

@@ -39,18 +39,21 @@ public class SimdIQ4_XSFloatTensor extends IQ4_XSFloatTensor {
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
         int otherBase = otherOffset;
 
+        // 16 is block-clean only for F_LEN in {4,8,16}; fall back otherwise.
+        if ((16 % F_LEN) != 0) return super.dot(thisOffset, other, otherOffset, length);
+
         FloatVector acc = FloatVector.zero(F_SPECIES);
-        byte[] qs = new byte[16];   // per sub-block packed nibbles
-        byte[] scl = new byte[4];   // scales_l bytes
-        float[] dqLo = new float[16];
-        float[] dqHi = new float[16];
+        final byte[] qs = new byte[16];   // per sub-block packed nibbles
+        final byte[] scl = new byte[4];   // scales_l bytes
+        final float[] sk = new float[16]; // per-sub-block scaled codebook (dl*KVALUES[i])
+        final int[] lo = new int[16];
+        final int[] hi = new int[16];
+        final float[] KV = IQ4_NLFloatTensor.KVALUES_IQ4NL;
 
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;
             float d = Float.float16ToFloat(segment.get(SHORT_LE, bo));
             int scalesH = Short.toUnsignedInt(segment.get(SHORT_LE, bo + 2));
-
-            // Bulk copy scales_l (4 bytes)
             MemorySegment.copy(segment, BYTE_LE, bo + 4, scl, 0, 4);
 
             for (int ib = 0; ib < 8; ib++) {
@@ -61,44 +64,30 @@ public class SimdIQ4_XSFloatTensor extends IQ4_XSFloatTensor {
                 int ls = low4 | (high2 << 4);
                 float dl = d * (ls - 32);
 
-                // Bulk copy 16 packed nibble bytes for this sub-block
                 MemorySegment.copy(segment, BYTE_LE, bo + 8 + (long) ib * 16, qs, 0, 16);
 
-                // Dequantize 32 weights using non-linear lookup
+                // Scaled codebook + lane-parallel nibble split, then SIMD gather
                 for (int i = 0; i < 16; i++) {
-                    int lo = qs[i] & 0x0F;
-                    int hi = (qs[i] >> 4) & 0x0F;
-                    dqLo[i] = dl * IQ4_NLFloatTensor.KVALUES_IQ4NL[lo];
-                    dqHi[i] = dl * IQ4_NLFloatTensor.KVALUES_IQ4NL[hi];
+                    sk[i] = dl * KV[i];
+                    int v = qs[i] & 0xFF;
+                    lo[i] = v & 0x0F;
+                    hi[i] = v >>> 4;
                 }
 
                 int elemBase = otherBase + ib * 32;
-
-                // SIMD FMA for elements 0..15 of this sub-block
-                int loopBound = F_SPECIES.loopBound(16);
-                for (int j = 0; j < loopBound; j += F_LEN) {
-                    FloatVector vw = FloatVector.fromArray(F_SPECIES, dqLo, j);
+                for (int j = 0; j < 16; j += F_LEN) {
+                    FloatVector vw = FloatVector.fromArray(F_SPECIES, sk, 0, lo, j);
                     FloatVector vIn = FloatVector.fromArray(F_SPECIES, other, elemBase + j);
                     acc = vw.fma(vIn, acc);
                 }
-                for (int j = loopBound; j < 16; j++) {
-                    acc = acc.withLane(0, acc.lane(0) + dqLo[j] * other[elemBase + j]);
-                }
-
-                // SIMD FMA for elements 16..31 of this sub-block
-                for (int j = 0; j < loopBound; j += F_LEN) {
-                    FloatVector vw = FloatVector.fromArray(F_SPECIES, dqHi, j);
+                for (int j = 0; j < 16; j += F_LEN) {
+                    FloatVector vw = FloatVector.fromArray(F_SPECIES, sk, 0, hi, j);
                     FloatVector vIn = FloatVector.fromArray(F_SPECIES, other, elemBase + 16 + j);
                     acc = vw.fma(vIn, acc);
                 }
-                for (int j = loopBound; j < 16; j++) {
-                    acc = acc.withLane(0, acc.lane(0) + dqHi[j] * other[elemBase + 16 + j]);
-                }
             }
-
             otherBase += BLOCK_SIZE;
         }
-
         return acc.reduceLanes(VectorOperators.ADD);
     }
 }

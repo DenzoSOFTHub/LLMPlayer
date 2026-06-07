@@ -31,6 +31,32 @@ public final class SimdVectorOps implements VectorOps {
     }
 
     @Override
+    public float ssmStateUpdate(float[] S, int sOff, float[] b, int bOff, float[] c, int cOff,
+                                int n, float dA, float bx) {
+        FloatVector vdA = FloatVector.broadcast(SPECIES, dA);
+        FloatVector vbx = FloatVector.broadcast(SPECIES, bx);
+        FloatVector vacc = FloatVector.zero(SPECIES);
+        int i = 0;
+        int upperBound = SPECIES.loopBound(n);
+        for (; i < upperBound; i += SPECIES_LENGTH) {
+            FloatVector vS = FloatVector.fromArray(SPECIES, S, sOff + i);
+            FloatVector vB = FloatVector.fromArray(SPECIES, b, bOff + i);
+            FloatVector vC = FloatVector.fromArray(SPECIES, c, cOff + i);
+            // s = dA*S + B*bx  ->  vS.fma(vdA, vB*vbx)
+            FloatVector vsNew = vS.fma(vdA, vB.mul(vbx));
+            vsNew.intoArray(S, sOff + i);
+            vacc = vsNew.fma(vC, vacc);    // acc += sNew * C
+        }
+        float acc = vacc.reduceLanes(VectorOperators.ADD);
+        for (; i < n; i++) {
+            float s = dA * S[sOff + i] + b[bOff + i] * bx;
+            S[sOff + i] = s;
+            acc += s * c[cOff + i];
+        }
+        return acc;
+    }
+
+    @Override
     public void saxpy(float a, float[] x, int xOff, float[] y, int yOff, int len) {
         FloatVector va = FloatVector.broadcast(SPECIES, a);
         int i = 0;

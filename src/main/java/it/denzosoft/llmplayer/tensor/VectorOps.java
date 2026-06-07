@@ -24,6 +24,23 @@ public interface VectorOps {
     void accumulate(float[] y, float[] x, int size);
 
     /**
+     * Mamba-2 SSD per-state-vector update for one head_dim element.
+     * For i in [0,n): {@code S[sOff+i] = dA*S[sOff+i] + b[bOff+i]*bx}; accumulates
+     * {@code acc += S[sOff+i]*c[cOff+i]}. Returns acc (the y contribution before the D residual).
+     * {@code b} and {@code c} are typically the same packed xBC array at different offsets.
+     */
+    default float ssmStateUpdate(float[] S, int sOff, float[] b, int bOff, float[] c, int cOff,
+                                 int n, float dA, float bx) {
+        float acc = 0f;
+        for (int i = 0; i < n; i++) {
+            float s = dA * S[sOff + i] + b[bOff + i] * bx;
+            S[sOff + i] = s;
+            acc += s * c[cOff + i];
+        }
+        return acc;
+    }
+
+    /**
      * In-place scale with weights: x[xOff+i] = x[xOff+i] * scale * w[i] for i in [0, size).
      * Used for per-head QK-norm scaling phase.
      */

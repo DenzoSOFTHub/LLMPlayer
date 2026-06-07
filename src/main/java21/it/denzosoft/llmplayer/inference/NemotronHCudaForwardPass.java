@@ -72,6 +72,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     private final MemorySegment rmsnormFunc, siluFunc, ropeFunc, kvUpdateFunc, attnFunc;
     private final MemorySegment siluMulFunc;   // silu_mul for integrated SwiGLU FFN
     private final MemorySegment accumulateFunc, conv1dSiluFunc, mamba2ScanFunc;
+    // Opt-in shared-memory Mamba-2 scan variant (-Dcuda.mamba.smem=true): caches per-group B/C in smem.
+    private final MemorySegment mamba2ScanSmemFunc;
+    private final boolean useScanSmem = "true".equals(System.getProperty("cuda.mamba.smem"));
     private final MemorySegment dtSoftplusFunc, gateNormFunc, sqreluFunc;
 
     // ParamBuffers (zero-allocation hot path)
@@ -290,6 +293,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         conv1dSiluFunc = cudaContext.compileKernel("kernels/cuda/conv1d_short.cu", "conv1d_short");
         mamba2ScanFunc = cudaContext.compileKernel("kernels/cuda/mamba2_scan.cu", "mamba2_scan");
+        mamba2ScanSmemFunc = useScanSmem
+            ? cudaContext.compileKernel("kernels/cuda/mamba2_scan_smem.cu", "mamba2_scan_smem") : null;
         dtSoftplusFunc = cudaContext.compileKernel("kernels/cuda/mamba2_dt_softplus.cu", "mamba2_dt_softplus");
         gateNormFunc = cudaContext.compileKernel("kernels/cuda/mamba2_gate_norm.cu", "mamba2_gate_norm");
         sqreluFunc = cudaContext.compileKernel("kernels/cuda/sqrelu.cu", "sqrelu");
@@ -434,10 +439,14 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         kvPB = new ParamBuffer(arena, 6);
         kvPB.setLong(2, gpuK); kvPB.setLong(3, gpuV); kvPB.setInt(4, kvDim); kvPB.setLong(5, gpuTokenParams);
 
-        attnPB = new ParamBuffer(arena, 9);
+        // attention_full takes 10 args: arg9 = slidingWindow (0 = full attention).
+        // Nemotron-H attention layers always use full attention; arg9 must still be present
+        // since attention.cu reads 10 params (regression fix: was 9, crashed cuLaunchKernel).
+        attnPB = new ParamBuffer(arena, 10);
         attnPB.setLong(0, gpuXb2); attnPB.setLong(1, gpuQ);
         attnPB.setInt(4, headCount); attnPB.setInt(5, headCountKV);
         attnPB.setInt(6, headSize); attnPB.setInt(7, kvDim); attnPB.setLong(8, gpuTokenParams);
+        attnPB.setInt(9, 0);
 
         conv1dPB = new ParamBuffer(arena, 6);
         conv1dPB.setLong(0, gpuXBC); conv1dPB.setInt(3, convChannels);
@@ -561,6 +570,10 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     public static boolean isSupported(ModelConfig config, NemotronHWeights weights) {
         if (weights.layers().length == 0) return false;
+        // Granite Hybrid MoE (e.g. granite-4.0-h-tiny): the GPU-resident forward pass has no MoE
+        // expert routing, so fall back to the CPU engine (which handles MoE; dense projections
+        // still run on GPU via per-tensor matmul). Detect via the router tensor on layer 0.
+        if (config.expertCount() > 0 || weights.layers()[0].isMoE()) return false;
         // Granite Hybrid fully supported as of 2026-04-14:
         //   - scale factors (embed/logit/residual/attention)
         //   - integrated SwiGLU FFN inside Mamba/Attention layers
@@ -765,7 +778,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
         // Mamba-2 scan
         scanPB.setLong(0, gpuSsmState[li]); scanPB.setLong(5, gpuSsmA[li]); scanPB.setLong(6, gpuSsmD[li]);
-        launchKernel(mamba2ScanFunc, scanGridDim, headDim, 0, scanPB.ptrs);
+        if (mamba2ScanSmemFunc != null) {
+            launchKernel(mamba2ScanSmemFunc, scanGridDim, headDim, 2 * ssmStateSize * 4, scanPB.ptrs);
+        } else {
+            launchKernel(mamba2ScanFunc, scanGridDim, headDim, 0, scanPB.ptrs);
+        }
         if (PROFILING_MAMBA) { cudaContext.finish(); t1 = System.nanoTime(); profMambaScanNs += t1 - t0; t0 = t1; }
 
         // Gate + grouped RMSNorm (fused)

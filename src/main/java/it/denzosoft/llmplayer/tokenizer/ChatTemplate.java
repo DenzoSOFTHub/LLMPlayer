@@ -50,8 +50,11 @@ public class ChatTemplate {
             return formatQwen35(userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
-                || architecture == ModelArchitecture.NEMOTRON_H) {
+                || architecture == ModelArchitecture.NEMOTRON_H
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
             return formatQwen(userMessage);
+        } else if (architecture == ModelArchitecture.ERNIE4_5) {
+            return formatErnie(userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4(userMessage);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
@@ -83,8 +86,11 @@ public class ChatTemplate {
             return formatQwen35Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
-                || architecture == ModelArchitecture.NEMOTRON_H) {
+                || architecture == ModelArchitecture.NEMOTRON_H
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
             return formatQwenChat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.ERNIE4_5) {
+            return formatErnieChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
@@ -119,6 +125,16 @@ public class ChatTemplate {
         return "<|start_header_id|>system<|end_header_id|>\n\n" +
                systemMessage + "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
                userMessage + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    }
+
+    // ERNIE 4.5: <|begin_of_sentence|> (cls) + "User: ...\nAssistant: ..."<|end_of_sentence|> (sep).
+    // Assistant turn ends with <|end_of_sentence|>; generation prompt is "Assistant: ".
+    private String formatErnie(String userMessage) {
+        return "<|begin_of_sentence|>User: " + userMessage + "\nAssistant: ";
+    }
+
+    private String formatErnieChat(String systemMessage, String userMessage) {
+        return "<|begin_of_sentence|>" + systemMessage + "\nUser: " + userMessage + "\nAssistant: ";
     }
 
     /**
@@ -219,8 +235,11 @@ public class ChatTemplate {
             return formatQwen35Conversation(messages);
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
-                || architecture == ModelArchitecture.NEMOTRON_H) {
+                || architecture == ModelArchitecture.NEMOTRON_H
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
             return formatQwenConversation(messages);
+        } else if (architecture == ModelArchitecture.ERNIE4_5) {
+            return formatErnieConversation(messages);
         } else if (architecture == ModelArchitecture.GLM4) {
             return formatGLM4Conversation(messages);
         } else if (architecture == ModelArchitecture.DEEPSEEK2) {
@@ -286,6 +305,21 @@ public class ChatTemplate {
             sb.append(msg[1]).append("<|im_end|>\n");
         }
         sb.append("<|im_start|>assistant\n").append(thinkingSuffix());
+        return sb.toString();
+    }
+
+    private String formatErnieConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder("<|begin_of_sentence|>");
+        for (String[] msg : messages) {
+            if ("user".equals(msg[0])) {
+                sb.append("User: ").append(msg[1]).append("\n");
+            } else if ("assistant".equals(msg[0])) {
+                sb.append("Assistant: ").append(msg[1]).append("<|end_of_sentence|>");
+            } else if ("system".equals(msg[0])) {
+                sb.append(msg[1]).append("\n");
+            }
+        }
+        sb.append("Assistant: ");
         return sb.toString();
     }
 

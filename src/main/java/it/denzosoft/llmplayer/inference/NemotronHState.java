@@ -37,6 +37,17 @@ public class NemotronHState {
     // FFN buffers
     public final float[] hb;      // [ffnDim] after ffn_up
 
+    // Granite Hybrid MoE buffers (null when not MoE)
+    public final float[] routerLogits;       // [expertCount]
+    public final int[] selectedExperts;      // [expertUsedCount]
+    public final float[] selectedWeights;    // [expertUsedCount]
+    public final float[][] moeGatePerExpert; // [expertUsedCount][expertFfnDim]
+    public final float[][] moeUpPerExpert;   // [expertUsedCount][expertFfnDim]
+    public final float[][] moeOutPerExpert;  // [expertUsedCount][dim]
+    public final float[] sharedHb;           // [sharedFfnDim]
+    public final float[] sharedHb2;          // [sharedFfnDim]
+    public final float[] moeOut;             // [dim] accumulated MoE output
+
     private final int blockCount;
     private final ModelConfig config;
 
@@ -85,6 +96,27 @@ public class NemotronHState {
 
         // FFN buffers
         this.hb = new float[config.intermediateSize()];
+
+        // MoE buffers (Granite Hybrid MoE)
+        int expertCount = config.expertCount();
+        if (expertCount > 0) {
+            int eu = config.expertUsedCount();
+            int eFfn = config.expertFfnLength() > 0 ? config.expertFfnLength() : config.intermediateSize();
+            int shFfn = Math.max(config.expertSharedFeedForwardLength(), 1);
+            this.routerLogits = new float[expertCount];
+            this.selectedExperts = new int[eu];
+            this.selectedWeights = new float[eu];
+            this.moeGatePerExpert = new float[eu][eFfn];
+            this.moeUpPerExpert = new float[eu][eFfn];
+            this.moeOutPerExpert = new float[eu][dim];
+            this.sharedHb = new float[shFfn];
+            this.sharedHb2 = new float[shFfn];
+            this.moeOut = new float[dim];
+        } else {
+            this.routerLogits = null; this.selectedExperts = null; this.selectedWeights = null;
+            this.moeGatePerExpert = null; this.moeUpPerExpert = null; this.moeOutPerExpert = null;
+            this.sharedHb = null; this.sharedHb2 = null; this.moeOut = null;
+        }
 
         // Persistent Mamba state
         int histSize = ssmConvKernel - 1;

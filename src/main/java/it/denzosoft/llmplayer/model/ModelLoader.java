@@ -22,11 +22,14 @@ public class ModelLoader {
         private final Qwen3MoEWeights qwen3MoEWeights;
         private final Qwen35Weights qwen35Weights;
         private final NemotronHWeights nemotronHWeights;
+        private final LFM2Weights lfm2Weights;
+        private final FalconH1Weights falconH1Weights;
         private final Tokenizer tokenizer;
 
         public LoadedModel(GGUFFile ggufFile, ModelConfig config, ModelWeights weights,
                            DeepSeek2Weights deepSeek2Weights, Qwen3MoEWeights qwen3MoEWeights,
                            Qwen35Weights qwen35Weights, NemotronHWeights nemotronHWeights,
+                           LFM2Weights lfm2Weights, FalconH1Weights falconH1Weights,
                            Tokenizer tokenizer) {
             this.ggufFile = ggufFile;
             this.config = config;
@@ -35,6 +38,8 @@ public class ModelLoader {
             this.qwen3MoEWeights = qwen3MoEWeights;
             this.qwen35Weights = qwen35Weights;
             this.nemotronHWeights = nemotronHWeights;
+            this.lfm2Weights = lfm2Weights;
+            this.falconH1Weights = falconH1Weights;
             this.tokenizer = tokenizer;
         }
 
@@ -45,6 +50,8 @@ public class ModelLoader {
         public Qwen3MoEWeights qwen3MoEWeights() { return qwen3MoEWeights; }
         public Qwen35Weights qwen35Weights() { return qwen35Weights; }
         public NemotronHWeights nemotronHWeights() { return nemotronHWeights; }
+        public LFM2Weights lfm2Weights() { return lfm2Weights; }
+        public FalconH1Weights falconH1Weights() { return falconH1Weights; }
         public Tokenizer tokenizer() { return tokenizer; }
 
         @Override
@@ -92,11 +99,17 @@ public class ModelLoader {
         Qwen3MoEWeights q3moeWeights = null;
         Qwen35Weights q35Weights = null;
         NemotronHWeights nemHWeights = null;
+        LFM2Weights lfm2Weights = null;
+        FalconH1Weights falconH1Weights = null;
 
         ModelArchitecture arch = config.architecture();
         boolean isMoEArch = config.expertCount() > 0;
         if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
             weights = loadWeights(gguf, config, gpuLayers);
+        } else if (arch == ModelArchitecture.LFM2) {
+            lfm2Weights = loadLFM2Weights(gguf, config, gpuLayers);
+        } else if (arch == ModelArchitecture.FALCON_H1) {
+            falconH1Weights = loadFalconH1Weights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
             nemHWeights = loadNemotronHWeights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.QWEN35) {
@@ -120,7 +133,8 @@ public class ModelLoader {
         long elapsed = System.currentTimeMillis() - startTime;
         System.out.println("  Model loaded in " + elapsed + "ms");
 
-        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, q35Weights, nemHWeights, tokenizer);
+        return new LoadedModel(gguf, config, weights, ds2Weights, q3moeWeights, q35Weights, nemHWeights,
+                lfm2Weights, falconH1Weights, tokenizer);
     }
 
     private static Qwen35Weights loadQwen35Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
@@ -580,6 +594,106 @@ public class ModelLoader {
             + " (also tried " + ArchitectureRegistry.postAttnNorm(layer) + ")");
     }
 
+    private static LFM2Weights loadLFM2Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        // Embedding on CPU (lookup only)
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
+        FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
+        FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD_NORM); // LFM2 final norm
+        FloatTensor output;
+        GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
+        if (outputInfo != null) {
+            output = createTensor(gguf, outputInfo);
+        } else {
+            output = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD); // tied
+        }
+
+        boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
+        Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
+
+        LFM2LayerWeights[] layers = new LFM2LayerWeights[config.blockCount()];
+        for (int i = 0; i < config.blockCount(); i++) {
+            if (partialOffload && i >= gpuLayers) TensorFactory.setGpuBufferManager(null);
+
+            FloatTensor opNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i)); // "operator_norm"
+            FloatTensor ffnNorm = loadTensor(gguf, ArchitectureRegistry.ffnNorm(i));
+            FloatTensor ffnGate = loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+            FloatTensor ffnUp = loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
+            FloatTensor ffnDown = loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
+
+            if (config.lfm2IsAttentionLayer(i)) {
+                layers[i] = LFM2LayerWeights.attention(opNorm, ffnNorm,
+                    loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
+                    loadTensor(gguf, ArchitectureRegistry.attnKNorm(i)),
+                    ffnGate, ffnUp, ffnDown);
+            } else {
+                layers[i] = LFM2LayerWeights.conv(opNorm, ffnNorm,
+                    loadTensor(gguf, ArchitectureRegistry.shortconvInProj(i)),
+                    loadTensor(gguf, ArchitectureRegistry.shortconvConv(i)),
+                    loadTensor(gguf, ArchitectureRegistry.shortconvOutProj(i)),
+                    ffnGate, ffnUp, ffnDown);
+            }
+        }
+        if (partialOffload) TensorFactory.setGpuBufferManager(savedGpuManager);
+
+        float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
+        return new LFM2Weights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
+    }
+
+    private static FalconH1Weights loadFalconH1Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+        Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
+        FloatTensor tokenEmbedding = loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+        TensorFactory.setGpuBufferManager(savedGpuForEmb);
+
+        FloatTensor outputNorm = loadTensor(gguf, ArchitectureRegistry.OUTPUT_NORM);
+        FloatTensor output;
+        GGUFTensorInfo outputInfo = gguf.findTensor(ArchitectureRegistry.OUTPUT);
+        output = (outputInfo != null) ? createTensor(gguf, outputInfo)
+                                      : loadTensor(gguf, ArchitectureRegistry.TOKEN_EMBD);
+
+        boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
+        Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
+
+        FalconH1LayerWeights[] layers = new FalconH1LayerWeights[config.blockCount()];
+        for (int i = 0; i < config.blockCount(); i++) {
+            if (partialOffload && i >= gpuLayers) TensorFactory.setGpuBufferManager(null);
+            layers[i] = new FalconH1LayerWeights(
+                loadTensor(gguf, ArchitectureRegistry.attnNorm(i)),
+                loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                tryLoadTensor(gguf, ArchitectureRegistry.attnOutputBias(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                tryLoadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
+                tryLoadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                loadTensor(gguf, ArchitectureRegistry.ssmOut(i)),
+                // Falcon-H1 ffn_norm is stored WITHOUT a ".weight" suffix
+                loadTensor(gguf, "blk." + i + ".ffn_norm"),
+                loadTensor(gguf, ArchitectureRegistry.ffnGate(i)),
+                tryLoadTensor(gguf, "blk." + i + ".ffn_gate.bias"),
+                loadTensor(gguf, ArchitectureRegistry.ffnUp(i)),
+                tryLoadTensor(gguf, "blk." + i + ".ffn_up.bias"),
+                loadTensor(gguf, ArchitectureRegistry.ffnDown(i)),
+                tryLoadTensor(gguf, "blk." + i + ".ffn_down.bias"));
+        }
+        if (partialOffload) TensorFactory.setGpuBufferManager(savedGpuManager);
+
+        float[] ropeFreqFactors = loadRopeFreqFactors(gguf, config);
+        return new FalconH1Weights(tokenEmbedding, outputNorm, output, layers, ropeFreqFactors);
+    }
+
     private static NemotronHWeights loadNemotronHWeights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
         // Embedding on CPU
         Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
@@ -607,6 +721,40 @@ public class ModelLoader {
 
             FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
             int type = config.nemotronLayerType(i);
+
+            // Granite Hybrid MoE: layer has a router (ffn_gate_inp) instead of a dense FFN.
+            FloatTensor ffnGateInp = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
+            if (ffnGateInp != null && (type == 0 || type == 1)) {
+                FloatTensor ffnNorm = tryLoadTensor(gguf, ArchitectureRegistry.ffnNorm(i));
+                // Experts load on whatever backend is active: GPU-resident when GPU is on (so
+                // GraniteExpertGpu can matmul them via offset pointers), CPU otherwise (dot path).
+                FloatTensor gateExps = loadTensor(gguf, ArchitectureRegistry.ffnGateExps(i));
+                FloatTensor upExps = loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i));
+                FloatTensor downExps = loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i));
+                FloatTensor gateSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i));
+                FloatTensor upSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
+                FloatTensor downSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
+                if (type == 0) {
+                    layers[i] = NemotronHLayerWeights.mambaWithMoE(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.ssmIn(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1d(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmConv1dBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmDtBias(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmA(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmD(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmNorm(i)),
+                        loadTensor(gguf, ArchitectureRegistry.ssmOut(i)),
+                        ffnNorm, ffnGateInp, gateExps, upExps, downExps, gateSh, upSh, downSh);
+                } else {
+                    layers[i] = NemotronHLayerWeights.attentionWithMoE(attnNorm,
+                        loadTensor(gguf, ArchitectureRegistry.attnQ(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnK(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnV(i)),
+                        loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
+                        ffnNorm, ffnGateInp, gateExps, upExps, downExps, gateSh, upSh, downSh);
+                }
+                continue;
+            }
 
             if (type == 0) { // Mamba-2 (optionally with integrated FFN for Granite Hybrid)
                 FloatTensor ffnGateMamba = tryLoadTensor(gguf, ArchitectureRegistry.ffnGate(i));
