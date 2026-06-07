@@ -10,6 +10,43 @@
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
+## Results v1.14.0-dev — three new architectures (2026-06-07)
+
+Three architectures were added: **ERNIE 4.5** (`ernie4_5`, dense transformer), **LFM2** (`lfm2`, gated short-convolution + GQA hybrid, Liquid AI), and **Falcon-H1** (`falcon-h1`, parallel Mamba-2 + attention hybrid, TII). All produce coherent output with EXCELLENT perplexity on both CPU and GPU.
+
+**Settings:** `--max-tokens 32 --temperature 0`, RTX 4050 Laptop GPU (6 GB) / Core Ultra 7 155H CPU. Prompt: `"The capital of France is"`.
+
+| Model | Quant | Arch | GPU tok/s | CPU tok/s | PPL | Verdict |
+|-------|-------|------|----------:|----------:|----:|---------|
+| ERNIE-4.5-0.3B-PT | Q8_0 | ernie4_5 | **117–127** | 39.6 | 1.15 | EXCELLENT |
+| LFM2-1.2B | Q8_0 | lfm2 | **50–56** ¹ | 23.0 | 1.22–1.55 | EXCELLENT |
+| Falcon-H1-0.5B-Instruct | Q8_0 | falcon-h1 | **40** ¹ | 13.8 | 1.18 | EXCELLENT |
+| Falcon-H1-1.5B-Instruct | Q4_K_M | falcon-h1 | **42** ¹ | 9.3 | 1.02 | EXCELLENT |
+
+¹ GPU forward passes added 2026-06-07: dedicated **`LFM2CudaForwardPass`** raised LFM2 from ~33 (per-tensor matmul) to **50–56 tok/s (+70 %)** (output bit-identical to CPU), and **`FalconH1CudaForwardPass`** raised Falcon-H1 from ~12 to **40-42 tok/s (~3×)** (parallel Mamba-2+attention on GPU; 0.5B gate-only & 1.5B gate+norm paths both PPL 0.98-0.99).
+
+**GPU acceleration mode:**
+- **ERNIE 4.5** is a standard dense transformer (RMSNorm + GQA with explicit head_dim=128 + RoPE NORM + SwiGLU, tied embeddings), so it runs through the full CUDA-graph GPU-resident forward pass (`CudaForwardPass`) — the large GPU speedup (~3× over CPU) reflects this.
+- **LFM2** and **Falcon-H1** currently use **per-tensor GPU matmul** (weights GPU-resident; the short-conv / Mamba-2 scan run on CPU). LFM2 benefits clearly (more of its compute is linear-projection matmul); Falcon-H1's tiny per-token throughput is dominated by the CPU-side SSM scan, so GPU ≈ CPU at these sizes. Dedicated GPU-resident forward passes for the conv/SSM mixers are a future optimization (mirrors how Nemotron-H/Qwen3.5 graduated from per-tensor to full residency).
+
+### Regression fixed during the v1.14.0 benchmark sweep
+
+The sweep surfaced a hard `cuLaunchKernel` crash (native libcuda SIGSEGV) on **every Nemotron-H, Granite-Hybrid, and Qwen3.5 model on GPU**. Root cause: the v1.13.x sliding-window-attention commit widened `attention.cu`'s `attention_full` kernel from 9 to 10 parameters (added `slidingWindow`) and updated `CudaForwardPass`, but `NemotronHCudaForwardPass` and `Qwen35CudaForwardPass` still allocated a 9-element parameter buffer — so `cuLaunchKernel` read an out-of-bounds 10th pointer. Fixed by widening both buffers to 10 and setting `slidingWindow=0` (these architectures' attention layers are full-attention). Post-fix GPU throughput:
+
+| Model | Arch | Before | After |
+|-------|------|-------:|------:|
+| Nemotron-3-Nano-4B Q4_K_M | nemotron-h | crash | **24.9 tok/s** |
+| Qwen3.5-4B Q4_K_M | qwen35 | crash | **20.7 tok/s** |
+| granite-4.0-h-micro Q4_K_M | granitehybrid | crash | **33.2 tok/s** |
+
+### Granite Hybrid MoE support (granite-4.0-h-tiny)
+
+A broader architecture-coverage sweep found `granite-4.0-h-tiny` producing garbage (PPL 1637) on GPU. It is a **Granite Hybrid MoE** (64 experts, top-6, 1 shared expert, n_embd=1536, routed-expert FFN 512, shared FFN 1024) — the hybrid engine previously handled only the dense integrated FFN, so the MoE FFN was silently skipped. Added MoE FFN support to the CPU `NemotronHInferenceEngine` (`runIntegratedMoEFFN`): softmax → top-K → renormalize → routed experts + shared expert. The dedicated GPU forward pass is disabled for MoE (no GPU expert routing), so the model runs on the CPU engine with per-tensor GPU matmul for the dense attention/Mamba projections. Result: **garbage (PPL 1637) → coherent (PPL 0.98 EXCELLENT)** at 4.1 tok/s (CPU-bound on experts; GPU expert acceleration is a future optimization).
+
+### Coverage-sweep note: large models need `--force`
+
+deepseek2-lite (9.7 GB), phi-4 (8.5 GB), and sonar-oss-20b (12 GB) initially showed as "FAIL" in the non-interactive sweep — they trigger the `"This configuration is not recommended. Continue? [y/N]"` RAM/swap safety prompt, which auto-aborts with no stdin. They are **not** broken: with `--force`/`-y` they run correctly (e.g. DeepSeek-Coder-V2-Lite Q4_K_M → "Paris", PPL 0.94, 4.4 tok/s). Benchmark scripts should pass `--force` for models that approach the RAM/VRAM budget.
+
 ## Results v1.13.0 — GPU sweep (2026-04-17)
 
 **Release configuration (v1.13.0 changes active):**

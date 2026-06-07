@@ -1,5 +1,23 @@
 # LLMPlayer — What's New
 
+## v1.14.0-dev — three new architectures: ERNIE 4.5, LFM2, Falcon-H1 (2026-06-07)
+
+Three more GGUF architectures are supported (24 total), each validated on CPU and GPU with EXCELLENT perplexity:
+
+- **ERNIE 4.5** (`ernie4_5`, Baidu) — dense transformer. Maps directly onto the standard inference engine and the full CUDA-graph forward pass. Notable detail: it uses an explicit `head_dim=128` from `attention.key_length` (not `embedding/heads=64`), RoPE NORM (θ=500000), SwiGLU, and tied embeddings, with a `<|begin_of_sentence|>` "User:/Assistant:" chat template. **117–127 tok/s** on RTX 4050 for the 0.3B.
+- **LFM2** (`lfm2`, Liquid AI) — hybrid of gated short-convolution mixers and GQA attention mixers (10 conv / 6 attention layers for the 1.2B), each with a SwiGLU FFN. The short-conv mixer splits an `in_proj` into `[b|c|x]`, gates `bx = b*x`, runs a depthwise causal conv1d (width 3, rolling state 2), gates `y = c*conv_out`, and projects out. Attention layers use per-head QK-norm + RoPE NEOX. **27–33 tok/s** for the 1.2B.
+- **Falcon-H1** (`falcon-h1`, TII) — parallel hybrid: every layer runs a GQA attention path **and** a Mamba-2 SSM path on the same pre-normed input, sums their outputs, then a SwiGLU FFN. The HF channel/attention multiplier scalars are baked into the GGUF weights at conversion, so the forward pass applies none. Grouped `ssm_norm` is present on the 1.5B (absent on the 0.5B). Validated on both 0.5B (PPL 1.18) and 1.5B (PPL 1.02).
+
+LFM2 and Falcon-H1 currently use per-tensor GPU matmul (linear projections on GPU; the conv / Mamba-2 scan on CPU); a dedicated GPU-resident forward pass for the conv/SSM mixers is a future optimization.
+
+### Regression fix found during the new-arch benchmark sweep — GPU crash on Nemotron-H / Granite-Hybrid / Qwen3.5
+
+The sweep surfaced a hard native `cuLaunchKernel` crash (libcuda SIGSEGV) affecting **every Nemotron-H, Granite-Hybrid, and Qwen3.5 model on GPU**. The CUDA sliding-window-attention change (below) widened `attention.cu`'s `attention_full` kernel from 9 to 10 parameters and updated `CudaForwardPass`, but `NemotronHCudaForwardPass` and `Qwen35CudaForwardPass` still allocated a 9-element parameter buffer — so `cuLaunchKernel` read an out-of-bounds 10th pointer. Both buffers were widened to 10 with `slidingWindow=0` (these architectures' attention layers are full-attention). Post-fix: Nemotron-3-Nano-4B **24.9 tok/s**, Qwen3.5-4B **20.7 tok/s**, granite-4.0-h-micro **33.2 tok/s** — all previously crashing.
+
+### Granite Hybrid MoE support (granite-4.0-h-tiny)
+
+The coverage sweep also found `granite-4.0-h-tiny` emitting garbage (PPL 1637) — it is a **Granite Hybrid MoE** (64 experts, top-6, shared expert) and the hybrid engine only handled the dense integrated FFN, silently skipping the MoE FFN. Added MoE FFN support to the CPU hybrid engine (router → softmax → top-K → routed experts + shared expert); the GPU-resident forward pass is disabled for MoE so the model runs on the CPU engine with per-tensor GPU matmul for the dense projections. Result: garbage → coherent (PPL 0.98 EXCELLENT). (The three large dense models that showed as "FAIL" in the sweep — deepseek2-lite, phi-4, sonar-oss-20b — were false alarms: they hit the interactive RAM-safety prompt and run fine with `--force`.)
+
 ## v1.14.0-dev (in progress) — audit fixes, CUDA SWA, Q4_1 KV cache
 
 A full LLM-engine audit run after the v1.13.0 release surfaced one HIGH correctness bug, several MEDIUM items, and one concrete optimization opportunity worth shipping. Each item below was implemented, verified against the previous behavior, and where applicable benched with a before/after comparison.
