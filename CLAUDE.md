@@ -1,4 +1,4 @@
-# Architecture
+# CLAUDE.md
 
 This document describes the architecture, build process, and internal design of the LLMPlayer codebase, as a reference for developers working in this repository.
 
