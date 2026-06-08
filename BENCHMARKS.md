@@ -10,6 +10,32 @@
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
+## v1.16.0 — verification sweep (2026-06-08)
+
+Post-release regression check after the v1.16.0 changes (lazy mmap for models > RAM, MoE routing
+instrumentation, the Qwen3-Coder-30B `-1` crash fix, and `madvise(MADV_RANDOM)`). GPU mode, RTX 4050
+Laptop, best-of-2, 40 tokens, prompt `"Explain what photosynthesis is in simple terms."`. The CPU was
+shared with unrelated workloads during the run, so only the GPU figures are reported (the GPU itself
+was idle — 0 % util, 0 MiB used before the sweep). **All ten architectures generate coherent output
+with EXCELLENT perplexity — no regression from the session's changes.**
+
+| Model | Quant | Arch | GPU tok/s | PPL |
+|-------|-------|------|-----------|-----|
+| Qwen3-0.6B | Q8_0 | Qwen3 | 91.6 | 0.89 |
+| Llama-3.2-1B | Q4_K_M | Llama | 86.5 | 0.96 |
+| OLMo-2-1B | Q4_K_M | OLMo2 | 63.0 | 0.73 |
+| ERNIE-4.5-0.3B | Q8_0 | ERNIE 4.5 | 55.3 | 1.00 |
+| Gemma-3-1B | Q4_K_M | Gemma 3 | 41.2 | 0.91 |
+| Qwen3-1.7B | Q8_0 | Qwen3 | 39.3 | 1.00 |
+| SmolLM3 | Q4_K_M | SmolLM3 | 38.8 | 0.96 |
+| LFM2-1.2B | Q8_0 | LFM2 | 36.8 | 0.99 |
+| Phi-4-mini | Q4_K_M | Phi-4 | 27.4 | 0.98 |
+| Falcon-H1-0.5B | Q8_0 | Falcon-H1 | 16.7 | 0.97 |
+
+The v1.14 architectures (ERNIE 4.5, LFM2, Falcon-H1) and all the standard ones run cleanly. The
+Qwen3-Coder-30B `-1` crash fix was verified separately: it now produces coherent output on the exact
+prompt that previously aborted.
+
 ## v1.15.0 — placement auto-tuning (Phase 1 + 2.1)
 
 This release adds the KV-aware VRAM budget (each GPU layer reserves its KV-cache slice; FP16 KV
