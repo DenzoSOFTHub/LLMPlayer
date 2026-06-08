@@ -49,6 +49,10 @@ public class Qwen3MoEInferenceEngine {
     private final boolean routingStats = "true".equals(System.getProperty("moe.routing.stats", "false"));
     private long[][] expertHits;     // [layer][expert] selection counts
     private long routingDecisions;   // total expert selections counted
+
+    // Phase 2.2b diagnostic: compare the GPU expert-cache output to the CPU path on the first MoE call.
+    private final boolean debugCache = "true".equals(System.getProperty("moe.cache.debug", "false"));
+    private boolean debugCacheDone;
     private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
     private int profTokenCount;
 
@@ -488,6 +492,21 @@ public class Qwen3MoEInferenceEngine {
                     state.moeHbPerExpert, state.moeHb2PerExpert, state.expertOutPerExpert,
                     useSwigluOai,
                     weights.ffnGateExpsBias(), weights.ffnUpExpsBias(), weights.ffnDownExpsBias());
+
+                if (debugCache && !debugCacheDone) {
+                    debugCacheDone = true;
+                    float[][] gpuOut = new float[expertUsedCount][];
+                    for (int k = 0; k < expertUsedCount; k++) gpuOut[k] = state.expertOutPerExpert[k].clone();
+                    // CPU recompute (overwrites expertOutPerExpert) for comparison
+                    cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
+                    for (int k = 0; k < expertUsedCount; k++) {
+                        double maxd = 0; int e = state.selectedExperts[k];
+                        for (int i = 0; i < dim; i++) maxd = Math.max(maxd, Math.abs(gpuOut[k][i] - state.expertOutPerExpert[k][i]));
+                        System.err.printf("  [cache.debug] layer %d k=%d expert %d: max|GPU-CPU|=%.4f  GPU[0..2]=%.3f,%.3f,%.3f  CPU[0..2]=%.3f,%.3f,%.3f%n",
+                            currentLayer, k, e, maxd, gpuOut[k][0], gpuOut[k][1], gpuOut[k][2],
+                            state.expertOutPerExpert[k][0], state.expertOutPerExpert[k][1], state.expertOutPerExpert[k][2]);
+                    }
+                }
             } catch (Throwable e) {
                 // Fallback to CPU on error, disable cache. Print the real cause (reflection wraps it).
                 Throwable c = (e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null) ? e.getCause() : e;

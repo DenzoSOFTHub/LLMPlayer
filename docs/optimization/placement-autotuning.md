@@ -251,10 +251,20 @@ OOM/under-fill bug. Highest value per effort.
      negligible weight, and `cpuExpertCompute` guards `e < 0`. The 30B now generates coherent output
      on prompts that previously aborted.
    - **Q4_K/Q5_K/Q6_K cache path: EXPERIMENTAL, default OFF** (`-Dmoe.expert.cache.experimental`).
-     The type-aware plumbing initialises correctly (e.g. `Q4_K experts, 5681 slots` on the 30B) but
-     the K-quant matmul-in-cache currently produces incorrect output (the byte offsets and kernel
-     signatures match the working CPU path, so the remaining defect is subtle). MXFP4 (GPT-OSS) stays
-     validated and on.
+     The type-aware plumbing initialises correctly (`Q4_K experts, 5681 slots` on the 30B) but the
+     Q4_K path produces incorrect output. A deep investigation (a 6-agent adversarial workflow plus an
+     empirical per-expert GPU-vs-CPU diagnostic, `-Dmoe.cache.debug`) **localised it precisely**: the
+     GPU Q4_K expert dequant yields huge/NaN values (e.g. 1.5e6, NaN) while the CPU path is correct
+     (~0.01). The following were each **ruled out**: cache orchestration / buffer sizing / result
+     combination (the MXFP4 cache path is byte-identical and generates coherent output —
+     `sonar-oss-20b` → "Paris"); the FP32 `matmul_q4_k` kernel itself (validated in-place via
+     `-Dcuda.dp4a=false` on Llama-1B → "Paris"); the per-expert byte offset (matches
+     `Q4_KFloatTensor.dot` and the CPU `expertMatmul` exactly); 4-byte/16-byte read alignment; the
+     launch geometry (`getMatmulBlockDim`→256, grid `ceil(rows/8)`, smem 0 — identical to the in-place
+     path); and weight repacking (`getGpuWeights` uploads raw bytes, no repack). The exact byte-level
+     root cause (why the *same raw Q4_K bytes* dequant correctly in-place but as huge values from the
+     cache's uploaded slot) remains open and would need GPU-memory dumping to settle. MXFP4 (GPT-OSS)
+     stays validated and on. The diagnostic harness is retained behind `-Dmoe.cache.debug`.
    - **Measured neutral on models that fit RAM.** On the 30B (18 GB, fits 31 GB RAM) the cache ran at
      ~0.6–1.0 tok/s — the same as the CPU expert path — because the per-expert GPU matmul launch +
      PCIe-miss overhead roughly equals CPU SIMD for these small, numerous experts (top-8 × 48 layers
