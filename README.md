@@ -376,6 +376,8 @@ This maximizes GPU utilization because expert tensors are large but only top-K a
 
 Explicit `--gpu-layers N` always uses first-N-layers to preserve backward compatibility.
 
+The dense first-N-layers budget is **KV-aware**: each GPU layer also reserves its KV-cache slice (which grows with context length), so long contexts no longer over-commit VRAM, and FP16 KV is auto-enabled when it lets more layers fit. The full analysis of placement heuristics for models that exceed VRAM — the bandwidth cost model, value-per-VRAM-byte ranking, CPU/GPU/multi-GPU tuning, and the implementation roadmap — is in [`docs/optimization/placement-autotuning.md`](docs/optimization/placement-autotuning.md).
+
 ## Java Profile Feature Comparison
 
 | Feature | Java 8 | Java 21 | Java 25 |
@@ -431,7 +433,7 @@ These flags control how tokens are generated. They affect output quality and cre
 | `--dry-allowed-length` | — | Integer | 2 | DRY: minimum n-gram length before penalty kicks in. |
 | `--dry-range` | — | Integer | 1024 | DRY: lookback window size in tokens. |
 | `--seed` | — | Long | random | Random seed for reproducibility. Same seed + same prompt = same output (when temperature > 0). |
-| `--threads` | — | Integer | num CPUs | Number of threads for parallel operations. By default uses all available CPU cores. |
+| `--threads` | — | Integer | physical cores | Number of threads for the parallel matmul. Defaults to **physical** cores (not logical/hyperthreaded) — the matmul hot path is memory-bandwidth bound, so hyperthreads only add port contention (measured ~+32–45 % on Llama-1B CPU decode). |
 | `--context-length` | `-c` | Integer | 2048 | Maximum context window in tokens. Larger values allow longer conversations but use more RAM. Model's maximum is shown in `--info` output. |
 
 ### GPU Flags
@@ -442,6 +444,7 @@ LLMPlayer **auto-detects** NVIDIA GPUs and enables CUDA when available. These fl
 |---|---|---|---|
 | `--gpu` | Flag | false | Force GPU enablement. Not usually needed — auto-detection handles this. Use when auto-detect picks the wrong device or when you want to be explicit. |
 | `--no-gpu` | Flag | false | **Disable GPU entirely**, force CPU-only inference. Useful for benchmarking or when GPU causes issues. Note: CPU-only is significantly slower (see Benchmarks). |
+| `--auto-tune` | Flag | false | Measure decode tok/s for the GPU placement vs CPU-only and use the faster. Catches the partial-fit case where GPU placement is slower than CPU (too little fits VRAM, or a weak GPU/slow bus). One-time, opt-in (loads the model a couple of extra times). |
 | `--gpu-device` | Integer | auto | Select GPU device by index. Use `--gpu-list` to see available devices and their indices. By default, the best available GPU is selected automatically. |
 | `--gpu-backend` | String | `auto` | GPU compute backend: `auto` (prefers CUDA over OpenCL), `cuda` (NVIDIA only), `opencl` (any OpenCL device). |
 | `--gpu-layers` | Integer | -1 | How many transformer layers to place on GPU. `-1` = auto-detect (fills VRAM optimally). `0` = no layers on GPU (equivalent to `--no-gpu`). Positive value N = put the first N layers on GPU. For MoE models with auto-detect, uses MoE-optimized placement (all attention on GPU, experts on CPU). |

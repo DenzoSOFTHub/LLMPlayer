@@ -1,5 +1,34 @@
 # LLMPlayer — What's New
 
+## Placement auto-tuning — Phase 1 + 2.1 (post-v1.14.0)
+
+Heuristics and tooling for running models that do not fit entirely in VRAM, making the best use of
+the available GPU, CPU cores, and memory. The full analysis (bandwidth cost model, value-per-VRAM
+ranking, CPU/GPU/multi-GPU tuning) and the three-phase roadmap are in
+`docs/optimization/placement-autotuning.md`.
+
+- **KV-aware VRAM budget.** The dense first-N-layers GPU budget now reserves each layer's KV-cache
+  slice — which grows linearly with context length and was previously ignored — via the closed form
+  `N = (usable − nonLayer) / (bytesPerLayer + kvPerLayer)`. This stops long contexts from
+  over-committing VRAM. When FP32 KV would not fit all layers but FP16 KV would, **FP16 KV is
+  auto-enabled**. (MoE-optimized is unchanged; its KV cache lives on the CPU.) Example: Llama-3.2-3B
+  at ctx=24576 auto-enables FP16 KV and fits all 28 layers instead of over-committing.
+- **Physical-core thread default.** The matmul thread pool now sizes to *physical* cores, not
+  logical/hyperthreaded ones (Linux sysfs detection), because the bandwidth-bound matmul gains
+  nothing from two hyperthreads contending for one core's load/store ports. Measured **~+32 % best /
+  ~+45 % average** on Llama-1B CPU decode (5.0 vs 3.8 tok/s). `--threads` overrides; a `numactl`
+  pinning hint is logged on multi-NUMA-node machines.
+- **`--auto-tune`.** Measures steady-state decode tok/s for the GPU placement and for CPU-only, then
+  keeps the faster — replacing the file-size-based guess with a measurement and auto-correcting the
+  partial-fit footgun where GPU placement is actually slower than CPU (too little fits VRAM, or a
+  weak GPU/slow bus). One-time, opt-in.
+- **autosearch.sh** now sweeps the KV-quant flags (`cuda.kv.fp16`, `kv.q8`, `kv.q4`) in its
+  coordinate ascent; `--gpu-layers` is left at auto because the budget is now KV-aware so "fill VRAM"
+  is already the optimal contiguous split.
+
+Still on the roadmap: a hot-expert LRU GPU cache for Q4_K MoE (the dominant lever for 30B-on-6GB)
+and multi-GPU layer-split.
+
 ## v1.14.0 — GPU forward passes for LFM2/Falcon-H1/Gemma 4, dp4a, FP16 KV, batched-verify scaffolding (2026-06-07)
 
 A second round of GPU work for the v1.14.0 cycle, focused on closing the GPU coverage gaps left open by the first round (the three new architectures below) and on new opt-in throughput/memory features. Every item was benched on RTX 4050 and verified against the CPU path where applicable.
