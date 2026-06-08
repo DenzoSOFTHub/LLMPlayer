@@ -1,10 +1,6 @@
-# CLAUDE.md
+# Architecture
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Documentation style
-
-When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CALLING, docs under `docs/**`, Javadoc, and any `.md` authored for the project), always use normal prose — full sentences, articles, standard grammar. Do **not** use caveman / ultra-terse style in documentation, even if an active session has caveman mode enabled. Caveman style applies only to in-session assistant chat, not to persisted project artifacts.
+This document describes the architecture, build process, and internal design of the LLMPlayer codebase, as a reference for developers working in this repository.
 
 ## Project Overview
 
@@ -167,7 +163,7 @@ The model config UI (`web-ui.html`, served at `/`) uses `/v1/chat/completions` f
 
 #### Anthropic Messages API (`/v1/messages`)
 
-Implements the Anthropic Messages API for compatibility with Claude Code and other Anthropic API clients. Implemented in `AnthropicHandler.java`.
+Implements the Anthropic Messages API for compatibility with Anthropic API clients. Implemented in `AnthropicHandler.java`.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|

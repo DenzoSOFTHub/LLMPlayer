@@ -1,7 +1,7 @@
 /**
  * Q5_0 × Q8_1 matmul using __dp4a + shared-memory input cache.
  *
- * Target: Gemma-3-1B Q4_K_M where Q5_0 is used for Q/K/gate/up (per CLAUDE.md
+ * Target: Gemma-3-1B Q4_K_M where Q5_0 is used for Q/K/gate/up (per ARCHITECTURE.md
  * note on Gemma-3 quant layout). Current matmul_q5_0_dp4a.cu reads Q8_1 bytes
  * directly from HBM; with 8 warps per block sharing the same input vector,
  * 7 of 8 reads are redundant. Caching Q8_1 in shared memory eliminates them.

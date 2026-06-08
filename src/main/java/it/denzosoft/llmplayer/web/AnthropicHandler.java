@@ -11,7 +11,7 @@ import java.util.*;
 /**
  * Anthropic Messages API handler.
  * Implements POST /v1/messages and POST /v1/messages/count_tokens.
- * Compatible with Claude Code and other Anthropic API clients.
+ * Compatible with Anthropic API clients.
  */
 public class AnthropicHandler {
 

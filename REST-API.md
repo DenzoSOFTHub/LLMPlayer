@@ -3,7 +3,7 @@
 LLMPlayer exposes four groups of REST APIs when started with `--web` (default port 8080):
 
 - **`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`** — OpenAI Chat Completions compatible API. Works with standard OpenAI clients (Open WebUI, LangChain, LiteLLM, Cursor, Continue.dev, etc.).
-- **`/v1/messages`, `/v1/messages/count_tokens`** — Anthropic Messages API. Compatible with Claude Code and other Anthropic API clients. Implemented by `AnthropicHandler`.
+- **`/v1/messages`, `/v1/messages/count_tokens`** — Anthropic Messages API. Compatible with Anthropic API clients. Implemented by `AnthropicHandler`.
 - **`/api/*`** — LLMPlayer-specific management API for model loading, GPU configuration, and hardware diagnostics.
 - **`/api/chats/*`** — Chat persistence API with conversation branching. Used by the chat UI at `/chat`.
 
@@ -217,7 +217,7 @@ If no model is loaded, lists available GGUF files in the `gguf/` directory:
 
 ## Anthropic Messages API (`/v1/messages`)
 
-Implements the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) for compatibility with Claude Code and other Anthropic API clients. Implemented in `AnthropicHandler.java`.
+Implements the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) for compatibility with Anthropic API clients. Implemented in `AnthropicHandler.java`.
 
 The `x-api-key` header is accepted and ignored (no authentication required — same pattern as the OpenAI `Authorization: Bearer` header).
 

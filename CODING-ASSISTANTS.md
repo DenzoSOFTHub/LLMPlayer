@@ -15,20 +15,17 @@ mvn clean compile
 # Custom port: ./run.sh --web --port 9000 --model gguf/your-model.gguf
 ```
 
-## Claude Code
+## Anthropic Messages API clients
 
-Claude Code uses the Anthropic Messages API (`/v1/messages`), which LLMPlayer implements natively.
+Any assistant that speaks the Anthropic Messages API (`/v1/messages`) can use LLMPlayer natively.
 
 ```bash
-# Set environment variables
+# Point an Anthropic-compatible client at the local server
 export ANTHROPIC_BASE_URL=http://localhost:8080
 export ANTHROPIC_API_KEY=any-value
-
-# Launch Claude Code with local model
-claude --model local-model
 ```
 
-The `ANTHROPIC_API_KEY` is required by the client but LLMPlayer accepts any value.
+The `ANTHROPIC_API_KEY` is required by such clients but LLMPlayer accepts any value.
 
 ## Continue.dev (VS Code / JetBrains)
 
@@ -76,8 +73,8 @@ In the admin settings, add an OpenAI-compatible connection:
 
 | Endpoint | Protocol | Used By |
 |----------|----------|---------|
-| `POST /v1/messages` | Anthropic Messages API | Claude Code |
-| `POST /v1/messages/count_tokens` | Anthropic Messages API | Claude Code |
+| `POST /v1/messages` | Anthropic Messages API | Anthropic API clients |
+| `POST /v1/messages/count_tokens` | Anthropic Messages API | Anthropic API clients |
 | `POST /v1/chat/completions` | OpenAI Chat Completions | Continue.dev, Cursor, aider, Open WebUI |
 | `GET /v1/models` | OpenAI Models | All OpenAI-compatible clients |
 | `POST /v1/embeddings` | OpenAI Embeddings | Embedding clients |

@@ -123,7 +123,7 @@ The audit flagged Gemma 3n Q-norm handling as asymmetric: `kNormCache` adds `+1.
 
 ### Documentation
 
-CLAUDE.md, PERFORMANCE-ANALYSIS.md, and 15 of the 18 `docs/quantization/*.md` files were brought up to date with v1.13.0 reality (the dp4a dispatch coverage, the v1.12.0 CPU SIMD sweep, MXFP4 GPU wiring, and the `launchOutputMatmul` coverage fix). A pre-existing inaccuracy in `docs/quantization/Q2_K.md` — which referenced a `matmul_q2_k.cu` kernel that does not exist on disk — was corrected: Q2_K is the only one of the eighteen supported quantization formats without any GPU acceleration (no kernel, no `*CudaTensor` wrapper).
+ARCHITECTURE.md, PERFORMANCE-ANALYSIS.md, and 15 of the 18 `docs/quantization/*.md` files were brought up to date with v1.13.0 reality (the dp4a dispatch coverage, the v1.12.0 CPU SIMD sweep, MXFP4 GPU wiring, and the `launchOutputMatmul` coverage fix). A pre-existing inaccuracy in `docs/quantization/Q2_K.md` — which referenced a `matmul_q2_k.cu` kernel that does not exist on disk — was corrected: Q2_K is the only one of the eighteen supported quantization formats without any GPU acceleration (no kernel, no `*CudaTensor` wrapper).
 
 ## v1.13.0 (2026-04-17) — GPU coverage round-up
 
@@ -176,7 +176,7 @@ The implementation introduces `MergedQkvCudaTensor`, a GPU-only wrapper that del
 
 ### JFR / GPU profile diagnostics
 
-A full `-Dcuda.profile=true -Dcuda.nograph=true` session on Gemma-3-1B and Phi-3-mini identified the structural sources of the remaining gap to llama.cpp (reported separately at **32 %** and **19 %** of llama.cpp respectively in the pre-session comparison). The per-section breakdown is now documented in `CLAUDE.md` under the "dp4a path" note; the short version is that both anomalies trace back to non-4-byte-aligned quantization block sizes (Q5_0's 22 bytes, IQ4_NL's 18 bytes) forcing byte `__ldg` in the inner loop.
+A full `-Dcuda.profile=true -Dcuda.nograph=true` session on Gemma-3-1B and Phi-3-mini identified the structural sources of the remaining gap to llama.cpp (reported separately at **32 %** and **19 %** of llama.cpp respectively in the pre-session comparison). The per-section breakdown is now documented in `ARCHITECTURE.md` under the "dp4a path" note; the short version is that both anomalies trace back to non-4-byte-aligned quantization block sizes (Q5_0's 22 bytes, IQ4_NL's 18 bytes) forcing byte `__ldg` in the inner loop.
 
 ### Structural refactor: `forwardLayer` split + `forwardAttentionOnly`
 
@@ -569,7 +569,7 @@ Added support for 6 new quantization types: IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_X
 
 ### Anthropic Messages API
 
-New `/v1/messages` endpoint implementing the Anthropic Messages API for compatibility with Claude Code and other Anthropic API clients. Supports streaming and non-streaming modes.
+New `/v1/messages` endpoint implementing the Anthropic Messages API for compatibility with Anthropic API clients. Supports streaming and non-streaming modes.
 
 ### OpenAI API Enhancements
 
