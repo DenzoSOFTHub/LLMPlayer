@@ -1,5 +1,23 @@
 # LLMPlayer — What's New
 
+## v1.16.1 — MADV_RANDOM for the lazy >RAM path; verification sweep; placement roadmap closed out
+
+A small follow-up to v1.16.0, focused on the models-larger-than-RAM path and closing out the
+placement roadmap.
+
+- **`madvise(MADV_RANDOM)` on the lazy mmap.** When `LLMEngine.load` skips preload (model > 85 % of
+  RAM), it now advises the OS that access is random so it stops reading ahead pages that will not be
+  used — MoE cold experts are touched sparsely. Best-effort (libc via Panama FFM, caught on
+  non-Linux); the sequential preload path keeps default read-ahead.
+- **Verification sweep.** A 10-architecture GPU regression sweep (see BENCHMARKS.md) confirms all
+  supported models still generate coherent output with EXCELLENT perplexity after the v1.16.0
+  changes. `Qwen3.5-0.8B` (the smallest official Qwen3.5) was verified runnable on the existing
+  `Qwen35InferenceEngine` with full GPU offload.
+- **Placement roadmap closed out.** Phase 1.2 (fractional-layer split) closed as won't-do (gain below
+  the noise floor); the Q4_K expert GPU cache stays gated/experimental (investigated to the limit of
+  the tooling available against a JVM+FFM+driver-API stack); multi-GPU remains parked (single-GPU
+  hardware). Full dispositions in `docs/optimization/placement-autotuning.md`.
+
 ## v1.16.0 — Lazy mmap for models > RAM, MoE routing instrumentation, Qwen3-Coder-30B crash fix
 
 This release continues the placement work (Phase 2.2) with a focus on running models that do not fit

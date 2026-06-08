@@ -36,6 +36,13 @@ The v1.14 architectures (ERNIE 4.5, LFM2, Falcon-H1) and all the standard ones r
 Qwen3-Coder-30B `-1` crash fix was verified separately: it now produces coherent output on the exact
 prompt that previously aborted.
 
+**Qwen3.5 family.** Verified `Qwen3.5-0.8B-Q4_K_M` (unsloth) — the smallest *official* Qwen3.5 size —
+runs on the existing `Qwen35InferenceEngine`: `arch=QWEN35` (dim 1024, 24 layers, GQA 8/2, headSize
+256), full 24/24-layer GPU offload (699 MB incl. KV), CUDA graph captured, coherent output. The
+official dense ladder (0.8B / 2B / 4B / 9B / 27B) maps onto this engine; the MoE variants (35B-A3B and
+up) add a routed FFN that the current Qwen3.5 engine does not implement, so those are not expected to
+run correctly yet.
+
 ## v1.15.0 — placement auto-tuning (Phase 1 + 2.1)
 
 This release adds the KV-aware VRAM budget (each GPU layer reserves its KV-cache slice; FP16 KV
