@@ -317,6 +317,17 @@ public class LLMEngine implements AutoCloseable {
                 ModelConfig quickConfig = ModelConfig.fromMetadata(quickParse.getMetadata());
                 int blockCount = quickConfig.blockCount();
 
+                // KV-aware VRAM budget (Phase 1.1): each GPU-resident attention layer also reserves
+                // its slice of the KV cache, which grows linearly with context length. Reserving it
+                // up front stops long contexts from over-committing VRAM. FP16 KV (-Dcuda.kv.fp16)
+                // halves that reserve; auto-prefer it when it lets more weight layers fit.
+                int ctxForKv = Math.min(maxContextLength, quickConfig.contextLength());
+                long kvAllFp32 = estimateKvCache(quickConfig, ctxForKv);     // all layers, FP32
+                long kvPerLayerFp32 = kvAllFp32 / Math.max(1, blockCount);
+                long kvPerLayerFp16 = kvPerLayerFp32 / 2;
+                boolean fp16KvSet = System.getProperty("cuda.kv.fp16") != null;
+                boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+
                 // With managed or host-mapped memory, force all layers on GPU
                 // (driver handles paging between VRAM and system RAM)
                 String memMode = gpuConfig.getMemoryMode();
@@ -359,11 +370,19 @@ public class LLMEngine implements AutoCloseable {
                         long usableVram = (long) (vram * 0.90) - nonLayerBytes;
                         long layerBytes = Math.max(1, modelFileSize - nonLayerBytes);
                         long bytesPerLayer = layerBytes / blockCount;
-                        int fittableLayers = (int) (usableVram / bytesPerLayer);
+                        // Each GPU layer costs its weights PLUS its KV-cache slice.
+                        int fitFp32 = (int) (usableVram / (bytesPerLayer + kvPerLayerFp32));
+                        int fitFp16 = (int) (usableVram / (bytesPerLayer + kvPerLayerFp16));
+                        boolean autoFp16 = !fp16KvSet && fitFp16 > fitFp32 && fitFp32 < blockCount;
+                        if (autoFp16) { System.setProperty("cuda.kv.fp16", "true"); useFp16Kv = true; }
+                        long kvPerLayer = useFp16Kv ? kvPerLayerFp16 : kvPerLayerFp32;
+                        int fittableLayers = (int) (usableVram / (bytesPerLayer + kvPerLayer));
                         gpuLayersUsed = Math.min(Math.max(0, fittableLayers), blockCount);
-                        long vramUsedMB = ((long) gpuLayersUsed * bytesPerLayer + nonLayerBytes) / (1024 * 1024);
+                        long kvUsedMB = (long) gpuLayersUsed * kvPerLayer / (1024 * 1024);
+                        long vramUsedMB = ((long) gpuLayersUsed * (bytesPerLayer + kvPerLayer) + nonLayerBytes) / (1024 * 1024);
                         System.out.println("GPU: offloading " + gpuLayersUsed + "/" + blockCount +
-                            " layers to GPU (" + vramUsedMB + " MB VRAM used, " +
+                            " layers to GPU (" + vramUsedMB + " MB VRAM used incl. " + kvUsedMB + " MB KV"
+                            + (autoFp16 ? ", FP16 KV auto-enabled" : "") + ", " +
                             (vram / 1024 / 1024) + " MB available)");
                     } else {
                         // Can't detect VRAM, put all layers on GPU
