@@ -8,7 +8,7 @@ When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CA
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine (v1.14.0, latest release) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2, ERNIE 4.5, LFM2 hybrid short-conv, Falcon-H1 parallel Mamba-2+attention) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 17 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
+LLMPlayer is a pure Java LLM inference engine (v1.15.0, latest release) that runs GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures (Llama, Qwen2, Qwen3, Qwen3MoE, Qwen3.5, SmolLM3, DeepSeek2, GLM4/GLM-4.7-Flash, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Command-R/Cohere, OLMo2 (incl. Olmo 3 ChatML variant), Falcon3, GPT-OSS/Sonar, Granite 3.3, Granite Hybrid, Nemotron-H hybrid Mamba-2, ERNIE 4.5, LFM2 hybrid short-conv, Falcon-H1 parallel Mamba-2+attention) and 18 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). 17 of these have dedicated CUDA tensor classes for full GPU acceleration (all except Q2_K). Includes CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch (`autosearch.sh`), and a built-in LoRA fine-tuning pipeline.
 
 ## Build & Run Commands
 
@@ -272,8 +272,10 @@ Response parsing in `OpenAIHandler.tryParseToolCalls()`. Multi-tool-call parsing
 
 Two GPU offloading strategies are available, selected automatically based on model architecture and VRAM:
 
+Full analysis and the heuristics behind these strategies (the bandwidth cost model, value-per-VRAM-byte ranking, CPU/GPU/multi-GPU tuning) are in `docs/optimization/placement-autotuning.md`.
+
 #### First-N-layers (dense models)
-The default for dense architectures (Llama, Qwen2, GLM4, Phi, Mistral). The first N layers go entirely on GPU, the rest on CPU. N is calculated from available VRAM (`--gpu-layers -1` auto-detects, `--gpu-layers N` forces N layers).
+The default for dense architectures (Llama, Qwen2, GLM4, Phi, Mistral). The first N layers go entirely on GPU, the rest on CPU. N is calculated from available VRAM (`--gpu-layers -1` auto-detects, `--gpu-layers N` forces N layers). The budget is **KV-aware**: each GPU layer reserves its KV-cache slice (which grows with context length) via the closed form `N = (usableVram − nonLayerBytes) / (bytesPerLayer + kvPerLayer)`, so long contexts no longer over-commit VRAM. When FP32 KV would not fit all layers but FP16 KV would, FP16 KV (`-Dcuda.kv.fp16`) is auto-enabled. (MoE-optimized is unaffected — its KV cache lives on the CPU.)
 
 #### MoE-optimized (MoE models)
 For MoE architectures (Qwen3MoE, DeepSeek2) with `--gpu-layers -1` (auto-detect). Inspired by KTransformers (SOSP'25): places **all** attention tensors on GPU across every layer, while expert tensors (`ffn_*_exps`, ~80-90% of layer weight) stay on CPU. Router and shared expert tensors also go on GPU (small). This maximizes GPU utilization because:
@@ -293,6 +295,12 @@ For MoE architectures (Qwen3MoE, DeepSeek2) with `--gpu-layers -1` (auto-detect)
 - GPU ON → restore for next layer
 
 **Key files**: `GpuConfig.moeOptimized`, `ModelLoader.load(path, preload, gpuLayers, moeOptimizedGpu)`, `LLMEngine.sumNonExpertTensorBytes()`.
+
+#### Auto-tuning the split (`--auto-tune`)
+`--auto-tune` measures steady-state decode tok/s for the heuristic GPU placement and for CPU-only, then keeps the faster configuration. It replaces the file-size-based guess with a measurement and auto-corrects the partial-fit footgun where GPU placement is actually slower than running on the CPU (too little of the model fits VRAM, or the GPU/bus is weak). One-time, opt-in (it loads the model a couple of extra times). Implemented in `CLIRunner.autoTune()` / `measurePlacement()`.
+
+#### CPU thread sizing
+The matmul thread pool defaults to **physical** cores, not logical/hyperthreaded ones (`CLIOptions.detectPhysicalCores()` via Linux sysfs thread-sibling groups). The matmul hot path is memory-bandwidth bound, so two hyperthreads on one core only contend for its load/store ports — physical sizing is the bandwidth-correct default and matches llama.cpp's practice. The measured benefit on the thermally-constrained reference box is inconsistent (a single clean A/B showed physical faster, but a heat-soaked sweep was contradictory), so no fixed speedup is quoted. `--threads N` overrides; a `numactl` pinning hint is logged when more than one NUMA node is present.
 
 **Explicit `--gpu-layers N`** always uses first-N-layers (no MoE optimization) to preserve backward compatibility.
 
