@@ -22,13 +22,15 @@ import java.util.Map;
  */
 public class ExpertGpuCache {
 
-    private static final int BLOCK_SIZE = 32;
-    private static final int BLOCK_BYTES = 17;
     private static final int MAX_EXPERTS_PER_TOKEN = 8; // Max top-K (GPT-OSS uses 4)
 
     private final CudaContext cudaContext;
     private final int maxSlots;
     private final long sliceBytes;
+    // Block geometry + matmul kernel of the expert quant type (MXFP4: 32/17/matmul_mxfp4,
+    // Q4_K: 256/144/matmul_q4_k, Q6_K: 256/210/matmul_q6_k, Q5_K: 256/176/matmul_q5_k).
+    private final int blockSize;
+    private final int blockBytes;
 
     // Weight cache pool
     private final long[] gpuBuffers;
@@ -37,8 +39,8 @@ public class ExpertGpuCache {
     private long accessCounter;
     private final Map<Long, Integer> keyToSlot = new HashMap<>();
 
-    // Compiled kernel
-    private final MemorySegment mxfp4Kernel;
+    // Compiled matmul kernel for the expert quant type
+    private final MemorySegment matmulFunc;
     private final long cudaBlockSize;
 
     // Shared GPU input buffer (read-only during kernel execution)
@@ -57,13 +59,16 @@ public class ExpertGpuCache {
     private long hits;
     private long misses;
 
-    public ExpertGpuCache(CudaContext cudaContext, int maxSlots, long expertElements) {
+    public ExpertGpuCache(CudaContext cudaContext, int maxSlots, long expertElements,
+                          int blockSize, int blockBytes, String kernelResource, String kernelName) {
         this.cudaContext = cudaContext;
         this.maxSlots = maxSlots;
-        this.sliceBytes = (expertElements / BLOCK_SIZE) * BLOCK_BYTES;
+        this.blockSize = blockSize;
+        this.blockBytes = blockBytes;
+        this.sliceBytes = (expertElements / blockSize) * blockBytes;
         this.cudaBlockSize = Math.min(256, cudaContext.getDeviceInfo().maxWorkGroupSize());
 
-        this.mxfp4Kernel = cudaContext.compileKernel("kernels/cuda/matmul_mxfp4.cu", "matmul_mxfp4");
+        this.matmulFunc = cudaContext.compileKernel(kernelResource, kernelName);
 
         this.gpuBuffers = new long[maxSlots];
         this.slotKeys = new long[maxSlots];
@@ -239,15 +244,15 @@ public class ExpertGpuCache {
             gpuWeights, gpuInput, gpuOutput, rows, cols, 0);
         long rowsPerBlock = cudaBlockSize / 32;
         long globalSize = ((rows + rowsPerBlock - 1) / rowsPerBlock) * cudaBlockSize;
-        cudaContext.launchKernel1D(mxfp4Kernel, globalSize, cudaBlockSize, 0, params);
+        cudaContext.launchKernel1D(matmulFunc, globalSize, cudaBlockSize, 0, params);
         // NO finish() — caller batches multiple launches then syncs once
     }
 
     private void uploadExpertSlice(FloatTensor tensor, int expert, long elements, long gpuPtr) {
         long elementOffset = expert * elements;
-        long numBlocks = elements / BLOCK_SIZE;
-        long byteOffset = (elementOffset / BLOCK_SIZE) * BLOCK_BYTES;
-        long byteSize = numBlocks * BLOCK_BYTES;
+        long numBlocks = elements / blockSize;
+        long byteOffset = (elementOffset / blockSize) * blockBytes;
+        long byteSize = numBlocks * blockBytes;
 
         TensorData data = tensor.data();
         try (Arena staging = Arena.ofConfined()) {
