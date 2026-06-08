@@ -38,10 +38,21 @@ public class CLIRunner {
             return;
         }
 
-        // Configure thread pool
+        // Configure thread pool. Default is physical cores (CLIOptions.detectPhysicalCores) because
+        // the matmul hot path is memory-bandwidth bound and hyperthreads only add port contention.
         if (options.getThreads() > 0) {
             System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism",
                 String.valueOf(options.getThreads()));
+            int logical = Runtime.getRuntime().availableProcessors();
+            if (options.getThreads() < logical) {
+                System.out.println("CPU: using " + options.getThreads() + " threads (physical cores; "
+                    + logical + " logical available — bandwidth-bound matmul prefers physical; override with --threads)");
+            }
+            int numaNodes = CLIOptions.detectNumaNodes();
+            if (numaNodes > 1) {
+                System.out.println("CPU: " + numaNodes + " NUMA nodes detected — for best memory-bound "
+                    + "throughput pin to one node, e.g.: numactl --cpunodebind=0 --membind=0 java ...");
+            }
         }
 
         Path modelPath = Paths.get(options.getModelPath());

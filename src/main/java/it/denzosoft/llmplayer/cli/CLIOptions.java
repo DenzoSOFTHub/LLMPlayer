@@ -21,7 +21,7 @@ public class CLIOptions {
     private float dryBase = 1.75f;
     private int dryAllowedLength = 2;
     private int dryRange = 1024;
-    private int threads = Runtime.getRuntime().availableProcessors();
+    private int threads = detectPhysicalCores();  // default to physical cores (bandwidth-bound matmul)
     private boolean showInfo;
     private boolean help;
     private int contextLength = 2048;
@@ -221,6 +221,42 @@ public class CLIOptions {
     public float getTemperature() { return temperature; }
     public int getThreads() { return threads; }
     public boolean isShowInfo() { return showInfo; }
+
+    /**
+     * Number of physical cores (not logical/hyperthreaded). The matmul hot path is memory-bandwidth
+     * bound, so two hyperthreads on one core contend for the same load/store ports and add no
+     * throughput — physical-core sizing is usually 10–20% faster. Detected from Linux sysfs topology
+     * (distinct thread-sibling groups); falls back to {@code availableProcessors()} elsewhere.
+     */
+    public static int detectPhysicalCores() {
+        int logical = Runtime.getRuntime().availableProcessors();
+        try {
+            java.io.File cpuDir = new java.io.File("/sys/devices/system/cpu");
+            java.io.File[] cpus = cpuDir.listFiles((d, n) -> n.matches("cpu\\d+"));
+            if (cpus != null && cpus.length > 0) {
+                java.util.Set<String> cores = new java.util.HashSet<>();
+                for (java.io.File cpu : cpus) {
+                    java.io.File sib = new java.io.File(cpu, "topology/thread_siblings_list");
+                    if (sib.exists()) {
+                        cores.add(new String(java.nio.file.Files.readAllBytes(sib.toPath())).trim());
+                    }
+                }
+                if (!cores.isEmpty()) return cores.size();
+            }
+        } catch (Throwable ignore) { /* non-Linux / no sysfs */ }
+        return logical;
+    }
+
+    /** Number of NUMA nodes (Linux sysfs); 1 (or 0 on failure) if not detectable. */
+    public static int detectNumaNodes() {
+        try {
+            java.io.File nodeDir = new java.io.File("/sys/devices/system/node");
+            java.io.File[] nodes = nodeDir.listFiles((d, n) -> n.matches("node\\d+"));
+            if (nodes != null && nodes.length > 0) return nodes.length;
+        } catch (Throwable ignore) { }
+        return 1;
+    }
+
     public boolean isHelp() { return help; }
     public int getContextLength() { return contextLength; }
     public boolean isWebMode() { return webMode; }

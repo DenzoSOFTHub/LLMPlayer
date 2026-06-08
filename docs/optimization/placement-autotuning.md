@@ -201,14 +201,26 @@ inputs: model (per-tensor bytes, K/N), GPUs[] (free VRAM each), CPU (DRAM BW, ph
 Self-contained refinements to the current placement and CPU code; no new subsystems; fixes a real
 OOM/under-fill bug. Highest value per effort.
 
-1. **KV-aware VRAM budget** — fold `+ kvPerLayer` into the dense and MoE budgets (closed form in §4
-   Tier 0); auto-prefer FP16 KV when it buys ≥1 layer; reserve KV before placing layers.
-2. **Fractional-layer attention-first placement** — use the boundary layer's leftover budget for its
-   attention tensors (and its KV) rather than wasting it.
-3. **CPU physical-core + NUMA tuning** — size the matmul pool to physical cores; first-touch / steer
-   the hot matmul onto local-node / P-cores; expose a `--threads`-aware override.
-4. **`autosearch.sh` → placement sweep** — add `gpu-layers` and KV-quant mode to the coordinate
-   ascent; cache the Pareto-best (tok/s, PPL) per (model, machine).
+1. **KV-aware VRAM budget — DONE.** Folds `+ kvPerLayer` into the dense first-N-layers budget (closed
+   form in §4 Tier 0) and reserves the KV cache before placing layers; auto-enables FP16 KV when FP32
+   KV would not fit all layers but FP16 would. MoE-optimised is left unchanged because its KV cache
+   lives on the CPU, not the GPU. Validated: Llama-1B reserves 128 MB KV; Llama-3.2-3B at ctx=16384
+   accounts for 3584 MB KV (previously ignored → late VRAM over-commit); at ctx=24576 it auto-enables
+   FP16 KV and fits all 28 layers.
+3. **CPU physical-core + NUMA tuning — DONE.** The matmul thread pool now defaults to *physical* cores
+   (`CLIOptions.detectPhysicalCores()` via Linux sysfs thread-sibling groups), not logical, because
+   the bandwidth-bound matmul gains nothing from hyperthreads sharing one core's load/store ports;
+   `--threads` overrides. A `numactl` pinning suggestion is logged when >1 NUMA node is detected.
+   Measured Llama-1B CPU decode: **physical-11 ≈ 5.0 tok/s vs logical-22 ≈ 3.8 (+32% best, ~+45% avg).**
+4. **`autosearch.sh` → KV-quant sweep — DONE (local tool).** `cuda.kv.fp16`, `kv.q8`, `kv.q4` are now
+   in the coordinate-ascent flag set. `--gpu-layers` is deliberately left at auto: the budget is now
+   KV-aware, so "fill VRAM" is already the optimal contiguous split and there is nothing to sweep.
+   (`autosearch.sh` is gitignored like the other bench scripts, so this change lives locally.)
+2. **Fractional-layer attention-first placement — DEFERRED.** Splitting one boundary layer into
+   attention-on-GPU + FFN-on-CPU needs the `forwardAttentionOnly` infrastructure wired into the
+   loader and the GPU-resident chain (which assumes whole layers), for an estimated ~1–2% gain — at
+   or below the ±15–30% thermal-noise floor on the reference box. Better revisited together with the
+   Phase 2 MoE attention/FFN split, which shares the same `forwardAttentionOnly` substrate.
 
 ### Phase 2 — Measured auto-tuning + MoE hot-expert cache
 2. **`--auto-tune` calibration** — measure `t_gpu_layer` / `t_cpu_layer` / `t_xfer` at load and pick
