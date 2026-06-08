@@ -233,12 +233,20 @@ OOM/under-fill bug. Highest value per effort.
    with a measurement and auto-correcting the partial-fit footgun (GPU slower than CPU because too
    little fits VRAM or the GPU/bus is weak). One-time, opt-in (it loads the model a couple of extra
    times). Validated on Llama-1B: GPU 93.1 vs CPU 5.8 tok/s → GPU chosen.
-2. **Hot-expert LRU GPU cache for Q4_K MoE — TODO (the dominant lever for 30B-on-6GB).**
-   Frequency-tracking LRU admission on top of `GraniteExpertGpu`, sized from the leftover VRAM
-   budget: keep the top-M hottest experts GPU-resident, serve hits at GPU bandwidth, miss to CPU.
-   The larger, higher-risk item — it touches the validated MoE forward paths and is best validated
-   with a real big-MoE model. Promotion should be frequency-based over a window (not per-miss PCIe
-   upload, which would thrash).
+2. **Routing-frequency instrumentation (Phase 2.2a) — DONE.** `-Dmoe.routing.stats=true` counts
+   per-layer expert selections in `Qwen3MoEInferenceEngine` and prints, at exit, how much routing the
+   top-M experts capture per layer. **Measured on Qwen3-Coder-30B (128 experts, top-8, 48 MoE
+   layers, 34k selections):** top-8 = 38.5 %, top-16 = 57.3 %, **top-32 = 79.2 %**, top-64 = 96.2 %
+   of routing — i.e. routing is **moderately concentrated** (top-32 captures 3.2× its uniform share,
+   top-8 captures 6.4×). **Conclusion: a hot-expert GPU cache is justified** — caching the top-32 of
+   128 experts per layer would serve ~79 % of expert matmuls at GPU bandwidth.
+3. **Hot-expert GPU cache (Phase 2.2b) — TODO, evidence-backed.** Now that 2.2a shows the
+   concentration is real, the cache: run a short routing calibration → pick the top-M hottest experts
+   per layer → upload them to GPU (the `GraniteExpertGpu` offset-pointer matmul) → in `moeFFN`,
+   dispatch each selected expert to GPU if cached, else CPU. Size M from leftover VRAM (e.g. top-16
+   ≈ 1.8 GB, top-32 ≈ 3.7 GB of Q4_K experts for Qwen3-Coder-30B). The larger, higher-risk item: it
+   touches the validated MoE path and its only realistic test vehicle (Qwen3-Coder-30B at ~0.6 tok/s
+   on 6 GB) makes the build–test loop very slow (~2–3 min per iteration).
 
 ### Phase 3 — Multi-GPU layer-split
 4. **Per-layer device map** — generalise `gpuLayers` (count + one device) to `deviceOf[layer]`;
