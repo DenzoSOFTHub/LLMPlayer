@@ -428,6 +428,10 @@ public class LLMEngine implements AutoCloseable {
                     modelBytes / 1e9, ramBytes / 1e9);
             }
         }
+        // Lazy (>RAM) load: advise MADV_RANDOM on the mmap so the OS does not read ahead pages that
+        // will not be used (MoE cold experts are touched sparsely). Sequential read-ahead would only
+        // help the preload case, so this is gated on !preload.
+        System.setProperty("mmap.advise.random", String.valueOf(!preload));
         ModelLoader.LoadedModel model = ModelLoader.load(ggufPath, preload, gpuLayersUsed, moeOptimized);
         int maxCtx = Math.min(maxContextLength, model.config().contextLength());
         return new LLMEngine(model, maxCtx, gpuRes, gpuLayersUsed, deviceName, moeOptimized, gpuChainEnabled);
