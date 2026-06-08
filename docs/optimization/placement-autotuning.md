@@ -211,7 +211,12 @@ OOM/under-fill bug. Highest value per effort.
    (`CLIOptions.detectPhysicalCores()` via Linux sysfs thread-sibling groups), not logical, because
    the bandwidth-bound matmul gains nothing from hyperthreads sharing one core's load/store ports;
    `--threads` overrides. A `numactl` pinning suggestion is logged when >1 NUMA node is detected.
-   Measured Llama-1B CPU decode: **physical-11 ≈ 5.0 tok/s vs logical-22 ≈ 3.8 (+32% best, ~+45% avg).**
+   The choice rests on the bandwidth argument and llama.cpp precedent, not on a measured figure: on
+   the thermally-constrained reference box the effect is **not cleanly measurable** — a single clean
+   A/B showed physical-11 ≈ 5.0 vs logical-22 ≈ 3.8 tok/s, but a heat-soaked sweep was contradictory
+   (physical helped some models and hurt others, with absolute numbers throttled into the 1.5–8 tok/s
+   range). No single speedup figure is claimed; `--threads N` overrides for users who measure
+   otherwise on their hardware.
 4. **`autosearch.sh` → KV-quant sweep — DONE (local tool).** `cuda.kv.fp16`, `kv.q8`, `kv.q4` are now
    in the coordinate-ascent flag set. `--gpu-layers` is deliberately left at auto: the budget is now
    KV-aware, so "fill VRAM" is already the optimal contiguous split and there is nothing to sweep.

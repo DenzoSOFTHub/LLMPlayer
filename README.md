@@ -433,7 +433,7 @@ These flags control how tokens are generated. They affect output quality and cre
 | `--dry-allowed-length` | — | Integer | 2 | DRY: minimum n-gram length before penalty kicks in. |
 | `--dry-range` | — | Integer | 1024 | DRY: lookback window size in tokens. |
 | `--seed` | — | Long | random | Random seed for reproducibility. Same seed + same prompt = same output (when temperature > 0). |
-| `--threads` | — | Integer | physical cores | Number of threads for the parallel matmul. Defaults to **physical** cores (not logical/hyperthreaded) — the matmul hot path is memory-bandwidth bound, so hyperthreads only add port contention (measured ~+32–45 % on Llama-1B CPU decode). |
+| `--threads` | — | Integer | physical cores | Number of threads for the parallel matmul. Defaults to **physical** cores (not logical/hyperthreaded) — the matmul hot path is memory-bandwidth bound, so hyperthreads only add port contention; this is the bandwidth-correct default and matches llama.cpp's practice (`--threads N` overrides). |
 | `--context-length` | `-c` | Integer | 2048 | Maximum context window in tokens. Larger values allow longer conversations but use more RAM. Model's maximum is shown in `--info` output. |
 
 ### GPU Flags

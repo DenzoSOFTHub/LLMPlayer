@@ -15,9 +15,11 @@ ranking, CPU/GPU/multi-GPU tuning) and the three-phase roadmap are in
   at ctx=24576 auto-enables FP16 KV and fits all 28 layers instead of over-committing.
 - **Physical-core thread default.** The matmul thread pool now sizes to *physical* cores, not
   logical/hyperthreaded ones (Linux sysfs detection), because the bandwidth-bound matmul gains
-  nothing from two hyperthreads contending for one core's load/store ports. Measured **~+32 % best /
-  ~+45 % average** on Llama-1B CPU decode (5.0 vs 3.8 tok/s). `--threads` overrides; a `numactl`
-  pinning hint is logged on multi-NUMA-node machines.
+  nothing from two hyperthreads contending for one core's load/store ports. This is the
+  bandwidth-correct default and matches llama.cpp's practice; the measured benefit on the
+  thermally-constrained reference box is inconsistent (a single clean A/B showed physical faster, a
+  heat-soaked sweep was contradictory), so no fixed speedup is quoted. `--threads` overrides; a
+  `numactl` pinning hint is logged on multi-NUMA-node machines.
 - **`--auto-tune`.** Measures steady-state decode tok/s for the GPU placement and for CPU-only, then
   keeps the faster — replacing the file-size-based guess with a measurement and auto-correcting the
   partial-fit footgun where GPU placement is actually slower than CPU (too little fits VRAM, or a
