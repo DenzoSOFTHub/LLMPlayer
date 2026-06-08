@@ -10,6 +10,24 @@
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
+## v1.15.0 — placement auto-tuning (Phase 1 + 2.1)
+
+This release adds the KV-aware VRAM budget (each GPU layer reserves its KV-cache slice; FP16 KV
+auto-enabled when it lets more layers fit), the `--auto-tune` calibration (measures GPU vs CPU
+placement and keeps the faster), and a **physical-core thread default** for the matmul pool. Full
+analysis in `docs/optimization/placement-autotuning.md`.
+
+**Honest note on the CPU physical-vs-logical comparison.** The physical-core default is the
+bandwidth-correct choice for the memory-bound matmul and matches llama.cpp's standard practice, but
+its benefit **could not be reliably measured on the WSL2 laptop reference box.** Two sweeps — one on
+a heat-soaked box and one after a 12-minute cooldown — both produced *contradictory* per-model
+deltas (e.g. Llama-1B physical +100 %, Gemma-3-1B physical −70 % in the same cooled run, with
+absolute numbers swinging into the 1.5–12 tok/s range). Swings of that magnitude cannot come from a
+thread-count choice; they are thermal throttling, which dominates because the benchmark itself
+reheats the laptop within one or two models. **No CPU physical-vs-logical figure is published here.**
+The default rests on theory and precedent; users on non-throttled desktop/server hardware should
+measure on their own machine and override with `--threads N` if needed.
+
 ## Results v1.14.0-dev — three new architectures (2026-06-07)
 
 Three architectures were added: **ERNIE 4.5** (`ernie4_5`, dense transformer), **LFM2** (`lfm2`, gated short-convolution + GQA hybrid, Liquid AI), and **Falcon-H1** (`falcon-h1`, parallel Mamba-2 + attention hybrid, TII). All produce coherent output with EXCELLENT perplexity on both CPU and GPU.

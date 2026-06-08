@@ -1,6 +1,6 @@
 # LLMPlayer — What's New
 
-## Placement auto-tuning — Phase 1 + 2.1 (post-v1.14.0)
+## v1.15.0 — Placement auto-tuning (Phase 1 + 2.1)
 
 Heuristics and tooling for running models that do not fit entirely in VRAM, making the best use of
 the available GPU, CPU cores, and memory. The full analysis (bandwidth cost model, value-per-VRAM
