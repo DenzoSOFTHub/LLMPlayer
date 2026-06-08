@@ -1,5 +1,32 @@
 # LLMPlayer — What's New
 
+## v1.16.0 — Lazy mmap for models > RAM, MoE routing instrumentation, Qwen3-Coder-30B crash fix
+
+This release continues the placement work (Phase 2.2) with a focus on running models that do not fit
+entirely in VRAM — and now in RAM.
+
+- **Lazy mmap for models larger than physical RAM.** `LLMEngine.load` skips the full-file preload
+  when the model exceeds 85 % of physical RAM and relies on lazy mmap instead: only the working set
+  pages in on demand (read-only from the model file, never the swap partition); for MoE the cold
+  experts stay on disk. `-Dno.preload=true` / `-Dpreload=true` force the choice. Combined with
+  MoE-optimised placement (attention in VRAM, experts on CPU/disk), this is the foundation for
+  running models larger than RAM without disk swap.
+
+- **Qwen3-Coder-30B crash fix (real bug).** On some prompts the router logits go NaN; `selectTopK`
+  then left a routing slot at `-1` (`NaN > -inf` is false), and the expert matmul dereferenced expert
+  `-1` (IndexOutOfBounds at a negative tensor offset). Any unfilled slot is now backfilled with a
+  valid expert at negligible weight, and the expert path guards `e < 0`. The 30B now generates
+  coherent output on prompts that previously aborted.
+
+- **MoE routing-frequency instrumentation** (`-Dmoe.routing.stats`). Per-layer expert-selection
+  counters with an at-exit summary of how concentrated routing is. Measured on Qwen3-Coder-30B
+  (128 experts, top-8): the top-32 experts capture ~79 % of routing per layer.
+
+- **Type-aware expert GPU cache.** `ExpertGpuCache` is no longer MXFP4-hardcoded (block geometry +
+  matmul kernel are passed in). The MXFP4 path stays validated and on. The Q4_K/Q5_K/Q6_K path is
+  experimental and off by default (`-Dmoe.expert.cache.experimental`) — see
+  `docs/optimization/placement-autotuning.md` for the investigation status.
+
 ## v1.15.0 — Placement auto-tuning (Phase 1 + 2.1)
 
 Heuristics and tooling for running models that do not fit entirely in VRAM, making the best use of
