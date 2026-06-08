@@ -44,6 +44,15 @@ public class Qwen3MoEInferenceEngine {
     private int currentLayer; // tracks current layer for GPU cache keying
 
     private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
+
+    // Phase 2.2a: MoE routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true).
+    private final boolean routingStats = "true".equals(System.getProperty("moe.routing.stats", "false"));
+    private long[][] expertHits;     // [layer][expert] selection counts
+    private long routingDecisions;   // total expert selections counted
+
+    // Phase 2.2b diagnostic: compare the GPU expert-cache output to the CPU path on the first MoE call.
+    private final boolean debugCache = "true".equals(System.getProperty("moe.cache.debug", "false"));
+    private boolean debugCacheDone;
     private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
     private int profTokenCount;
 
@@ -55,6 +64,12 @@ public class Qwen3MoEInferenceEngine {
         this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
         this.slidingWindow = config.slidingWindow();
         this.noRopeLayerInterval = config.noRopeLayerInterval();
+
+        if (routingStats && config.expertCount() > 0) {
+            expertHits = new long[config.blockCount()][config.expertCount()];
+            Runtime.getRuntime().addShutdownHook(new Thread(this::printRoutingStats));
+            System.err.println("MoE routing stats: enabled (-Dmoe.routing.stats) — summary printed at exit");
+        }
 
         int ropeDimCount = config.ropeDimensionCount();
         RoPE.YarnParams yarnParams = null;
@@ -110,24 +125,37 @@ public class Qwen3MoEInferenceEngine {
      */
     public void initExpertGpuCache(Object cudaContext, long maxCacheBytes) {
         try {
-            // ExpertGpuCache runs the matmul_mxfp4 kernel — it is only valid for MXFP4 experts.
-            // For other expert quant types (e.g. Q4_K in Qwen3-Coder-30B) initializing it leads to a
-            // runtime cache error and a corrupted CPU fallback (IndexOutOfBounds). Skip it for
-            // non-MXFP4 experts: the CPU expert path handles those correctly (attention still on GPU).
+            // Phase 2.2b: the LRU expert GPU cache now supports Q4_K/Q5_K/Q6_K in addition to MXFP4,
+            // so big Q4_K MoE models (Qwen3-Coder-30B) get GPU-cached hot experts. Routing on the 30B
+            // is concentrated (top-32 of 128 experts capture ~79% of routing, Phase 2.2a), so the LRU
+            // hit rate is high and most expert matmuls run at GPU bandwidth instead of CPU.
             it.denzosoft.llmplayer.tensor.GGMLType expertType = null;
             for (Qwen3MoELayerWeights lw : weights.layers()) {
                 if (lw.ffnGateExps() != null) { expertType = lw.ffnGateExps().type(); break; }
             }
-            if (expertType != it.denzosoft.llmplayer.tensor.GGMLType.MXFP4) {
+            // MXFP4 (GPT-OSS) is validated. The Q4_K/Q5_K/Q6_K paths are EXPERIMENTAL
+            // (-Dmoe.expert.cache.experimental=true): the type-aware cache infrastructure works but
+            // the K-quant matmul-in-cache currently produces incorrect output (byte offsets + kernel
+            // signatures match the CPU path, but a subtle issue remains). It is also neutral on
+            // models that fit RAM (GPU per-expert matmul ~ CPU SIMD for small/numerous experts); its
+            // real value would be for models LARGER than RAM, keeping hot experts in VRAM to avoid
+            // paging them from disk. Default OFF so big Q4_K MoE models use the correct CPU path.
+            boolean experimentalKQuant = "true".equals(System.getProperty("moe.expert.cache.experimental", "false"));
+            String kRes, kName;
+            if (expertType == it.denzosoft.llmplayer.tensor.GGMLType.MXFP4) { kRes = "kernels/cuda/matmul_mxfp4.cu"; kName = "matmul_mxfp4"; }
+            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) { kRes = "kernels/cuda/matmul_q4_k.cu"; kName = "matmul_q4_k"; System.out.println("  Expert GPU cache: EXPERIMENTAL Q4_K path (may produce incorrect output)"); }
+            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K) { kRes = "kernels/cuda/matmul_q5_k.cu"; kName = "matmul_q5_k"; }
+            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K) { kRes = "kernels/cuda/matmul_q6_k.cu"; kName = "matmul_q6_k"; }
+            else {
                 System.out.println("  Expert GPU cache: experts are " + expertType
-                    + " (not MXFP4) — using CPU expert path");
+                    + " — using CPU expert path (GPU cache validated for MXFP4 only)");
                 return;
             }
+            int blockSize = expertType.getBlockSize();
+            int blockBytes = expertType.getTypeSize();
             int expertFfnDim = config.expertFfnLength();
             int dim = config.embeddingLength();
             long elementsPerSlice = (long) expertFfnDim * dim;
-            int blockSize = 32;
-            int blockBytes = 17; // MXFP4
             long bytesPerSlice = (elementsPerSlice / blockSize) * blockBytes;
             int maxSlots = (int) (maxCacheBytes / bytesPerSlice);
             if (maxSlots < 12) { // need at least 3 projections × 4 experts
@@ -137,8 +165,11 @@ public class Qwen3MoEInferenceEngine {
 
             Class<?> cacheClass = Class.forName("it.denzosoft.llmplayer.gpu.ExpertGpuCache");
             Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
-            Object cache = cacheClass.getConstructor(ctxClass, int.class, long.class)
-                .newInstance(cudaContext, maxSlots, elementsPerSlice);
+            Object cache = cacheClass.getConstructor(ctxClass, int.class, long.class,
+                    int.class, int.class, String.class, String.class)
+                .newInstance(cudaContext, maxSlots, elementsPerSlice, blockSize, blockBytes, kRes, kName);
+            System.out.println("  Expert GPU cache: " + expertType + " experts, " + maxSlots
+                + " slots — Phase 2.2b hot-expert LRU cache over " + config.expertCount() + " experts");
             computeExpertsMethod = cacheClass.getMethod("computeExperts",
                 FloatTensor.class, FloatTensor.class, FloatTensor.class,
                 float[].class, int[].class, float[].class,
@@ -430,6 +461,15 @@ public class Qwen3MoEInferenceEngine {
             }
         }
 
+        // Phase 2.2a: routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true). Counts
+        // how often each expert is selected per layer, to measure whether routing is concentrated
+        // enough to justify a hot-expert GPU cache. Additive only — no effect on the forward pass.
+        if (routingStats) {
+            long[] hits = expertHits[currentLayer];
+            for (int k = 0; k < expertUsedCount; k++) hits[state.selectedExperts[k]]++;
+            routingDecisions += expertUsedCount;
+        }
+
         // 2. Compute routed expert outputs
         Arrays.fill(state.xb, 0);
 
@@ -452,9 +492,26 @@ public class Qwen3MoEInferenceEngine {
                     state.moeHbPerExpert, state.moeHb2PerExpert, state.expertOutPerExpert,
                     useSwigluOai,
                     weights.ffnGateExpsBias(), weights.ffnUpExpsBias(), weights.ffnDownExpsBias());
-            } catch (Exception e) {
-                // Fallback to CPU on error, disable cache
-                System.err.println("Expert GPU cache error: " + e.getMessage() + " — falling back to CPU");
+
+                if (debugCache && !debugCacheDone) {
+                    debugCacheDone = true;
+                    float[][] gpuOut = new float[expertUsedCount][];
+                    for (int k = 0; k < expertUsedCount; k++) gpuOut[k] = state.expertOutPerExpert[k].clone();
+                    // CPU recompute (overwrites expertOutPerExpert) for comparison
+                    cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
+                    for (int k = 0; k < expertUsedCount; k++) {
+                        double maxd = 0; int e = state.selectedExperts[k];
+                        for (int i = 0; i < dim; i++) maxd = Math.max(maxd, Math.abs(gpuOut[k][i] - state.expertOutPerExpert[k][i]));
+                        System.err.printf("  [cache.debug] layer %d k=%d expert %d: max|GPU-CPU|=%.4f  GPU[0..2]=%.3f,%.3f,%.3f  CPU[0..2]=%.3f,%.3f,%.3f%n",
+                            currentLayer, k, e, maxd, gpuOut[k][0], gpuOut[k][1], gpuOut[k][2],
+                            state.expertOutPerExpert[k][0], state.expertOutPerExpert[k][1], state.expertOutPerExpert[k][2]);
+                    }
+                }
+            } catch (Throwable e) {
+                // Fallback to CPU on error, disable cache. Print the real cause (reflection wraps it).
+                Throwable c = (e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null) ? e.getCause() : e;
+                System.err.println("Expert GPU cache error: " + c + " — falling back to CPU");
+                if ("true".equals(System.getProperty("cuda.debug", "false"))) c.printStackTrace();
                 expertGpuCache = null;
                 computeExpertsMethod = null;
                 cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
@@ -505,6 +562,11 @@ public class Qwen3MoEInferenceEngine {
                 float[] up = state.moeHb2PerExpert[k];
                 float[] out = state.expertOutPerExpert[k];
 
+                // Guard against an unfilled routing slot (selectTopK leaves -1 when router logits
+                // contain NaN): treat it as a zero-contribution expert instead of reading a negative
+                // tensor offset (IndexOutOfBounds). Its routing weight is renormalised away anyway.
+                if (e < 0) { Arrays.fill(out, 0, dim, 0f); return; }
+
                 Arrays.fill(gate, 0, expertFfnDim, 0f);
                 Arrays.fill(up, 0, expertFfnDim, 0f);
 
@@ -542,6 +604,38 @@ public class Qwen3MoEInferenceEngine {
     /**
      * Select top-K indices and values from logits.
      */
+    /** Phase 2.2a: print the expert-routing concentration at exit (decides if a hot-expert cache helps). */
+    private void printRoutingStats() {
+        if (expertHits == null || routingDecisions == 0) return;
+        int L = expertHits.length, E = config.expertCount(), K = config.expertUsedCount();
+        System.err.println("\n=== MoE routing stats (" + routingDecisions + " selections, " + E
+            + " experts, top-" + K + ") ===");
+        int[] Ms = {K, 2 * K, 4 * K, 8 * K, Math.max(1, E / 4), Math.max(1, E / 2)};
+        double[] covSum = new double[Ms.length];
+        int moeLayers = 0;
+        for (int l = 0; l < L; l++) {
+            long[] h = expertHits[l].clone();
+            long tot = 0; for (long x : h) tot += x;
+            if (tot == 0) continue;
+            moeLayers++;
+            java.util.Arrays.sort(h); // ascending; hottest are at the end
+            for (int mi = 0; mi < Ms.length; mi++) {
+                int m = Math.min(Ms[mi], E);
+                long top = 0; for (int i = E - m; i < E; i++) top += h[i];
+                covSum[mi] += (double) top / tot;
+            }
+        }
+        if (moeLayers == 0) return;
+        System.err.printf("  %d MoE layers. Avg fraction of routing captured by the top-M experts per layer:%n", moeLayers);
+        for (int mi = 0; mi < Ms.length; mi++) {
+            int m = Math.min(Ms[mi], E);
+            System.err.printf("    top-%-4d (%2.0f%% of experts): %5.1f%% of routing%n",
+                m, 100.0 * m / E, 100.0 * covSum[mi] / moeLayers);
+        }
+        System.err.println("  Interpretation: a hot-expert GPU cache helps when a small top-M captures most"
+            + " routing (concentrated); it is wasted VRAM when routing is near-uniform (top-M ~ M/E).");
+    }
+
     private static void selectTopK(float[] logits, int n, int k,
                                     int[] outIndices, float[] outValues) {
         Arrays.fill(outIndices, 0, k, -1);
@@ -565,6 +659,12 @@ public class Qwen3MoEInferenceEngine {
                     }
                 }
             }
+        }
+        // Robustness: a slot stays unfilled only when fewer than k logits beat -inf, i.e. the router
+        // logits contained NaN (NaN > x is always false). Fill any such slot with a valid expert at a
+        // negligible weight so downstream never reads expert -1 nor sums a NEGATIVE_INFINITY weight.
+        for (int j = 0; j < k; j++) {
+            if (outIndices[j] < 0) { outIndices[j] = 0; outValues[j] = -1e30f; }
         }
     }
 

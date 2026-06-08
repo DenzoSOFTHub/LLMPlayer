@@ -406,7 +406,29 @@ public class LLMEngine implements AutoCloseable {
                 quickParse.close();
             }
         }
-        ModelLoader.LoadedModel model = ModelLoader.load(ggufPath, true, gpuLayersUsed, moeOptimized);
+        // Preload (warm the whole file into RAM) only when it comfortably fits physical RAM. For a
+        // model LARGER than RAM, preloading is futile — it reads the whole file just to have the OS
+        // evict pages again — so we skip it and rely on lazy mmap: only the working set pages in on
+        // demand (read-only from the model file, never the swap partition), and for MoE the cold
+        // experts stay on disk. Force with -Dno.preload=true / -Dpreload=true.
+        boolean preload;
+        String preloadProp = System.getProperty("preload");
+        String noPreloadProp = System.getProperty("no.preload");
+        if ("true".equals(preloadProp) || "false".equals(noPreloadProp)) {
+            preload = true;
+        } else if ("true".equals(noPreloadProp) || "false".equals(preloadProp)) {
+            preload = false;
+        } else {
+            long modelBytes = Files.size(ggufPath);
+            long ramBytes = getPhysicalMemorySize();
+            preload = ramBytes <= 0 || modelBytes < (long) (0.85 * ramBytes);
+            if (!preload) {
+                System.out.printf("Model (%.1f GB) exceeds 85%% of RAM (%.1f GB) — skipping preload, "
+                    + "using lazy mmap (working set pages in on demand, no full-file warm).%n",
+                    modelBytes / 1e9, ramBytes / 1e9);
+            }
+        }
+        ModelLoader.LoadedModel model = ModelLoader.load(ggufPath, preload, gpuLayersUsed, moeOptimized);
         int maxCtx = Math.min(maxContextLength, model.config().contextLength());
         return new LLMEngine(model, maxCtx, gpuRes, gpuLayersUsed, deviceName, moeOptimized, gpuChainEnabled);
     }
