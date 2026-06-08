@@ -44,6 +44,11 @@ public class Qwen3MoEInferenceEngine {
     private int currentLayer; // tracks current layer for GPU cache keying
 
     private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
+
+    // Phase 2.2a: MoE routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true).
+    private final boolean routingStats = "true".equals(System.getProperty("moe.routing.stats", "false"));
+    private long[][] expertHits;     // [layer][expert] selection counts
+    private long routingDecisions;   // total expert selections counted
     private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
     private int profTokenCount;
 
@@ -55,6 +60,12 @@ public class Qwen3MoEInferenceEngine {
         this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
         this.slidingWindow = config.slidingWindow();
         this.noRopeLayerInterval = config.noRopeLayerInterval();
+
+        if (routingStats && config.expertCount() > 0) {
+            expertHits = new long[config.blockCount()][config.expertCount()];
+            Runtime.getRuntime().addShutdownHook(new Thread(this::printRoutingStats));
+            System.err.println("MoE routing stats: enabled (-Dmoe.routing.stats) — summary printed at exit");
+        }
 
         int ropeDimCount = config.ropeDimensionCount();
         RoPE.YarnParams yarnParams = null;
@@ -430,6 +441,15 @@ public class Qwen3MoEInferenceEngine {
             }
         }
 
+        // Phase 2.2a: routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true). Counts
+        // how often each expert is selected per layer, to measure whether routing is concentrated
+        // enough to justify a hot-expert GPU cache. Additive only — no effect on the forward pass.
+        if (routingStats) {
+            long[] hits = expertHits[currentLayer];
+            for (int k = 0; k < expertUsedCount; k++) hits[state.selectedExperts[k]]++;
+            routingDecisions += expertUsedCount;
+        }
+
         // 2. Compute routed expert outputs
         Arrays.fill(state.xb, 0);
 
@@ -542,6 +562,38 @@ public class Qwen3MoEInferenceEngine {
     /**
      * Select top-K indices and values from logits.
      */
+    /** Phase 2.2a: print the expert-routing concentration at exit (decides if a hot-expert cache helps). */
+    private void printRoutingStats() {
+        if (expertHits == null || routingDecisions == 0) return;
+        int L = expertHits.length, E = config.expertCount(), K = config.expertUsedCount();
+        System.err.println("\n=== MoE routing stats (" + routingDecisions + " selections, " + E
+            + " experts, top-" + K + ") ===");
+        int[] Ms = {K, 2 * K, 4 * K, 8 * K, Math.max(1, E / 4), Math.max(1, E / 2)};
+        double[] covSum = new double[Ms.length];
+        int moeLayers = 0;
+        for (int l = 0; l < L; l++) {
+            long[] h = expertHits[l].clone();
+            long tot = 0; for (long x : h) tot += x;
+            if (tot == 0) continue;
+            moeLayers++;
+            java.util.Arrays.sort(h); // ascending; hottest are at the end
+            for (int mi = 0; mi < Ms.length; mi++) {
+                int m = Math.min(Ms[mi], E);
+                long top = 0; for (int i = E - m; i < E; i++) top += h[i];
+                covSum[mi] += (double) top / tot;
+            }
+        }
+        if (moeLayers == 0) return;
+        System.err.printf("  %d MoE layers. Avg fraction of routing captured by the top-M experts per layer:%n", moeLayers);
+        for (int mi = 0; mi < Ms.length; mi++) {
+            int m = Math.min(Ms[mi], E);
+            System.err.printf("    top-%-4d (%2.0f%% of experts): %5.1f%% of routing%n",
+                m, 100.0 * m / E, 100.0 * covSum[mi] / moeLayers);
+        }
+        System.err.println("  Interpretation: a hot-expert GPU cache helps when a small top-M captures most"
+            + " routing (concentrated); it is wasted VRAM when routing is near-uniform (top-M ~ M/E).");
+    }
+
     private static void selectTopK(float[] logits, int n, int k,
                                     int[] outIndices, float[] outValues) {
         Arrays.fill(outIndices, 0, k, -1);
