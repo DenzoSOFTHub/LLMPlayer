@@ -272,7 +272,7 @@ Response parsing in `OpenAIHandler.tryParseToolCalls()`. Multi-tool-call parsing
 
 Two GPU offloading strategies are available, selected automatically based on model architecture and VRAM:
 
-Full analysis and the heuristics behind these strategies (the bandwidth cost model, value-per-VRAM-byte ranking, CPU/GPU/multi-GPU tuning) are in `docs/optimization/placement-autotuning.md`.
+The operational reference for every placement decision rule (exact thresholds, the closed-form KV-aware budget, `--auto-tune`, CPU thread sizing, lazy mmap for models > RAM, with file:line citations) is `docs/optimization/autotuning-heuristics.md`. The deeper analysis behind these strategies (the bandwidth cost model, value-per-VRAM-byte ranking, CPU/GPU/multi-GPU tuning, and the roadmap) is in `docs/optimization/placement-autotuning.md`.
 
 #### First-N-layers (dense models)
 The default for dense architectures (Llama, Qwen2, GLM4, Phi, Mistral). The first N layers go entirely on GPU, the rest on CPU. N is calculated from available VRAM (`--gpu-layers -1` auto-detects, `--gpu-layers N` forces N layers). The budget is **KV-aware**: each GPU layer reserves its KV-cache slice (which grows with context length) via the closed form `N = (usableVram − nonLayerBytes) / (bytesPerLayer + kvPerLayer)`, so long contexts no longer over-commit VRAM. When FP32 KV would not fit all layers but FP16 KV would, FP16 KV (`-Dcuda.kv.fp16`) is auto-enabled. (MoE-optimized is unaffected — its KV cache lives on the CPU.)
