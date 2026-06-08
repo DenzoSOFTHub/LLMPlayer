@@ -221,11 +221,13 @@ OOM/under-fill bug. Highest value per effort.
    in the coordinate-ascent flag set. `--gpu-layers` is deliberately left at auto: the budget is now
    KV-aware, so "fill VRAM" is already the optimal contiguous split and there is nothing to sweep.
    (`autosearch.sh` is gitignored like the other bench scripts, so this change lives locally.)
-2. **Fractional-layer attention-first placement — DEFERRED.** Splitting one boundary layer into
-   attention-on-GPU + FFN-on-CPU needs the `forwardAttentionOnly` infrastructure wired into the
+2. **Fractional-layer attention-first placement — CLOSED (won't do).** Splitting one boundary layer
+   into attention-on-GPU + FFN-on-CPU needs the `forwardAttentionOnly` infrastructure wired into the
    loader and the GPU-resident chain (which assumes whole layers), for an estimated ~1–2% gain — at
-   or below the ±15–30% thermal-noise floor on the reference box. Better revisited together with the
-   Phase 2 MoE attention/FFN split, which shares the same `forwardAttentionOnly` substrate.
+   or below the ±15–30% noise floor on this shared, thermally-constrained reference box. The
+   risk/reward is poor: it adds a special case to the validated whole-layer forward loop and loader
+   for a gain that cannot even be measured here. Closed rather than left dangling; the
+   `forwardAttentionOnly` substrate remains available if a future MoE attention/FFN split needs it.
 
 ### Phase 2 — Measured auto-tuning + MoE hot-expert cache
 1. **`--auto-tune` calibration — DONE.** `--auto-tune` measures steady-state decode tok/s for the
@@ -263,8 +265,14 @@ OOM/under-fill bug. Highest value per effort.
      launch geometry (`getMatmulBlockDim`→256, grid `ceil(rows/8)`, smem 0 — identical to the in-place
      path); and weight repacking (`getGpuWeights` uploads raw bytes, no repack). The exact byte-level
      root cause (why the *same raw Q4_K bytes* dequant correctly in-place but as huge values from the
-     cache's uploaded slot) remains open and would need GPU-memory dumping to settle. MXFP4 (GPT-OSS)
-     stays validated and on. The diagnostic harness is retained behind `-Dmoe.cache.debug`.
+     cache's uploaded slot) remains open. `compute-sanitizer --tool memcheck` was tried to catch a
+     misaligned/OOB access directly but **cannot instrument this stack** ("Target application
+     terminated before first instrumented API call") — the JVM reaches `libcuda` through Panama FFM /
+     `dlopen`, which defeats the sanitizer's driver-API interception. cuda-gdb has the same obstacle.
+     **Disposition: closed as gated-experimental.** The bug is investigated to the limit of the
+     tooling available against a JVM+FFM+driver-API stack, and the payoff is untestable on this box
+     (neutral in-RAM, no >RAM model), so it is not worth unbounded debugging. MXFP4 (GPT-OSS) stays
+     validated and on; the diagnostic harness is retained behind `-Dmoe.cache.debug` for a future fix.
    - **Measured neutral on models that fit RAM.** On the 30B (18 GB, fits 31 GB RAM) the cache ran at
      ~0.6–1.0 tok/s — the same as the CPU expert path — because the per-expert GPU matmul launch +
      PCIe-miss overhead roughly equals CPU SIMD for these small, numerous experts (top-8 × 48 layers
@@ -280,6 +288,13 @@ OOM/under-fill bug. Highest value per effort.
    the foundation for running models larger than physical RAM without disk swap — combined with
    MoE-optimised placement (attention in VRAM) and, eventually, a corrected hot-expert cache, the hot
    working set stays in VRAM+RAM while cold weights remain on disk.
+5. **`madvise(MADV_RANDOM)` on the lazy mmap — DONE.** When `load` skips preload it sets
+   `mmap.advise.random=true`, and `MemorySegmentTensorData.mapFile` issues `madvise(MADV_RANDOM)` on
+   the mapped file (libc via Panama FFM, best-effort, caught on non-Linux). This disables OS
+   read-ahead, which is pure waste for sparse random cold-expert access on the >RAM path; the
+   sequential preload path keeps default read-ahead (gated on `!preload`). The measurable benefit
+   requires a model larger than this box's 31 GB RAM, which is not available here, so the change is
+   correctness/contained-by-construction rather than benchmarked.
 
 ### Phase 3 — Multi-GPU layer-split — NOT IMPLEMENTED (no hardware)
 **Parked deliberately.** The reference machine has a single GPU, so a multi-GPU layer-split (per-layer
