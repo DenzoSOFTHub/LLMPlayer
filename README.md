@@ -1,6 +1,18 @@
-# LLMPlayer v1.14.0
+# LLMPlayer v1.16.1
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), and **Falcon-H1** (parallel Mamba-2 + attention hybrid). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, cuBLAS support (opt-in), an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), and **Falcon-H1** (parallel Mamba-2 + attention hybrid). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads) and **lazy mmap for models larger than RAM**, cuBLAS support (opt-in), an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.16.1
+
+**Lazy mmap for models > RAM, placement auto-tuning, and a verification sweep.** When a model exceeds 85 % of physical RAM, LLMPlayer now skips the full-file preload and relies on lazy mmap — only the working set pages in on demand (read-only from the model file, never the swap partition), with `madvise(MADV_RANDOM)` disabling wasteful read-ahead — so models larger than RAM run without disk swap, especially MoE (attention in VRAM, cold experts on disk). A 10-architecture GPU regression sweep (see `BENCHMARKS.md`) confirms no regression, and `Qwen3.5-0.8B` (smallest official Qwen3.5) is verified runnable with full GPU offload. All three release jars are self-contained (zero external dependencies) and production-verified.
+
+### What's new in v1.16.0
+
+**Placement Phase 2.2 + a real crash fix.** MoE routing-frequency instrumentation (`-Dmoe.routing.stats`; Qwen3-Coder-30B routing is concentrated — top-32 of 128 experts capture ~79 %). Fixed a Qwen3-Coder-30B crash where NaN router logits left a routing slot at `-1`. Type-aware expert GPU cache (MXFP4 validated; K-quant path experimental/off).
+
+### What's new in v1.15.0
+
+**Placement auto-tuning Phase 1 + 2.1.** KV-aware VRAM budget (each GPU layer reserves its KV-cache slice; FP16 KV auto-enabled when it lets more layers fit), `--auto-tune` (measures GPU vs CPU placement and keeps the faster), and a physical-core thread default for the matmul pool. Full analysis in `docs/optimization/placement-autotuning.md`.
 
 ### What's new in v1.14.0
 
