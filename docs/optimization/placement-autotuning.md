@@ -240,19 +240,46 @@ OOM/under-fill bug. Highest value per effort.
    of routing — i.e. routing is **moderately concentrated** (top-32 captures 3.2× its uniform share,
    top-8 captures 6.4×). **Conclusion: a hot-expert GPU cache is justified** — caching the top-32 of
    128 experts per layer would serve ~79 % of expert matmuls at GPU bandwidth.
-3. **Hot-expert GPU cache (Phase 2.2b) — TODO, evidence-backed.** Now that 2.2a shows the
-   concentration is real, the cache: run a short routing calibration → pick the top-M hottest experts
-   per layer → upload them to GPU (the `GraniteExpertGpu` offset-pointer matmul) → in `moeFFN`,
-   dispatch each selected expert to GPU if cached, else CPU. Size M from leftover VRAM (e.g. top-16
-   ≈ 1.8 GB, top-32 ≈ 3.7 GB of Q4_K experts for Qwen3-Coder-30B). The larger, higher-risk item: it
-   touches the validated MoE path and its only realistic test vehicle (Qwen3-Coder-30B at ~0.6 tok/s
-   on 6 GB) makes the build–test loop very slow (~2–3 min per iteration).
+3. **Hot-expert GPU cache (Phase 2.2b) — PARTIAL.** The existing `ExpertGpuCache` (per-layer LRU,
+   wired into `moeFFN`) was made **type-aware** — block geometry + matmul kernel are now passed in,
+   so it is no longer MXFP4-hardcoded. Three concrete outcomes:
+   - **Real bug fixed (shipped on by default):** building the cache for Q4_K exposed a latent
+     Qwen3-Coder-30B crash. On some prompts the router logits go NaN; `selectTopK` then leaves a
+     routing slot at `-1` (because `NaN > -inf` is false), and both the cache (negative byte offset)
+     and the CPU path (`IndexOutOfBounds` at offset `-884736` = exactly one Q4_K expert slice)
+     dereferenced expert `-1`. `selectTopK` now fills any unfilled slot with a valid expert at
+     negligible weight, and `cpuExpertCompute` guards `e < 0`. The 30B now generates coherent output
+     on prompts that previously aborted.
+   - **Q4_K/Q5_K/Q6_K cache path: EXPERIMENTAL, default OFF** (`-Dmoe.expert.cache.experimental`).
+     The type-aware plumbing initialises correctly (e.g. `Q4_K experts, 5681 slots` on the 30B) but
+     the K-quant matmul-in-cache currently produces incorrect output (the byte offsets and kernel
+     signatures match the working CPU path, so the remaining defect is subtle). MXFP4 (GPT-OSS) stays
+     validated and on.
+   - **Measured neutral on models that fit RAM.** On the 30B (18 GB, fits 31 GB RAM) the cache ran at
+     ~0.6–1.0 tok/s — the same as the CPU expert path — because the per-expert GPU matmul launch +
+     PCIe-miss overhead roughly equals CPU SIMD for these small, numerous experts (top-8 × 48 layers
+     = ~1150 tiny matmuls/token). **Its real value is for models LARGER than RAM:** there the cache
+     keeps hot experts in VRAM and avoids paging them from *disk* (~100× slower than RAM), which is
+     not observable on the in-RAM 30B. That benefit awaits both the K-quant correctness fix and a
+     >RAM test model.
 
-### Phase 3 — Multi-GPU layer-split
-4. **Per-layer device map** — generalise `gpuLayers` (count + one device) to `deviceOf[layer]`;
-   contiguous proportional assignment across GPUs by free VRAM; one `CudaForwardPass` per device with
-   GPU→GPU activation hand-off; spill remainder to CPU. Pipeline parallel, not tensor parallel.
+4. **Lazy mmap for models > RAM — DONE.** `LLMEngine.load` now skips the full-file preload when the
+   model exceeds 85 % of physical RAM (`getPhysicalMemorySize`) and relies on lazy mmap: only the
+   working set pages in on demand (read-only from the model file, never the swap partition); for MoE
+   the cold experts stay on disk. `-Dno.preload=true` / `-Dpreload=true` force the choice. This is
+   the foundation for running models larger than physical RAM without disk swap — combined with
+   MoE-optimised placement (attention in VRAM) and, eventually, a corrected hot-expert cache, the hot
+   working set stays in VRAM+RAM while cold weights remain on disk.
 
-Phases are ordered by value/effort and dependency: Phase 1 fixes and sharpens the current
-single-GPU/CPU path, Phase 2 adds measurement-driven decisions and the MoE cache, Phase 3 is the
-larger architectural step to multiple GPUs.
+### Phase 3 — Multi-GPU layer-split — NOT IMPLEMENTED (no hardware)
+**Parked deliberately.** The reference machine has a single GPU, so a multi-GPU layer-split (per-layer
+device map, GPU→GPU activation hand-off) cannot be validated here, and shipping an untested
+multi-device forward pass would be irresponsible. The design — generalise `gpuLayers` to
+`deviceOf[layer]`, contiguous proportional assignment by free VRAM, one `CudaForwardPass` per device,
+pipeline (not tensor) parallel — is recorded for when multi-GPU hardware is available.
+
+### A note on benchmarking this box
+CPU/throughput measurements here are unreliable for fine comparisons: the machine is **shared with
+other tenants' workloads** (observed concurrent JVMs from unrelated projects) and is thermally
+constrained. Contention + throttling — not the change under test — dominated the contradictory
+physical-vs-logical CPU sweeps. Treat small (<2×) tok/s deltas measured here as noise.
