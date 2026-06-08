@@ -103,6 +103,13 @@ public class CLIRunner {
             }
         }
 
+        // --auto-tune (Phase 2.1): empirically compare GPU placement against CPU-only and keep the
+        // faster. This catches the case where too little of a partial-fit model lands in VRAM (or the
+        // GPU/bus is weak) so that GPU placement is actually slower than running entirely on the CPU.
+        if (options.isAutoTune() && !options.isNoGpu()) {
+            gpuConfig = autoTune(modelPath, gpuConfig, options);
+        }
+
         System.out.println("Loading model: " + modelPath);
 
         try (LLMEngine engine = LLMEngine.load(modelPath, options.getContextLength(), gpuConfig,
@@ -156,6 +163,47 @@ public class CLIRunner {
             for (EvaluationResult eval : response.evaluation()) {
                 System.out.println("  " + eval);
             }
+        }
+    }
+
+    /**
+     * --auto-tune calibration (Phase 2.1): measure steady-state decode tok/s for the heuristic GPU
+     * placement and for CPU-only, then return the faster configuration. A one-time, opt-in
+     * calibration (it loads the model a couple of extra times) that replaces "guess from file size"
+     * with a measurement, and auto-corrects the partial-fit footgun where GPU placement is slower
+     * than CPU because too little fits VRAM or the GPU/bus is weak.
+     */
+    private GpuConfig autoTune(Path modelPath, GpuConfig gpuConfig, CLIOptions options) {
+        final String calPrompt = "Write one short paragraph about the history of computing.";
+        final int calTokens = 24;
+        System.out.println("=== Auto-tune calibration (measuring placements) ===");
+        double tpsGpu = measurePlacement(modelPath, gpuConfig, options, calPrompt, calTokens, "GPU placement");
+        GpuConfig cpuCfg = new GpuConfig(); // GPU disabled
+        double tpsCpu = measurePlacement(modelPath, cpuCfg, options, calPrompt, calTokens, "CPU-only");
+        if (!Double.isNaN(tpsGpu) && tpsGpu >= tpsCpu) {
+            System.out.printf("Auto-tune: GPU placement wins (%.1f vs %.1f tok/s) — using GPU.%n", tpsGpu, tpsCpu);
+            return gpuConfig;
+        } else if (!Double.isNaN(tpsCpu)) {
+            System.out.printf("Auto-tune: CPU-only is faster (%.1f vs %.1f tok/s) — too little fits VRAM "
+                + "or the GPU/bus is weak; using CPU.%n", tpsCpu, tpsGpu);
+            return cpuCfg;
+        }
+        return gpuConfig;
+    }
+
+    /** Load the model with {@code cfg}, run a discarded warm-up then a measured decode, return tok/s. */
+    private double measurePlacement(Path modelPath, GpuConfig cfg, CLIOptions options,
+                                    String prompt, int nTokens, String label) {
+        try (LLMEngine e = LLMEngine.load(modelPath, options.getContextLength(), cfg, options.isGpuChainEnabled())) {
+            SamplerConfig sampler = options.toSamplerConfig();
+            e.generate(GenerationRequest.builder().prompt(prompt).maxTokens(6).samplerConfig(sampler).build());
+            GenerationResponse r = e.generate(
+                GenerationRequest.builder().prompt(prompt).maxTokens(nTokens).samplerConfig(sampler).build());
+            System.out.printf("  %-14s %.1f tok/s%n", label + ":", r.tokensPerSecond());
+            return r.tokensPerSecond();
+        } catch (Exception ex) {
+            System.out.println("  " + label + ": unavailable (" + ex.getMessage() + ")");
+            return Double.NaN;
         }
     }
 

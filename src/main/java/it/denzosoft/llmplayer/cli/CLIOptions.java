@@ -30,6 +30,7 @@ public class CLIOptions {
     private String ggufDirectory = "gguf";
     private boolean gpuEnabled;
     private boolean noGpu;
+    private boolean autoTune;   // --auto-tune: empirically compare GPU vs CPU placement and pick the faster
 
     // Speculative decoding (Tier 3) — opt-in
     private String draftModelPath;       // path to draft GGUF; enables speculative decoding when set
@@ -121,6 +122,8 @@ public class CLIOptions {
                 opts.ggufDirectory = args[++i];
             } else if ("--no-gpu".equals(arg)) {
                 opts.noGpu = true;
+            } else if ("--auto-tune".equals(arg)) {
+                opts.autoTune = true;
             } else if ("--gpu".equals(arg)) {
                 opts.gpuEnabled = true;
             } else if ("--gpu-device".equals(arg)) {
@@ -266,6 +269,7 @@ public class CLIOptions {
     public int getGpuDeviceId() { return gpuDeviceId; }
     public boolean isGpuList() { return gpuList; }
     public boolean isNoGpu() { return noGpu; }
+    public boolean isAutoTune() { return autoTune; }
     public int getGpuLayers() { return gpuLayers; }
     public Boolean getMoeOptimized() { return moeOptimized; }
     public boolean isGpuChainEnabled() { return gpuChainEnabled; }
@@ -320,7 +324,8 @@ public class CLIOptions {
         System.out.println("  --dry-allowed-length <n> DRY min match length (default: 2)");
         System.out.println("  --dry-range <num>        DRY lookback window (default: 1024)");
         System.out.println("  --seed <num>             Random seed");
-        System.out.println("  --threads <num>          Number of threads");
+        System.out.println("  --threads <num>          Number of threads (default: physical cores)");
+        System.out.println("  --auto-tune              Measure GPU vs CPU placement and use the faster");
         System.out.println("  --context-length, -c <n> Max context length (default: 2048)");
         System.out.println("  --info                   Show model info and exit");
         System.out.println("  --web, -w                Start web UI server");

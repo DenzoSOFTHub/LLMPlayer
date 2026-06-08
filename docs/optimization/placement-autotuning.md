@@ -223,10 +223,17 @@ OOM/under-fill bug. Highest value per effort.
    Phase 2 MoE attention/FFN split, which shares the same `forwardAttentionOnly` substrate.
 
 ### Phase 2 — Measured auto-tuning + MoE hot-expert cache
-2. **`--auto-tune` calibration** — measure `t_gpu_layer` / `t_cpu_layer` / `t_xfer` at load and pick
-   N and the strategy (first-N vs MoE-optimised) from measurements, not file-size estimates.
-3. **Hot-expert LRU GPU cache for Q4_K MoE** — frequency-tracking LRU admission on top of
-   `GraniteExpertGpu`, sized from the leftover VRAM budget. The dominant lever for 30B-on-6GB.
+1. **`--auto-tune` calibration — DONE.** `--auto-tune` measures steady-state decode tok/s for the
+   heuristic GPU placement and for CPU-only, then keeps the faster — replacing the file-size guess
+   with a measurement and auto-correcting the partial-fit footgun (GPU slower than CPU because too
+   little fits VRAM or the GPU/bus is weak). One-time, opt-in (it loads the model a couple of extra
+   times). Validated on Llama-1B: GPU 93.1 vs CPU 5.8 tok/s → GPU chosen.
+2. **Hot-expert LRU GPU cache for Q4_K MoE — TODO (the dominant lever for 30B-on-6GB).**
+   Frequency-tracking LRU admission on top of `GraniteExpertGpu`, sized from the leftover VRAM
+   budget: keep the top-M hottest experts GPU-resident, serve hits at GPU bandwidth, miss to CPU.
+   The larger, higher-risk item — it touches the validated MoE forward paths and is best validated
+   with a real big-MoE model. Promotion should be frequency-based over a window (not per-miss PCIe
+   upload, which would thrash).
 
 ### Phase 3 — Multi-GPU layer-split
 4. **Per-layer device map** — generalise `gpuLayers` (count + one device) to `deviceOf[layer]`;
