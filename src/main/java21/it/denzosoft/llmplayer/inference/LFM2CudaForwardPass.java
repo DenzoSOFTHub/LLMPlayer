@@ -248,6 +248,8 @@ public class LFM2CudaForwardPass implements AutoCloseable {
 
     public static boolean isSupported(ModelConfig config, LFM2Weights weights) {
         if (weights.layers().length == 0) return false;
+        // LFM2-MoE: the routed-expert FFN only exists on the CPU path
+        if (config.expertCount() > 0) return false;
         if (!(weights.output() instanceof CudaFloatTensor)) return false;
         for (LFM2LayerWeights lw : weights.layers()) {
             FloatTensor[] mm = lw.isAttention()

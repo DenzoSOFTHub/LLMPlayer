@@ -280,6 +280,14 @@ OOM/under-fill bug. Highest value per effort.
      keeps hot experts in VRAM and avoids paging them from *disk* (~100× slower than RAM), which is
      not observable on the in-RAM 30B. That benefit awaits both the K-quant correctness fix and a
      >RAM test model.
+   - **Update (v1.17.0, 2026-08-11): the >RAM test model now exists, and the hypothesis held — but on
+     the CPU side.** The reference box was reconfigured from 31 GB to 7.8 GB of RAM, which puts the
+     local 18–24 GB MoE models at 2.4–3.1× RAM and makes this regime measurable at last. The payoff
+     was realised by an equivalent **host-RAM** cache (`MappedExpertCache`) rather than the VRAM one:
+     Qwen3-Coder-30B went 0.1 → 1.0 decode tok/s, 3.2× on wall clock, with bit-identical output. The
+     `ExpertGpuCache` K-quant correctness bug is untouched and still gated off; the RAM cache is a
+     deliberately separate CPU-side path that does not depend on it. See
+     [`ssd-streaming-cache.md`](ssd-streaming-cache.md).
 
 4. **Lazy mmap for models > RAM — DONE.** `LLMEngine.load` now skips the full-file preload when the
    model exceeds 85 % of physical RAM (`getPhysicalMemorySize`) and relies on lazy mmap: only the
@@ -288,13 +296,24 @@ OOM/under-fill bug. Highest value per effort.
    the foundation for running models larger than physical RAM without disk swap — combined with
    MoE-optimised placement (attention in VRAM) and, eventually, a corrected hot-expert cache, the hot
    working set stays in VRAM+RAM while cold weights remain on disk.
-5. **`madvise(MADV_RANDOM)` on the lazy mmap — DONE.** When `load` skips preload it sets
-   `mmap.advise.random=true`, and `MemorySegmentTensorData.mapFile` issues `madvise(MADV_RANDOM)` on
-   the mapped file (libc via Panama FFM, best-effort, caught on non-Linux). This disables OS
-   read-ahead, which is pure waste for sparse random cold-expert access on the >RAM path; the
-   sequential preload path keeps default read-ahead (gated on `!preload`). The measurable benefit
-   requires a model larger than this box's 31 GB RAM, which is not available here, so the change is
-   correctness/contained-by-construction rather than benchmarked.
+5. **Pattern-aware `madvise` on the lazy mmap — DONE (extended from MADV_RANDOM-only).** When
+   `load` skips preload it quick-parses the GGUF metadata for `expertCount` and sets the internal
+   `mmap.advise` property to `random` (MoE — sparse cold-expert access, read-ahead is pure waste)
+   or `sequential` (dense — the per-token layer walk is cyclic-sequential, so MADV_SEQUENTIAL keeps
+   read-ahead aggressive and tells the kernel to drop the pages behind the walk first, the right
+   eviction policy for a pattern that defeats the page-cache LRU). `MemorySegmentTensorData.mapFile`
+   issues the corresponding `madvise` (libc via Panama FFM, best-effort, caught on non-Linux). The
+   preloaded path keeps default read-ahead (`mmap.advise=none`).
+6. **Next-layer prefetch on the dense lazy path — DONE.** `LayerPrefetcher` (attached by `LLMEngine`
+   to the standard `InferenceEngine` when `mmap.advise=sequential`) pages in layer N+1's weight
+   range — derived from the GGUF tensor directory `blk.N.*` offsets — on a background daemon thread
+   while the CPU loop computes layer N, overlapping disk I/O with compute. This is the AirLLM
+   prefetch pattern (~10 % end-to-end there); the single-slot discard queue means a lagging disk
+   just drops requests and the compute thread faults the pages itself. Prefetch starts at the first
+   CPU-resident layer and wraps to it past the last layer, so the next token's first read is in
+   flight during the output projection. `-Dmmap.prefetch=false` disables; MoE lazy loads get no
+   prefetcher (routed-expert access is unpredictable; a whole-layer range read would drag all
+   experts in).
 
 ### Phase 3 — Multi-GPU layer-split — NOT IMPLEMENTED (no hardware)
 **Parked deliberately.** The reference machine has a single GPU, so a multi-GPU layer-split (per-layer

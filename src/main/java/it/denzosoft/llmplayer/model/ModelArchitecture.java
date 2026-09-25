@@ -25,7 +25,11 @@ public enum ModelArchitecture {
     GRANITE_HYBRID("granitehybrid"),
     ERNIE4_5("ernie4_5"),
     LFM2("lfm2"),
-    FALCON_H1("falcon-h1");
+    FALCON_H1("falcon-h1"),
+    HUNYUAN_DENSE("hunyuan-dense"),
+    NANBEIGE("nanbeige"),
+    SPARK2_5("spark2_5"),
+    BAILINGMOE3("bailingmoe3");
 
     private final String ggufName;
 
@@ -52,6 +56,32 @@ public enum ModelArchitecture {
         }
         if ("gemma".equals(name)) {
             return GEMMA2; // Gemma1 uses same forward pass
+        }
+        // Qwen2.5-VL / Qwen3-VL text backbones: the decoder is Qwen2 / Qwen3. They use multi-axis
+        // RoPE (MRoPE / IMRoPE), but for text tokens the three position axes are equal and the
+        // rotation reduces to NEOX RoPE — see llama.cpp ggml_rope_multi. The vision projector
+        // (mmproj) is a separate file.
+        if ("qwen3vl".equals(name)) {
+            return QWEN3;
+        }
+        if ("qwen2vl".equals(name)) {
+            return QWEN2;
+        }
+        // Qwen3-TTS talker: the Qwen3-VL decoder (IMROPE) over a text + codec vocabulary, with a
+        // 3072-row codec output head. Only usable through it.denzosoft.llmplayer.tts.Qwen3Tts.
+        if ("qwen3tts".equals(name)) {
+            return QWEN3;
+        }
+        // LFM2-MoE (LFM2.5-8B-A1B): the LFM2 conv/attention layer mix with a routed-expert FFN on
+        // layers >= leading_dense_block_count (llama.cpp lfm2.cpp build_moe_feed_forward).
+        if ("lfm2moe".equals(name)) {
+            return LFM2;
+        }
+        // GLM-4.5 / 4.6 / 4.7 MoE (GLM-4.5-Air etc.): GLM4 attention with bias and optional QK-norm,
+        // leading dense blocks, sigmoid-routed experts with exp_probs_b and a shared expert. Runs on
+        // Qwen3MoEInferenceEngine (the GLM4 + expertCount > 0 branch); RoPE is NEOX, unlike glm4.
+        if ("glm4moe".equals(name)) {
+            return GLM4;
         }
         if ("granite".equals(name)) {
             return GRANITE; // Standard transformer, own chat template + NEOX RoPE

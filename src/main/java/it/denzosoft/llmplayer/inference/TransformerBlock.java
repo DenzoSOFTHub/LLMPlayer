@@ -158,6 +158,58 @@ public class TransformerBlock {
         }
     }
 
+    /**
+     * Whether {@link #forwardBatch} reproduces {@link #forward} for this layer. Covered: pre-norm
+     * (RMSNorm or LayerNorm), optional post-attention/post-FFN norms (Gemma 2/3, GLM4) and Granite
+     * residual scaling, merged QKV and the Spark2.5 head gate. Not covered, so prefilled token by
+     * token: parallel FFN (Command-R), post-norm only (OLMo2) and packed gate/up (GLM4, Phi-3/4).
+     */
+    boolean supportsBatch(TransformerLayerWeights weights, int layer) {
+        return cachedAttnNorm[layer] != null && cachedFfnNorm[layer] != null
+            && attention.supportsBatch(weights) && ffn.supportsBatch(weights);
+    }
+
+    /**
+     * Multi-token forward for batched prefill: advances {@code b.x[t]} through this layer for the
+     * tokens at positions {@code basePos .. basePos + n - 1}. Same operations and order per token as
+     * {@link #forward}; the matmuls are shared across tokens.
+     */
+    void forwardBatch(PrefillBatch b, InferenceState state, TransformerLayerWeights weights,
+                      int layer, int basePos, int n) {
+        int dim = config.embeddingLength();
+        float[] attnNorm = cachedAttnNorm[layer];
+        float[] ffnNorm = cachedFfnNorm[layer];
+        float[] postAttnNorm = cachedPostAttnNorm[layer];
+        float[] postFfnNorm = cachedPostFfnNorm[layer];
+
+        for (int t = 0; t < n; t++) normalize(b.xb[t], b.x[t], attnNorm, dim);
+        attention.forwardBatch(b, state, weights, layer, basePos, n);
+        for (int t = 0; t < n; t++) {
+            if (postAttnNorm != null) normalize(b.xb[t], b.xb[t], postAttnNorm, dim);
+            if (residualScale > 0f) {
+                for (int i = 0; i < dim; i++) b.xb[t][i] *= residualScale;
+            }
+            VectorOpsFactory.get().accumulate(b.x[t], b.xb[t], dim);
+            normalize(b.xb[t], b.x[t], ffnNorm, dim);
+        }
+        ffn.forwardBatch(b, weights, n);
+        for (int t = 0; t < n; t++) {
+            if (postFfnNorm != null) normalize(b.xb[t], b.xb[t], postFfnNorm, dim);
+            if (residualScale > 0f) {
+                for (int i = 0; i < dim; i++) b.xb[t][i] *= residualScale;
+            }
+            VectorOpsFactory.get().accumulate(b.x[t], b.xb[t], dim);
+        }
+    }
+
+    private void normalize(float[] out, float[] in, float[] normWeights, int dim) {
+        if (useLayerNorm) {
+            LayerNorm.apply(out, in, normWeights, dim, config.normEps());
+        } else {
+            RMSNorm.apply(out, in, normWeights, dim, config.normEps());
+        }
+    }
+
     private void printProfile() {
         int n = profileTokenCount;
         int layers = config.blockCount();

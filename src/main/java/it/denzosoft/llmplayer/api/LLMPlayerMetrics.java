@@ -34,7 +34,8 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
     private volatile long kvCacheEstimateMB;
 
     // GPU VRAM query (via reflection to avoid java21 dependency)
-    private volatile Object cudaContext; // CudaContext instance for VRAM queries
+    private volatile Object cudaContext;
+    private volatile it.denzosoft.llmplayer.tensor.ExpertCache expertCache; // CudaContext instance for VRAM queries
 
     // Generation stats (updated atomically)
     private final AtomicLong totalGenerations = new AtomicLong();
@@ -108,6 +109,15 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         this.cudaContext = cudaContext;
     }
 
+    /**
+     * Attach the SSD-streaming expert cache so its counters can be read live. Unlike the CUDA
+     * context this needs no reflection: {@code ExpertCache} is a base-code interface, and only the
+     * implementation behind it lives in java21.
+     */
+    public void setExpertCache(it.denzosoft.llmplayer.tensor.ExpertCache cache) {
+        this.expertCache = cache;
+    }
+
     /** Called after each generation to update stats. */
     public void recordGeneration(int genTokens, int promptTokens, double tokPerSec, long timeMs) {
         totalGenerations.incrementAndGet();
@@ -149,7 +159,48 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         lastTokPerSec.set(0.0);
         lastGenerationTimeMs.set(0);
         cudaContext = null;
+        expertCache = null;
         synchronized (samplesLock) { recentSamples.clear(); }
+    }
+
+    // --- SSD-streaming expert cache ---
+    @Override public boolean isExpertCacheActive() { return expertCache != null; }
+
+    @Override public double getExpertCacheHitRate() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        if (c == null) return -1;
+        long total = c.hits() + c.misses();
+        return total == 0 ? -1 : 100.0 * c.hits() / total;
+    }
+
+    @Override public long getExpertCacheHits() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.hits();
+    }
+
+    @Override public long getExpertCacheMisses() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.misses();
+    }
+
+    @Override public long getExpertCacheBytesReadMB() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.bytesRead() / (1024 * 1024);
+    }
+
+    @Override public long getExpertCacheReadTimeMs() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.readNanos() / 1_000_000L;
+    }
+
+    @Override public int getExpertCacheSlots() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.slotCount();
+    }
+
+    @Override public long getExpertCacheSizeMB() {
+        it.denzosoft.llmplayer.tensor.ExpertCache c = expertCache;
+        return c == null ? -1 : c.slotCount() * c.slotBytes() / (1024 * 1024);
     }
 
     // --- Model info ---

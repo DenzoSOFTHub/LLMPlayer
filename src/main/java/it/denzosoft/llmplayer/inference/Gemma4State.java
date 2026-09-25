@@ -42,6 +42,9 @@ public class Gemma4State extends InferenceState {
     public final float[] firstPredAltup;        // [pleDim] — first_prediction in altup space
     public final float[] firstPredFullDim;      // [dim]    — first_prediction back-projected
 
+    /** Per-token buffers for batched prefill, created on first use by {@link Gemma4InferenceEngine#forwardPrefill}. */
+    float[][][] prefillBuffers;
+
     public Gemma4State(ModelConfig config, int maxSeqLen, int pleDim, int maxQDim, int maxKvDim) {
         this(config, maxSeqLen, pleDim, maxQDim, maxKvDim, 0, 0);
     }
@@ -109,7 +112,6 @@ public class Gemma4State extends InferenceState {
 
         public Gemma4KVCache(ModelConfig config, int maxSeqLen) {
             int blockCount = config.blockCount();
-            int headCountKV = config.headCountKV();
             int headSizeSwa = config.headSize();  // SWA headSize (256)
             int headSizeFull = config.keyLength() > 0 ? config.keyLength() : headSizeSwa; // full headSize (512)
             boolean[] swaPattern = config.slidingWindowPattern();
@@ -121,7 +123,8 @@ public class Gemma4State extends InferenceState {
 
             for (int i = 0; i < blockCount; i++) {
                 boolean isSwa = (swaPattern != null && i < swaPattern.length) ? swaPattern[i] : (i % 6 != 5);
-                int kvDim = headCountKV * (isSwa ? headSizeSwa : headSizeFull);
+                // Per-layer KV head count: Gemma 4 dense (12B) reduces it on global layers.
+                int kvDim = config.layerKvHeads(i) * (isSwa ? headSizeSwa : headSizeFull);
                 kvDimPerLayer[i] = kvDim;
                 keyLayers[i] = new float[maxSeqLen * kvDim];
                 valueLayers[i] = new float[maxSeqLen * kvDim];

@@ -84,6 +84,7 @@ public class OpenAIHandler {
         ChatTemplate chatTpl = engine.getChatTemplate();
 
         List<String[]> messages = new ArrayList<>();
+        List<byte[]> images = new ArrayList<>();
         for (Object msgObj : messagesRaw) {
             Map<String, Object> msg = (Map<String, Object>) msgObj;
             String role = (String) msg.get("role");
@@ -102,7 +103,14 @@ public class OpenAIHandler {
             }
 
             Object contentObj = msg.get("content");
-            String content = contentObj instanceof String ? (String) contentObj : null;
+            String content;
+            try {
+                // string, or an array of text / image_url parts (images become markers)
+                content = ImageContent.flattenOpenAI(contentObj, images);
+            } catch (ImageContent.BadImageException e) {
+                sendError(exchange, 400, e.getMessage());
+                return;
+            }
 
             // Handle assistant messages with tool_calls
             if ("assistant".equals(role) && msg.containsKey("tool_calls")) {
@@ -118,6 +126,10 @@ public class OpenAIHandler {
 
         if (messages.isEmpty()) {
             sendError(exchange, 400, "messages must contain at least one message with role and content");
+            return;
+        }
+        if (!images.isEmpty() && !engine.hasVision()) {
+            sendError(exchange, 400, "the loaded model has no vision projector (load it with an mmproj file)");
             return;
         }
 
@@ -252,6 +264,7 @@ public class OpenAIHandler {
             .useChat(false)
             .rawMode(true)
             .cacheKey(cacheKey)
+            .images(images)
             .build();
 
         String modelName = engine.getModelName();

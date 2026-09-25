@@ -2,6 +2,7 @@ package it.denzosoft.llmplayer.inference;
 
 import it.denzosoft.llmplayer.model.DeepSeek2LayerWeights;
 import it.denzosoft.llmplayer.model.ModelConfig;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.util.Arrays;
@@ -64,15 +65,13 @@ public class MLAAttention {
     public void forward(DeepSeek2State state, DeepSeek2LayerWeights weights, int layer, int position) {
         int dim = config.embeddingLength();
         int headCount = config.headCount();
-        int keyLength = config.keyLength();    // e.g. 192 (DS2) or 256 (GLM-4.7)
-        int valueLength = config.valueLength(); // e.g. 128 (DS2) or 256 (GLM-4.7)
-        int kvLoraRank = config.kvLoraRank();  // e.g. 512
-        int ropeDim = config.ropeDimensionCount(); // e.g. 64
-        int keyNope = keyLength - ropeDim;     // e.g. 128 (DS2) or 192 (GLM-4.7)
-        int kvCompressedDim = kvLoraRank + ropeDim; // e.g. 576
-
+        int keyLength = config.keyLength();
+        int valueLength = config.valueLength();
+        int kvLoraRank = config.kvLoraRank();
+        int ropeDim = config.ropeDimensionCount();
+        int keyNope = keyLength - ropeDim;
+        int kvCompressedDim = kvLoraRank + ropeDim;
         int totalQDim = headCount * keyLength;
-        int totalKeyDim = headCount * keyLength;
         int totalValDim = headCount * valueLength;
 
         // 1. Q projection
@@ -83,8 +82,7 @@ public class MLAAttention {
             weights.wqA().matmulParallel(state.xb, state.qCompressed, qLoraRank, dim);
 
             // RMSNorm on qCompressed
-            float[] qaNormWeights = cachedQANorm[layer];
-            RMSNorm.apply(state.qCompressedNorm, state.qCompressed, qaNormWeights, qLoraRank, config.normEps());
+            RMSNorm.apply(state.qCompressedNorm, state.qCompressed, cachedQANorm[layer], qLoraRank, config.normEps());
 
             // Q = wqB * qCompressedNorm
             Arrays.fill(state.q, 0, totalQDim, 0f);
@@ -95,45 +93,76 @@ public class MLAAttention {
             weights.wq().matmulParallel(state.xb, state.q, totalQDim, dim);
         }
 
-        // 2. KV compression: x → c_kv [kvLoraRank + ropeDim]
+        // 2. KV compression: x → c_kv [kvLoraRank + ropeDim] = [c_latent, k_rope_raw]
         Arrays.fill(state.kvCompressed, 0, kvCompressedDim, 0f);
         weights.wkvA().matmulParallel(state.xb, state.kvCompressed, kvCompressedDim, dim);
 
-        // 3. Split c_kv into c_latent [kvLoraRank] and k_rope_raw [ropeDim]
-        // c_latent = kvCompressed[0..kvLoraRank-1]
-        // k_rope_raw = kvCompressed[kvLoraRank..kvCompressedDim-1]
+        // 3-4. RMSNorm on c_latent (the first kvLoraRank elements)
+        normLatent(state.kvCompressed, state.kvLatentNormed, layer);
 
-        // 4. RMSNorm on c_latent (only first kvLoraRank elements)
-        float[] kvNormWeights = cachedKvANorm[layer];
-        float ss = 0f;
-        for (int i = 0; i < kvLoraRank; i++) {
-            ss += state.kvCompressed[i] * state.kvCompressed[i];
-        }
-        ss = 1.0f / (float) Math.sqrt(ss / kvLoraRank + config.normEps());
-        for (int i = 0; i < kvLoraRank; i++) {
-            state.kvLatentNormed[i] = state.kvCompressed[i] * ss * kvNormWeights[i];
-        }
-
-        // 5. KV decompression
+        // 5. KV decompression → K_nope and V per head
         if (weights.hasSeparateKVB()) {
             // Separate K_B (transposed) and V_B (standard) per head
             decompressKVSeparate(state, weights, headCount, keyNope, valueLength, kvLoraRank);
         } else {
             // Combined wkvB → [headCount * (keyNope + valueLen)]
-            int kvBOutPerHead = keyNope + valueLength;
-            int kvBOutDim = headCount * kvBOutPerHead;
+            int kvBOutDim = headCount * (keyNope + valueLength);
             Arrays.fill(state.kvDecompressed, 0, kvBOutDim, 0f);
             weights.wkvB().matmulParallel(state.kvLatentNormed, state.kvDecompressed, kvBOutDim, kvLoraRank);
-
-            // Extract K_nope and V from interleaved kvDecompressed
-            for (int h = 0; h < headCount; h++) {
-                int kvBSrc = h * kvBOutPerHead;
-                // K_nope
-                System.arraycopy(state.kvDecompressed, kvBSrc, state.k, h * keyLength, keyNope);
-                // V
-                System.arraycopy(state.kvDecompressed, kvBSrc + keyNope, state.v, h * valueLength, valueLength);
-            }
+            splitKV(state.kvDecompressed, state);
         }
+
+        // 6-8. RoPE, KV store, attention → xb2
+        attentionCore(state, layer, position);
+
+        // 9. Output projection: xb = Wo * xb2
+        Arrays.fill(state.xb, 0);
+        weights.wo().matmulParallel(state.xb2, state.xb, dim, totalValDim);
+    }
+
+    /** RMSNorm of the latent part of {@code kvCompressed} into {@code dst}. */
+    private void normLatent(float[] kvCompressed, float[] dst, int layer) {
+        int kvLoraRank = config.kvLoraRank();
+        float[] kvNormWeights = cachedKvANorm[layer];
+        float ss = 0f;
+        for (int i = 0; i < kvLoraRank; i++) {
+            ss += kvCompressed[i] * kvCompressed[i];
+        }
+        ss = 1.0f / (float) Math.sqrt(ss / kvLoraRank + config.normEps());
+        for (int i = 0; i < kvLoraRank; i++) {
+            dst[i] = kvCompressed[i] * ss * kvNormWeights[i];
+        }
+    }
+
+    /** Extract K_nope and V per head from the interleaved output of the combined wkvB. */
+    private void splitKV(float[] kvDecompressed, DeepSeek2State state) {
+        int headCount = config.headCount();
+        int keyLength = config.keyLength();
+        int valueLength = config.valueLength();
+        int keyNope = keyLength - config.ropeDimensionCount();
+        int kvBOutPerHead = keyNope + valueLength;
+        for (int h = 0; h < headCount; h++) {
+            int kvBSrc = h * kvBOutPerHead;
+            System.arraycopy(kvDecompressed, kvBSrc, state.k, h * keyLength, keyNope);
+            System.arraycopy(kvDecompressed, kvBSrc + keyNope, state.v, h * valueLength, valueLength);
+        }
+    }
+
+    /**
+     * The order-dependent part of MLA for one token: RoPE on k_rope (from {@code state.kvCompressed})
+     * and on each head's Q rope part, K assembly, KV store and attention over the cache. Reads
+     * {@code state.q}, {@code state.kvCompressed} and the K_nope/V parts of {@code state.k/v}; writes
+     * the attention output, before Wo, to {@code state.xb2}.
+     */
+    private void attentionCore(DeepSeek2State state, int layer, int position) {
+        int headCount = config.headCount();
+        int keyLength = config.keyLength();
+        int valueLength = config.valueLength();
+        int kvLoraRank = config.kvLoraRank();
+        int ropeDim = config.ropeDimensionCount();
+        int keyNope = keyLength - ropeDim;
+        int totalKeyDim = headCount * keyLength;
+        int totalValDim = headCount * valueLength;
 
         // 6. Assemble full K per head: [K_nope, k_rope]
         // Copy k_rope to temp and apply RoPE
@@ -167,7 +196,7 @@ public class MLAAttention {
         final int keyLengthFinal = keyLength;
         final int valueLengthFinal = valueLength;
 
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int attOffset = h * (positionFinal + 1);
             int qOffset = h * keyLengthFinal;
             int kHeadOff = h * keyLengthFinal;  // per-head K slice
@@ -189,10 +218,107 @@ public class MLAAttention {
                 kv.saxpyV(layerFinal, t, vHeadOff, valueLengthFinal, a, state.xb2, outOffset);
             }
         });
+    }
 
-        // 9. Output projection: xb = Wo * xb2
-        Arrays.fill(state.xb, 0);
-        weights.wo().matmulParallel(state.xb2, state.xb, dim, totalValDim);
+    // ==================== Batched prefill ====================
+
+    // Indices into DeepSeek2State.mlaPrefill
+    private static final int M_Q = 0, M_QC = 1, M_QCN = 2, M_KVC = 3, M_LAT = 4, M_KVD = 5, M_ATT = 6;
+
+    /**
+     * Multi-token {@link #forward} for the chunk's tokens at one layer: {@code out[t] = Wo * attn(xn[t])}.
+     * Every projection that depends on the token alone — Q (or Q-LoRA A, norm, B), wkvA, the latent
+     * norm and the combined wkvB — runs as a multi-token matmul; {@link #attentionCore} and the
+     * separate K_B/V_B decompression run token by token in position order; Wo is batched again.
+     */
+    public void forwardBatch(DeepSeek2State state, DeepSeek2LayerWeights weights, int layer, int basePos,
+                             int n, float[][] xn, float[][] out) {
+        int dim = config.embeddingLength();
+        int headCount = config.headCount();
+        int keyLength = config.keyLength();
+        int valueLength = config.valueLength();
+        int kvLoraRank = config.kvLoraRank();
+        int ropeDim = config.ropeDimensionCount();
+        int keyNope = keyLength - ropeDim;
+        int kvCompressedDim = kvLoraRank + ropeDim;
+        int totalQDim = headCount * keyLength;
+        int totalValDim = headCount * valueLength;
+        int kvBOutDim = headCount * (keyNope + valueLength);
+        int qLoraRank = Math.max(0, config.qLoraRank());
+        float[][][] b = batchBuffers(state, xn.length, totalQDim, qLoraRank, kvCompressedDim, kvLoraRank,
+            kvBOutDim, totalValDim);
+
+        // Q
+        for (int t = 0; t < n; t++) Arrays.fill(b[M_Q][t], 0, totalQDim, 0f);
+        if (weights.hasQLoRA()) {
+            for (int t = 0; t < n; t++) Arrays.fill(b[M_QC][t], 0, qLoraRank, 0f);
+            FloatTensor.matmulBatchParallel(weights.wqA(), xn, b[M_QC], n, qLoraRank, dim);
+            for (int t = 0; t < n; t++) {
+                RMSNorm.apply(b[M_QCN][t], b[M_QC][t], cachedQANorm[layer], qLoraRank, config.normEps());
+            }
+            FloatTensor.matmulBatchParallel(weights.wqB(), b[M_QCN], b[M_Q], n, totalQDim, qLoraRank);
+        } else {
+            FloatTensor.matmulBatchParallel(weights.wq(), xn, b[M_Q], n, totalQDim, dim);
+        }
+
+        // KV compression, latent norm, combined decompression
+        for (int t = 0; t < n; t++) Arrays.fill(b[M_KVC][t], 0, kvCompressedDim, 0f);
+        FloatTensor.matmulBatchParallel(weights.wkvA(), xn, b[M_KVC], n, kvCompressedDim, dim);
+        for (int t = 0; t < n; t++) normLatent(b[M_KVC][t], b[M_LAT][t], layer);
+        boolean combined = !weights.hasSeparateKVB();
+        if (combined) {
+            for (int t = 0; t < n; t++) Arrays.fill(b[M_KVD][t], 0, kvBOutDim, 0f);
+            FloatTensor.matmulBatchParallel(weights.wkvB(), b[M_LAT], b[M_KVD], n, kvBOutDim, kvLoraRank);
+        }
+
+        // Token by token in position order
+        for (int t = 0; t < n; t++) {
+            System.arraycopy(b[M_Q][t], 0, state.q, 0, totalQDim);
+            System.arraycopy(b[M_KVC][t], 0, state.kvCompressed, 0, kvCompressedDim);
+            if (combined) {
+                splitKV(b[M_KVD][t], state);
+            } else {
+                System.arraycopy(b[M_LAT][t], 0, state.kvLatentNormed, 0, kvLoraRank);
+                decompressKVSeparate(state, weights, headCount, keyNope, valueLength, kvLoraRank);
+            }
+            attentionCore(state, layer, basePos + t);
+            System.arraycopy(state.xb2, 0, b[M_ATT][t], 0, totalValDim);
+            Arrays.fill(out[t], 0, dim, 0f);
+        }
+        FloatTensor.matmulBatchParallel(weights.wo(), b[M_ATT], out, n, dim, totalValDim);
+    }
+
+    private static float[][][] batchBuffers(DeepSeek2State state, int cap, int totalQDim, int qLoraRank,
+                                            int kvCompressedDim, int kvLoraRank, int kvBOutDim, int totalValDim) {
+        if (state.mlaPrefill == null || state.mlaPrefill[M_Q].length < cap) {
+            state.mlaPrefill = new float[][][] {
+                new float[cap][totalQDim], new float[cap][qLoraRank], new float[cap][qLoraRank],
+                new float[cap][kvCompressedDim], new float[cap][kvLoraRank], new float[cap][kvBOutDim],
+                new float[cap][totalValDim]
+            };
+        }
+        return state.mlaPrefill;
+    }
+
+    /** See {@link FloatTensor#warmUpRows}: the single-token kernels of this layer's projections. */
+    void warmUp(DeepSeek2LayerWeights weights) {
+        int dim = config.embeddingLength();
+        int headCount = config.headCount();
+        int keyLength = config.keyLength();
+        int valueLength = config.valueLength();
+        int kvLoraRank = config.kvLoraRank();
+        int ropeDim = config.ropeDimensionCount();
+        if (weights.hasQLoRA()) {
+            FloatTensor.warmUpRows(weights.wqA(), config.qLoraRank(), dim);
+            FloatTensor.warmUpRows(weights.wqB(), headCount * keyLength, config.qLoraRank());
+        } else {
+            FloatTensor.warmUpRows(weights.wq(), headCount * keyLength, dim);
+        }
+        FloatTensor.warmUpRows(weights.wkvA(), kvLoraRank + ropeDim, dim);
+        if (!weights.hasSeparateKVB()) {
+            FloatTensor.warmUpRows(weights.wkvB(), headCount * (keyLength - ropeDim + valueLength), kvLoraRank);
+        }
+        FloatTensor.warmUpRows(weights.wo(), dim, headCount * valueLength);
     }
 
     /**
@@ -218,7 +344,7 @@ public class MLAAttention {
                                        int headCount, int keyNope, int valueLength, int kvLoraRank) {
         // K decompression: transposed matmul per head
         // wkB 3D: [keyNope, kvLoraRank, headCount] — ne0=keyNope, ne1=kvLoraRank
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             long headOffset = (long) h * kvLoraRank * keyNope;
             int kDst = h * (keyNope + config.ropeDimensionCount()); // offset in state.k (keyLength per head)
 
@@ -235,7 +361,7 @@ public class MLAAttention {
         // V decompression: standard matmul per head
         // wvB 3D: [kvLoraRank, valueLen, headCount] — ne0=kvLoraRank, ne1=valueLen
         // Standard: output[row] = dot(input, weight[row * ne0 ...])
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             long headOffset = (long) h * valueLength * kvLoraRank;
             int vDst = h * valueLength;
 

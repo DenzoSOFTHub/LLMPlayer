@@ -5,6 +5,7 @@ import it.denzosoft.llmplayer.inference.DeepSeek2InferenceEngine;
 import it.denzosoft.llmplayer.inference.DeepSeek2State;
 import it.denzosoft.llmplayer.inference.InferenceEngine;
 import it.denzosoft.llmplayer.inference.InferenceState;
+import it.denzosoft.llmplayer.inference.LayerPrefetcher;
 import it.denzosoft.llmplayer.inference.Qwen3MoEInferenceEngine;
 import it.denzosoft.llmplayer.inference.Qwen3MoEState;
 import it.denzosoft.llmplayer.inference.NemotronHInferenceEngine;
@@ -49,12 +50,14 @@ public class LLMEngine implements AutoCloseable {
     private final InferenceEngine engine;                 // standard architectures
     private final DeepSeek2InferenceEngine ds2Engine;     // DeepSeek2 only
     private final Qwen3MoEInferenceEngine q3moeEngine;   // Qwen3 MoE only
+    private final it.denzosoft.llmplayer.tensor.ExpertCache expertCache; // SSD streaming, MoE >RAM
     private final Qwen35InferenceEngine q35Engine;        // Qwen3.5 only
     private final NemotronHInferenceEngine nemHEngine;   // Nemotron-H only
     private final Gemma4InferenceEngine gemma4Engine;    // Gemma 4 only
     // Non-final (default null): set only in their own dispatch branch, avoiding per-branch null churn.
     private LFM2InferenceEngine lfm2Engine;              // LFM2 only
     private FalconH1InferenceEngine falconH1Engine;      // Falcon-H1 only
+    private it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine bm3Engine; // Ling-3.0 only
     private final Tokenizer tokenizer;
     private final ChatTemplate chatTemplate;
     private final SpecialTokens specialTokens;
@@ -66,6 +69,10 @@ public class LLMEngine implements AutoCloseable {
     private final String gpuDeviceName;    // GPU device name, or null
     private final boolean moeOptimizedGpu; // MoE: attention on GPU, experts on CPU
     private final ConversationCache conversationCache = new ConversationCache();
+    private final LayerPrefetcher layerPrefetcher; // lazy >RAM dense loads only, else null
+
+    // Explicit command-line -Dmmap.advise, captured before load() ever writes the property
+    private static final String USER_MMAP_ADVISE = System.getProperty("mmap.advise");
 
     private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         this(loadedModel, maxContextLength, null, -1, null, false, true);
@@ -94,9 +101,12 @@ public class LLMEngine implements AutoCloseable {
         this.moeOptimizedGpu = moeOptimizedGpu;
 
         ModelArchitecture arch = loadedModel.config().architecture();
-        if ((arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N)
-                && loadedModel.config().embeddingLengthPerLayer() > 0) {
-            // Use dedicated Gemma4 engine only for PLE models (E2B/E4B)
+        if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
+            // Use the dedicated Gemma 4 engine for ALL Gemma 4 / 3n variants — both the PLE
+            // models (E2B/E4B, embedding_length_per_layer_input>0) and the dense models
+            // (12B/31B, ==0). The dense path runs with PLE disabled (hasPle=false). The standard
+            // InferenceEngine cannot handle Gemma 4's dual head size, per-layer KV head count,
+            // V-norm or per-layer output scale, so dense Gemma 4 must not fall through to it.
             this.engine = null;
             this.ds2Engine = null;
             this.q3moeEngine = null;
@@ -109,6 +119,11 @@ public class LLMEngine implements AutoCloseable {
             this.lfm2Engine = new LFM2InferenceEngine(
                 loadedModel.config(), loadedModel.lfm2Weights(), maxContextLength,
                 loadedModel.lfm2Weights().ropeFreqFactors());
+        } else if (arch == ModelArchitecture.BAILINGMOE3) {
+            this.engine = null; this.ds2Engine = null; this.q3moeEngine = null;
+            this.q35Engine = null; this.nemHEngine = null; this.gemma4Engine = null;
+            this.bm3Engine = new it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine(
+                loadedModel.config(), loadedModel.ggufFile(), maxContextLength);
         } else if (arch == ModelArchitecture.FALCON_H1) {
             this.engine = null; this.ds2Engine = null; this.q3moeEngine = null;
             this.q35Engine = null; this.nemHEngine = null; this.gemma4Engine = null;
@@ -186,6 +201,29 @@ public class LLMEngine implements AutoCloseable {
             this.gemma4Engine = null;
             this.engine = new InferenceEngine(loadedModel.config(), loadedModel.weights(), maxContextLength,
                 loadedModel.weights().ropeFreqFactors());
+        }
+
+        // Lazy (>RAM) dense load: overlap disk I/O with compute by prefetching layer N+1 while
+        // the CPU loop computes layer N. GPU-resident layers (first gpuLayersUsed) never page in
+        // from the file at inference time, so prefetch starts at the first CPU layer.
+        int firstCpuLayer = Math.max(0, gpuLayersUsed);
+        this.layerPrefetcher = (this.engine != null)
+            ? LayerPrefetcher.createIfEnabled(loadedModel.ggufFile(),
+                loadedModel.config().blockCount(), firstCpuLayer)
+            : null;
+        if (this.layerPrefetcher != null) {
+            this.engine.setLayerPrefetcher(this.layerPrefetcher);
+        }
+
+        // Lazy (>RAM) MoE load: routed experts live on disk. Cache their slices in RAM and fill them
+        // with explicit positional reads, which is roughly an order of magnitude better per byte than
+        // faulting them in 4 KB at a time. See docs/optimization/ssd-streaming-cache.md.
+        this.expertCache = initExpertCache(loadedModel);
+        if (this.expertCache != null) {
+            if (this.q3moeEngine != null) this.q3moeEngine.setExpertCache(this.expertCache);
+            if (this.ds2Engine != null) this.ds2Engine.setExpertCache(this.expertCache);
+            try { LLMPlayerMetrics.getInstance().setExpertCache(this.expertCache); }
+            catch (Throwable ignored) {}
         }
 
         // Register JMX metrics
@@ -428,10 +466,30 @@ public class LLMEngine implements AutoCloseable {
                     modelBytes / 1e9, ramBytes / 1e9);
             }
         }
-        // Lazy (>RAM) load: advise MADV_RANDOM on the mmap so the OS does not read ahead pages that
-        // will not be used (MoE cold experts are touched sparsely). Sequential read-ahead would only
-        // help the preload case, so this is gated on !preload.
-        System.setProperty("mmap.advise.random", String.valueOf(!preload));
+        // Lazy (>RAM) load: pick the madvise mode by access pattern. MoE touches experts sparsely
+        // (cold experts stay on disk) → MADV_RANDOM kills wasted read-ahead. A dense model walks
+        // its layers sequentially every token → MADV_SEQUENTIAL keeps aggressive read-ahead and
+        // lets the OS drop pages behind the walk. Preloaded models need no advice.
+        // An explicit -Dmmap.advise=random|sequential|none on the command line overrides the
+        // heuristic (benchmarking knob); captured at class load so the per-load heuristic writes
+        // below are not mistaken for a user override on subsequent loads (web mode load/unload).
+        if (USER_MMAP_ADVISE != null) {
+            System.setProperty("mmap.advise", USER_MMAP_ADVISE);
+        } else {
+            String mmapAdvise = "none";
+            if (!preload) {
+                int lazyExpertCount = 0;
+                try (it.denzosoft.llmplayer.gguf.GGUFFile lazyParse =
+                         it.denzosoft.llmplayer.gguf.GGUFParser.parse(ggufPath)) {
+                    lazyExpertCount = ModelConfig.fromMetadata(lazyParse.getMetadata()).expertCount();
+                } catch (Exception ignored) {
+                    // metadata parse failure → treat as dense; the real load below will fail anyway
+                    // if the file is unreadable
+                }
+                mmapAdvise = lazyExpertCount > 0 ? "random" : "sequential";
+            }
+            System.setProperty("mmap.advise", mmapAdvise);
+        }
         ModelLoader.LoadedModel model = ModelLoader.load(ggufPath, preload, gpuLayersUsed, moeOptimized);
         int maxCtx = Math.min(maxContextLength, model.config().contextLength());
         return new LLMEngine(model, maxCtx, gpuRes, gpuLayersUsed, deviceName, moeOptimized, gpuChainEnabled);
@@ -445,15 +503,21 @@ public class LLMEngine implements AutoCloseable {
         ModelConfig config = loadedModel.config();
         CompositeSampler sampler = new CompositeSampler(request.samplerConfig());
 
-        // Tokenize prompt
+        // Tokenize prompt. Images (vision models) go before the user text as one marker each.
+        String userPrompt = request.prompt();
+        if (request.hasImages() && !request.rawMode()) {
+            StringBuilder markers = new StringBuilder();
+            for (int i = 0; i < request.images().size(); i++) markers.append(imageMarker());
+            userPrompt = markers + userPrompt;
+        }
         String formattedPrompt;
         if (request.rawMode()) {
             formattedPrompt = request.prompt();
         } else if (request.useChat()) {
             if (request.systemMessage() != null) {
-                formattedPrompt = chatTemplate.formatChat(request.systemMessage(), request.prompt());
+                formattedPrompt = chatTemplate.formatChat(request.systemMessage(), userPrompt);
             } else {
-                formattedPrompt = chatTemplate.formatUserMessage(request.prompt());
+                formattedPrompt = chatTemplate.formatUserMessage(userPrompt);
             }
         } else {
             formattedPrompt = request.prompt();
@@ -484,6 +548,10 @@ public class LLMEngine implements AutoCloseable {
         if (promptLen >= maxContextLength - 1) {
             return new GenerationResponse("Error: prompt too long (" + promptLen + " tokens, max " +
                 (maxContextLength - 1) + ")", 0, promptLen, 0, 0, Collections.<EvaluationResult>emptyList());
+        }
+
+        if (request.hasImages()) {
+            return generateMultimodal(request, callback, sampler, promptTokens);
         }
 
         // KV cache reuse: check for cached conversation state
@@ -527,6 +595,12 @@ public class LLMEngine implements AutoCloseable {
                 : falconH1Engine.createState(maxContextLength);
             stateForCache = state;
             response = generateFalconH1(falconH1Engine, sampler, promptTokens, request, callback, state, prefillStart);
+        } else if (bm3Engine != null) {
+            it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State state = (cached != null)
+                ? (it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State) cached.state
+                : bm3Engine.createState();
+            stateForCache = state;
+            response = generateBailingMoE3(sampler, promptTokens, request, callback, state, prefillStart);
         } else if (nemHEngine != null) {
             NemotronHState state = (cached != null)
                 ? (NemotronHState) cached.state
@@ -574,10 +648,10 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
 
         long startTime = System.nanoTime();
-        float[] logits = null;
-        for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(state, promptTokens[i], i);
-        }
+        // Only the last prompt token's logits are used, so the output projection runs once. The
+        // prompt goes through the layers in multi-token chunks when the model allows it (batched
+        // matmuls); otherwise token by token — see InferenceEngine.forwardPrefill.
+        float[] logits = eng.forwardPrefill(state, promptTokens, prefillStart, promptLen);
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -585,6 +659,136 @@ public class LLMEngine implements AutoCloseable {
                 @Override
                 public float[] forward(int token, int position) {
                     return eng.forward(state, token, position);
+                }
+            });
+    }
+
+    // ==================== Vision (Qwen3-VL / Qwen2-VL style mmproj) ====================
+
+    private volatile it.denzosoft.llmplayer.vision.VisionEncoder visionEncoder;
+
+    /** Image placeholder in the prompt text: Qwen-VL's vision_start / image_pad / vision_end. */
+    public static String imageMarker() { return "<|vision_start|><|image_pad|><|vision_end|>"; }
+
+    /**
+     * Attach a vision projector (mmproj GGUF) so that {@link GenerationRequest#images()} can be used.
+     * Supported: {@code qwen3vl_merger} projectors with a Qwen3-VL text model (loaded as qwen3 with
+     * multi-axis RoPE). The projector width must equal the model's embedding width.
+     */
+    public void loadVisionProjector(Path mmproj) throws IOException {
+        ModelConfig config = loadedModel.config();
+        if ((engine == null && q35Engine == null) || config.ropeSections() == null) {
+            throw new IllegalStateException("Vision input needs a Qwen3-VL or Qwen3.5 text model; this model is "
+                + config.architecture());
+        }
+        it.denzosoft.llmplayer.vision.VisionEncoder enc = it.denzosoft.llmplayer.vision.VisionEncoder.load(mmproj);
+        if (enc.projectionDim() != config.embeddingLength()) {
+            throw new IllegalArgumentException("mmproj projection dim " + enc.projectionDim()
+                + " does not match the model embedding length " + config.embeddingLength());
+        }
+        // Image tokens use multi-axis RoPE positions and embedding input, which only the CPU layer
+        // path implements; a GPU-resident pass would also keep the KV cache of its layers apart.
+        if (engine != null) engine.disableGpuForwardPass();
+        if (q35Engine != null) q35Engine.disableGpuForwardPass();
+        this.visionEncoder = enc;
+    }
+
+    public boolean hasVision() { return visionEncoder != null; }
+
+    /** Upper bound on merged vision tokens per image (-Dvision.max.tokens, default 576 = 768x768 px). */
+    private static final int VISION_MAX_TOKENS = Integer.getInteger("vision.max.tokens", 576);
+    private static final int VISION_MIN_TOKENS = Integer.getInteger("vision.min.tokens", 8);
+
+    /**
+     * Prefill a prompt whose image markers are replaced by vision embeddings, then decode. Text runs
+     * go through the normal (batched) prefill; each image is encoded, registered in the state's
+     * multi-axis rope positions and prefilled as embeddings. Conversation caching is bypassed.
+     */
+    private GenerationResponse generateMultimodal(GenerationRequest request, StreamingCallback callback,
+                                                  CompositeSampler sampler, int[] promptTokens) {
+        it.denzosoft.llmplayer.vision.VisionEncoder enc = visionEncoder;
+        if (enc == null || (engine == null && q35Engine == null)) {
+            return new GenerationResponse("Error: this model has no vision projector loaded (use --mmproj)",
+                0, promptTokens.length, 0, 0, Collections.<EvaluationResult>emptyList());
+        }
+        int[] padIds = tokenizer.encode("<|image_pad|>");
+        if (padIds.length != 1) {
+            return new GenerationResponse("Error: the tokenizer has no <|image_pad|> token",
+                0, promptTokens.length, 0, 0, Collections.<EvaluationResult>emptyList());
+        }
+        int padId = padIds[0];
+        long startTime = System.nanoTime();
+
+        // Encode every image referenced by a marker, in order
+        List<it.denzosoft.llmplayer.vision.VisionEncoder.Output> encoded = new ArrayList<>();
+        int align = enc.patchSize() * enc.mergeSize();
+        int patchArea = align * align;
+        int imageIdx = 0;
+        for (int t : promptTokens) {
+            if (t != padId) continue;
+            if (imageIdx >= request.images().size()) {
+                return new GenerationResponse("Error: more image markers than images in the request",
+                    0, promptTokens.length, 0, 0, Collections.<EvaluationResult>emptyList());
+            }
+            try {
+                it.denzosoft.llmplayer.vision.ImagePreprocessor.Image img =
+                    it.denzosoft.llmplayer.vision.ImagePreprocessor.preprocess(request.images().get(imageIdx++),
+                        align, VISION_MIN_TOKENS * patchArea, VISION_MAX_TOKENS * patchArea,
+                        enc.imageMean(), enc.imageStd());
+                encoded.add(enc.encode(img));
+            } catch (IOException e) {
+                return new GenerationResponse("Error: cannot decode image " + imageIdx + ": " + e.getMessage(),
+                    0, promptTokens.length, 0, 0, Collections.<EvaluationResult>emptyList());
+            }
+        }
+
+        // Lay the sequence out in KV order: text tokens keep their ids, image slots are filled by embeddings
+        int total = 0;
+        int k = 0;
+        for (int t : promptTokens) total += (t == padId) ? encoded.get(k++).embeddings.length : 1;
+        if (total >= maxContextLength - 1) {
+            return new GenerationResponse("Error: prompt too long with images (" + total + " tokens, max "
+                + (maxContextLength - 1) + ")", 0, total, 0, 0, Collections.<EvaluationResult>emptyList());
+        }
+        int[] seq = new int[total];
+        it.denzosoft.llmplayer.inference.MRopePositions mrope = new it.denzosoft.llmplayer.inference.MRopePositions();
+        final InferenceState st = engine != null ? engine.createState(maxContextLength) : null;
+        final Qwen35State q35st = engine == null ? q35Engine.createState(maxContextLength) : null;
+        if (st != null) st.mrope = mrope; else q35st.mrope = mrope;
+        float[] logits = null;
+        int pos = 0, textStart = 0;
+        k = 0;
+        for (int t : promptTokens) {
+            if (t != padId) {
+                seq[pos++] = t;
+                continue;
+            }
+            if (pos > textStart) {
+                if (st != null) engine.forwardPrefill(st, seq, textStart, pos);
+                else q35Engine.forwardPrefill(q35st, seq, textStart, pos);
+            }
+            it.denzosoft.llmplayer.vision.VisionEncoder.Output img = encoded.get(k++);
+            mrope.addImage(pos, img.embeddings.length, img.nx, img.ny);
+            if (st != null) engine.prefillEmbeddings(st, img.embeddings, pos, img.deepstackCount);
+            else q35Engine.prefillEmbeddings(q35st, img.embeddings, pos);
+            pos += img.embeddings.length;
+            textStart = pos;
+        }
+        if (pos > textStart) {
+            logits = st != null ? engine.forwardPrefill(st, seq, textStart, pos)
+                                : q35Engine.forwardPrefill(q35st, seq, textStart, pos);
+        } else {
+            return new GenerationResponse("Error: the prompt must end with text after the last image",
+                0, total, 0, 0, Collections.<EvaluationResult>emptyList());
+        }
+        System.err.printf("  Multimodal prompt: %d text tokens + %d image tokens (%d images)%n",
+            promptTokens.length - encoded.size(), total - (promptTokens.length - encoded.size()), encoded.size());
+        long genStartTime = System.nanoTime();
+        return generateLoop(logits, total, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override
+                public float[] forward(int token, int position) {
+                    return st != null ? engine.forward(st, token, position) : q35Engine.forward(q35st, token, position);
                 }
             });
     }
@@ -597,7 +801,12 @@ public class LLMEngine implements AutoCloseable {
         long startTime = System.nanoTime();
         float[] logits = null;
         for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(state, promptTokens[i], i);
+            // Only the last prompt token's logits are used, so skip the output projection for the
+            // rest. On a large vocabulary that single matmul dominates prefill — 151936 x 2048 costs
+            // ~186 ms per token on the 4-core CPU box — and every earlier result was computed and
+            // then overwritten. Matches what LFM2/Falcon-H1/Qwen3.5/Gemma 4 already do.
+            if (i < promptLen - 1) eng.forwardNoOutput(state, promptTokens[i], i);
+            else logits = eng.forward(state, promptTokens[i], i);
         }
         long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -606,6 +815,24 @@ public class LLMEngine implements AutoCloseable {
                 public float[] forward(int token, int position) {
                     return eng.forward(state, token, position);
                 }
+            });
+    }
+
+    private GenerationResponse generateBailingMoE3(CompositeSampler sampler, int[] promptTokens,
+                                                   GenerationRequest request, StreamingCallback callback,
+                                                   it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State state,
+                                                   int prefillStart) {
+        int promptLen = promptTokens.length;
+        long startTime = System.nanoTime();
+        float[] logits = null;
+        for (int i = prefillStart; i < promptLen; i++) {
+            if (i < promptLen - 1) bm3Engine.forwardNoOutput(state, promptTokens[i], i);
+            else logits = bm3Engine.forward(state, promptTokens[i], i);
+        }
+        long genStartTime = System.nanoTime();
+        return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
+            new ForwardFunction() {
+                @Override public float[] forward(int token, int position) { return bm3Engine.forward(state, token, position); }
             });
     }
 
@@ -651,15 +878,9 @@ public class LLMEngine implements AutoCloseable {
                                                   Qwen35State state, int prefillStart) {
         int promptLen = promptTokens.length;
         long startTime = System.nanoTime();
-        float[] logits = null;
-        // Prefill: skip output matmul for all tokens except the last
-        for (int i = prefillStart; i < promptLen; i++) {
-            if (i < promptLen - 1) {
-                eng.forwardNoOutput(state, promptTokens[i], i);
-            } else {
-                logits = eng.forward(state, promptTokens[i], i);
-            }
-        }
+        // Prefill: output projection only for the last token; multi-token chunks through the
+        // layers when the CPU path allows it — see Qwen35InferenceEngine.forwardPrefill.
+        float[] logits = eng.forwardPrefill(state, promptTokens, prefillStart, promptLen);
         long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
             new ForwardFunction() {
@@ -677,10 +898,10 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
 
         long startTime = System.nanoTime();
-        float[] logits = null;
-        for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(state, promptTokens[i], i);
-        }
+        // Layer-outer prefill, as for Qwen3 MoE: identical arithmetic, but each expert is read about
+        // once per layer instead of once per (layer, token). Also skips the output projection for
+        // all but the last position.
+        float[] logits = eng.forwardPrefill(state, promptTokens, prefillStart, promptLen);
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -699,10 +920,11 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
 
         long startTime = System.nanoTime();
-        float[] logits = null;
-        for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(state, promptTokens[i], i);
-        }
+        // Layer-outer prefill: identical arithmetic, but each expert is read about once per layer
+        // instead of once per (layer, token), which is what makes prefill affordable when the
+        // experts are streamed from SSD. It also skips the output projection for all but the last
+        // position, as the per-token loop it replaced did.
+        float[] logits = eng.forwardPrefill(state, promptTokens, prefillStart, promptLen);
         long genStartTime = System.nanoTime();
 
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
@@ -721,10 +943,9 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
         eng.setState(state);
         long startTime = System.nanoTime();
-        float[] logits = null;
-        for (int i = prefillStart; i < promptLen; i++) {
-            logits = eng.forward(promptTokens[i], i, i == promptLen - 1);
-        }
+        // Batched across the prompt on the CPU path without AltUp; otherwise token by token —
+        // see Gemma4InferenceEngine.forwardPrefill.
+        float[] logits = eng.forwardPrefill(state, promptTokens, prefillStart, promptLen);
         long genStartTime = System.nanoTime();
         return generateLoop(logits, promptLen, request, sampler, callback, startTime, genStartTime,
             new ForwardFunction() {
@@ -794,9 +1015,17 @@ public class LLMEngine implements AutoCloseable {
                     plePostNorm[i] = new float[config.embeddingLength()];
                     for (int j = 0; j < config.embeddingLength(); j++) plePostNorm[i][j] = n.getFloat(j);
                 }
-                it.denzosoft.llmplayer.tensor.FloatTensor s = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.layerOutputScale(i));
-                if (s != null) layerOutputScale[i] = s.getFloat(0);
             }
+        }
+
+        // layer_output_scale is a standard Gemma 4 per-layer residual scalar present on ALL
+        // variants, independent of PLE. Load it unconditionally: the dense 12B has
+        // embedding_length_per_layer_input==0 (pleDim==0), so gating this load on pleDim>0
+        // would leave the scale at the default 1.0 and silently drop the model's trained
+        // per-layer residual scaling (garbage output). Gemma 3n/E-series keep PLE above.
+        for (int i = 0; i < blockCount; i++) {
+            it.denzosoft.llmplayer.tensor.FloatTensor s = ModelLoader.tryLoadTensor(gguf, ArchitectureRegistry.layerOutputScale(i));
+            if (s != null) layerOutputScale[i] = s.getFloat(0);
         }
 
         // === H10: AltUp + Laurel tensor loading ===
@@ -1196,6 +1425,15 @@ public class LLMEngine implements AutoCloseable {
                 trainingState = state;
             }
             return falconH1Engine.forward(state, token, position);
+        } else if (bm3Engine != null) {
+            it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State state;
+            if (trainingState instanceof it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State) {
+                state = (it.denzosoft.llmplayer.inference.BailingMoE3InferenceEngine.State) trainingState;
+            } else {
+                state = bm3Engine.createState();
+                trainingState = state;
+            }
+            return bm3Engine.forward(state, token, position);
         }
         throw new IllegalStateException("No inference engine available for training");
     }
@@ -1349,21 +1587,31 @@ public class LLMEngine implements AutoCloseable {
             long kvCache = 2L * blockCount * contextLength * kvDim * 4L;
             long estimatedRam = fileSize + kvCache;
 
-            // Get available memory
+            // Two separate budgets: the weights are mmap'd off-heap, so they compete for physical
+            // RAM, not for -Xmx; the KV cache is float[] on the Java heap, so it is bounded by -Xmx.
             long jvmMaxMemory = Runtime.getRuntime().maxMemory();
             long physicalMemory = getPhysicalMemorySize();
-            long availableRam = physicalMemory > 0 ? Math.min(jvmMaxMemory, physicalMemory) : jvmMaxMemory;
+            long availableRam = physicalMemory > 0 ? physicalMemory : jvmMaxMemory;
 
-            boolean safe = estimatedRam < (long) (availableRam * 0.90); // 10% margin
+            // Same threshold as the preload decision in load(): above 85% of RAM the weights stay on
+            // disk and are read on demand. Not swap — the cost is throughput, not stability.
+            boolean weightsFit = physicalMemory <= 0 || estimatedRam < (long) (physicalMemory * 0.85);
+            boolean kvFits = kvCache < (long) (jvmMaxMemory * 0.90); // 10% margin for activations
+            boolean safe = weightsFit && kvFits;
             String message;
-            if (safe) {
-                message = "Memory OK: ~" + formatMB(estimatedRam) + " needed, " + formatMB(availableRam) + " available";
+            if (!kvFits) {
+                message = "KV cache for " + contextLength + " tokens needs ~" + formatMB(kvCache)
+                    + " of heap but -Xmx is " + formatMB(jvmMaxMemory)
+                    + " — raise -Xmx or lower the context length.";
+            } else if (!weightsFit) {
+                message = "Model needs ~" + formatMB(estimatedRam) + " but only "
+                    + formatMB(availableRam) + " RAM available — weights will stream from the model file.";
             } else {
-                message = "WARNING: Model needs ~" + formatMB(estimatedRam) +
-                    " but only " + formatMB(availableRam) + " available. Loading may cause swap/OOM.";
+                message = "Memory OK: ~" + formatMB(estimatedRam) + " needed, " + formatMB(availableRam)
+                    + " RAM available (KV cache " + formatMB(kvCache) + " of " + formatMB(jvmMaxMemory) + " heap)";
             }
 
-            return new MemoryCheck(estimatedRam, availableRam, safe, message);
+            return new MemoryCheck(estimatedRam, availableRam, safe, weightsFit, message);
         } catch (IOException e) {
             return new MemoryCheck(0, 0, false, "Cannot check memory: " + e.getMessage());
         }
@@ -1376,19 +1624,72 @@ public class LLMEngine implements AutoCloseable {
         private final long estimatedRam;
         private final long availableRam;
         private final boolean safe;
+        private final boolean weightsFit;
         private final String message;
 
         public MemoryCheck(long estimatedRam, long availableRam, boolean safe, String message) {
+            this(estimatedRam, availableRam, safe, safe, message);
+        }
+
+        public MemoryCheck(long estimatedRam, long availableRam, boolean safe, boolean weightsFit, String message) {
             this.estimatedRam = estimatedRam;
             this.availableRam = availableRam;
             this.safe = safe;
+            this.weightsFit = weightsFit;
             this.message = message;
         }
 
         public long estimatedRam() { return estimatedRam; }
         public long availableRam() { return availableRam; }
         public boolean isSafe() { return safe; }
+        /** False when the weights exceed the preload threshold and will be read from disk on demand. */
+        public boolean weightsFit() { return weightsFit; }
         public String message() { return message; }
+    }
+
+    /**
+     * Build the SSD-streaming expert cache for a MoE model, or null when it does not apply.
+     *
+     * Slots are sized by the largest expert across all MoE layers, because a Q4_K_M mix can ship
+     * different quantization types per layer (Q6_K {@code ffn_down_exps} on some, Q4_K on others).
+     */
+    private static it.denzosoft.llmplayer.tensor.ExpertCache initExpertCache(
+            ModelLoader.LoadedModel lm) {
+        long elements = (long) lm.config().expertFfnLength() * lm.config().embeddingLength();
+        if (elements <= 0) return null;
+        long maxSlice = 0;
+        if (lm.qwen3MoEWeights() != null) {
+            for (it.denzosoft.llmplayer.model.Qwen3MoELayerWeights w : lm.qwen3MoEWeights().layers()) {
+                maxSlice = Math.max(maxSlice,
+                    expertTripleBytes(w.ffnGateExps(), w.ffnUpExps(), w.ffnDownExps(), elements));
+            }
+        } else if (lm.deepSeek2Weights() != null) {
+            for (it.denzosoft.llmplayer.model.DeepSeek2LayerWeights w : lm.deepSeek2Weights().layers()) {
+                maxSlice = Math.max(maxSlice,
+                    expertTripleBytes(w.ffnGateExps(), w.ffnUpExps(), w.ffnDownExps(), elements));
+            }
+        } else {
+            return null;
+        }
+        if (maxSlice <= 0) return null;
+        return it.denzosoft.llmplayer.tensor.ExpertCacheFactory.createIfEnabled(
+            lm.ggufFile().getPath(), lm.ggufFile().getMappedFile(), maxSlice);
+    }
+
+    private static long expertTripleBytes(it.denzosoft.llmplayer.tensor.FloatTensor gate,
+                                          it.denzosoft.llmplayer.tensor.FloatTensor up,
+                                          it.denzosoft.llmplayer.tensor.FloatTensor down,
+                                          long elements) {
+        if (gate == null || up == null || down == null) return 0;
+        return expertSliceBytes(gate, elements) + expertSliceBytes(up, elements)
+            + expertSliceBytes(down, elements);
+    }
+
+    private static long expertSliceBytes(it.denzosoft.llmplayer.tensor.FloatTensor tensor,
+                                         long elements) {
+        it.denzosoft.llmplayer.tensor.GGMLType type = tensor.type();
+        if (type == null || type.getBlockSize() <= 0) return 0;
+        return (elements / type.getBlockSize()) * (long) type.getTypeSize();
     }
 
     private static long getPhysicalMemorySize() {
@@ -1625,11 +1926,24 @@ public class LLMEngine implements AutoCloseable {
             summary.append("Plan: CPU only");
         }
 
-        if (!memCheck.isSafe()) {
-            summary.append("\n\nWARNING: This model is too large for the available RAM.\n");
-            summary.append("Loading will cause disk swap, resulting in extremely slow performance.\n");
-            summary.append("Consider using a smaller/more quantized model.");
-            recommended = false;
+        if (!memCheck.weightsFit()) {
+            // Since v1.16.0 this never involves swap: the loader skips the preload above 85% of RAM
+            // and reads pages from the model file on demand. For MoE that path is supported — the
+            // routed experts stream from SSD through the expert cache — so say so rather than
+            // discouraging a configuration that now works.
+            summary.append("\n\nNOTE: This model is larger than the available RAM.\n");
+            if (isMoE) {
+                summary.append("It will run in SSD-streaming mode: weights are read from the model "
+                    + "file on demand\n(no swap), with the routed experts cached in RAM. Expect "
+                    + "reduced throughput.\nUse --ssd-streaming to skip this prompt, and "
+                    + "--expert-cache-size <MB> to tune the cache.");
+                recommended = false;
+            } else {
+                summary.append("It will be read from the model file on demand (no swap), but a dense "
+                    + "model needs\nevery weight for every token, so no cache can help and throughput "
+                    + "will be very low.\nConsider a smaller or more quantized model.");
+                recommended = false;
+            }
         }
 
         return new HardwarePlan(modelName, gpuAvailable, bestDeviceIdx, bestDeviceName,
@@ -1987,6 +2301,14 @@ public class LLMEngine implements AutoCloseable {
     @Override
     public void close() {
         try { LLMPlayerMetrics.getInstance().reset(); } catch (Throwable ignored) {}
+        if (layerPrefetcher != null) {
+            layerPrefetcher.stop(); // before unmapping the file it reads from
+        }
+        if (expertCache != null) {
+            String cacheStats = expertCache.stats();
+            if (cacheStats != null) System.out.println("  " + cacheStats);
+            expertCache.close(); // frees the off-heap slots and the file handle
+        }
         if (gpuResources != null) {
             try { gpuResources.close(); } catch (Exception ignored) {}
         }

@@ -1,6 +1,23 @@
-# LLMPlayer v1.16.1
+# LLMPlayer v1.18.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 24 architectures including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), and **Falcon-H1** (parallel Mamba-2 + attention hybrid). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads) and **lazy mmap for models larger than RAM**, cuBLAS support (opt-in), an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 29 architectures (plus the Qwen-VL, LFM2-MoE, GLM4-MoE and Qwen3-TTS variants), with **image input** for Qwen3-VL, Qwen3.5 and Qwen2.5-VL and **text-to-speech** with Qwen3-TTS, including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), and **Falcon-H1** (parallel Mamba-2 + attention hybrid). 18 quantized formats with **17 dedicated CUDA kernels** (all except Q2_K). Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads), **lazy mmap for models larger than RAM** and **SSD streaming with a hot-expert RAM cache** (`--ssd-streaming`) for MoE models that exceed it, cuBLAS support (opt-in), an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.18.0
+
+**New models, image input, text-to-speech, and a much faster CPU path.** This is the first published release since v1.16.1, so it also carries the v1.17.0 changes below, which were never released on their own. Everything in it was verified on the CPU; the GPU paths were not re-run, because the reference machine has no GPU.
+
+- **New architectures:** Hunyuan dense (Hy-MT2 translation models), Nanbeige (looped depth), Spark2.5, and Ling 3.0 (`bailingmoe3`, on a new dedicated engine). **New variants** of supported families: the Qwen3-VL and Qwen2.5-VL text backbones, LFM2-MoE (LFM2.5-8B-A1B), and GLM4 MoE (GLM-4.5, GLM-4.5-Air, GLM-4.6, GLM-4.7), which the documentation listed before but which did not actually load.
+- **Image input** for Qwen3-VL, Qwen3.5 and Qwen2.5-VL through llama.cpp `mmproj` files (`--mmproj` and `--image` on the CLI, `image_url` parts on the OpenAI API, `image` blocks on the Anthropic API). **Text-to-speech** with Qwen3-TTS (`--tts out.wav`).
+- **A faster CPU path.** `MatmulPool` replaces the previous dispatchers with one persistent, dynamically scheduled worker pool (1.28–1.77× decode on Llama-3.2-1B). The Q4_K, Q5_K and Q8_0 kernels are faster (Q4_K 1.7× on one core), and IQ4_NL/IQ4_XS are 4–5× faster. Batched prefill now covers the standard engine (Llama-3.2-1B prompt processing 3.7× faster) and Qwen3.5. `--threads` now works, and AVX-512 machines no longer fall back to the scalar kernels.
+- **Correctness fixes.** The Gemma family (2, 3, 3n and 4) and dense GLM4 used the wrong RoPE pairing, which left short prompts plausible but broke longer ones: GLM-4-9B perplexity fell from 5.45 to 2.60 once fixed. GLM4 MoE now uses llama.cpp's sigmoid routing with the `exp_probs_b` selection bias and skips the NextN/MTP layers. The memory check no longer compares memory-mapped weights with the Java heap.
+
+Full details are in `WHATS-NEW.md`.
+
+### What's new in v1.17.0 (not released separately; shipped in v1.18.0)
+
+**SSD streaming: MoE models larger than RAM are now usable, not just loadable.** v1.16.0 made them load; this release makes them run. The routed experts of a lazily-loaded MoE model are cached in off-heap slots filled by explicit positional reads (`FileChannel.read(ByteBuffer, position)`, which lowers to `pread`), with least-frequently-used retention holding the hot set. **Qwen3-Coder-30B (18.6 GB against 7.8 GB of RAM) went from 0.1 to 1.0 decode tok/s — 3.2× on wall clock — with bit-identical output.** New flags: `--ssd-streaming` (run a model above the RAM budget without the confirmation prompt) and `--expert-cache-size <MB>`. Cache counters are exposed on JMX and `/api/metrics`.
+
+The measurement that shaped the design: an `madvise(MADV_WILLNEED)` hint per expert bought only ~1.15× because the mmap layer will not carry an expert-sized request — a `mincore()` probe showed 32 of 647 pages resident after the call returned success. Explicit reads are a requirement, not an optimisation. A budget sweep also found that *more cache is not monotonically better*: a 3 GB cache reached the best hit rate of the sweep and still ran 4× slower, because cache plus heap starved the page cache that absorbs every miss. Reference designs: [Colibri](https://github.com/JustVugg/colibri) and [LLM in a flash](https://arxiv.org/abs/2312.11514). Full analysis in `docs/optimization/ssd-streaming-cache.md`.
 
 ### What's new in v1.16.1
 
@@ -278,6 +295,30 @@ Enables extended reasoning for supported models. The model "thinks" step-by-step
 
 Via the OpenAI API, pass `"thinking": true` in the request body.
 
+### CLI — Image input (vision)
+
+```bash
+./run.sh --model gguf/Qwen3-VL-4B-Instruct-Q4_K_M.gguf --mmproj gguf/mmproj-Qwen3-VL-4B-F16.gguf \
+    --image photo.jpg --prompt "Describe this image." --max-tokens 200
+```
+
+Works with Qwen3-VL, Qwen3.5 and Qwen2.5-VL text models and their mmproj files as published for
+llama.cpp (`qwen3vl_merger` and `qwen2.5vl_merger` projectors). Images are resized to at most `-Dvision.max.tokens` merged tokens (default 576, about
+768 × 768 pixels). Encoding runs on the CPU and takes tens of seconds per image. Details in
+[`docs/architecture/vision-and-tts.md`](docs/architecture/vision-and-tts.md).
+
+### CLI — Text to speech
+
+```bash
+./run.sh --model gguf/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+    --mmproj gguf/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+    --tts out.wav --tts-lang it --prompt "Ciao, questa è una prova di sintesi vocale."
+```
+
+Uses Qwen3-TTS in the llama.cpp GGUF layout (`ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`) and writes
+24 kHz mono WAV. `--max-tokens` caps the length in 80 ms frames. Voice cloning from a reference
+recording is not supported. On a busy 8-core CPU synthesis runs at about 0.2× real time.
+
 ### Web UI
 
 ```bash
@@ -421,6 +462,10 @@ Degradation is automatic: Java 21/25 classes are loaded via reflection (`Class.f
 | `--port` | — | Integer | 8080 | Web server port |
 | `--gguf-dir` | — | String | `gguf` | GGUF file directory |
 | `--thinking` | — | Flag | false | Enable thinking/reasoning mode (SmolLM3, Qwen3, Qwen3.5) |
+| `--mmproj` | — | String | — | Projector GGUF: a Qwen3-VL/Qwen3.5/Qwen2.5-VL vision mmproj (with `--image`) or a Qwen3-TTS mmproj (with `--tts`) |
+| `--image` | — | String | — | Image file (JPEG, PNG) for the prompt; repeatable. Needs a vision `--mmproj` |
+| `--tts` | — | String | — | Text-to-speech: write the spoken `--prompt` to this WAV file (Qwen3-TTS `--model` + `--mmproj`) |
+| `--tts-lang` | — | String | `en` | TTS language: `en`, `it`, `de`, `fr`, `es`, `pt`, `zh`, `ja`, `ko`, `ru` |
 | `--draft-model` | — | String | — | Path to draft GGUF. Enables speculative decoding via `SpeculativeDecoder` (target = `--model`, draft = this). **Experimental**: sequential verification only (~1.14× max with K=4); kept for algorithmic correctness. See `docs/optimization/speculative-decoding.md`. |
 | `--force` | `-y` | Flag | false | Skip confirmation prompts (e.g., RAM warning) |
 | `--help` | `-h` | Flag | false | Show help |
@@ -642,6 +687,13 @@ engine.close();
 | ERNIE 4.5 | `ernie4_5` | BPE (gpt2) | `<\|begin_of_sentence\|>User: ... Assistant:` |
 | LFM2 (short-conv + GQA hybrid) | `lfm2` | BPE (gpt2) | `<\|im_start\|>user` |
 | Falcon-H1 (parallel Mamba-2 + attention) | `falcon-h1` | BPE (gpt2) | `<\|im_start\|>user` |
+| Qwen3-VL / Qwen2.5-VL (multi-axis RoPE; images via `--mmproj`) | `qwen3vl` / `qwen2vl` | BPE (gpt2) | `<\|im_start\|>user` |
+| LFM2-MoE (LFM2.5-8B-A1B) | `lfm2moe` | BPE (gpt2) | `<\|im_start\|>user` |
+| Hunyuan dense (Hy-MT2) | `hunyuan-dense` | BPE (gpt2, multi-regex) | `<｜hy_User｜>` |
+| Nanbeige 4.2 (looped depth) | `nanbeige` | SentencePiece | `<\|im_start\|>user` |
+| Spark-X2.5 (SWA + gated attention) | `spark2_5` | BPE (gpt2, multi-regex) | `<\|User\|>` |
+| Ling 3.0 (KDA + gated MLA + MoE) | `bailingmoe3` | BPE (gpt2) | `<role>HUMAN</role>` |
+| Qwen3-TTS talker (text-to-speech, `--tts`) | `qwen3tts` | BPE (gpt2) | — |
 
 The architecture is automatically detected from the `general.architecture` field in GGUF metadata.
 

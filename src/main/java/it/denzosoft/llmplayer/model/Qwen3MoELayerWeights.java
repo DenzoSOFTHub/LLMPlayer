@@ -137,6 +137,11 @@ public final class Qwen3MoELayerWeights {
     public FloatTensor ffnDownExpsBias() { return ffnDownExpsBias; }
     public FloatTensor attnSinks() { return attnSinks; }
 
+    // Selection-only router bias of sigmoid routing (GLM4-MoE exp_probs_b); null if absent
+    private FloatTensor expProbsBias;
+    public FloatTensor expProbsBias() { return expProbsBias; }
+    public void setExpProbsBias(FloatTensor expProbsBias) { this.expProbsBias = expProbsBias; }
+
     public boolean isMoELayer() {
         return ffnGateInp != null;
     }

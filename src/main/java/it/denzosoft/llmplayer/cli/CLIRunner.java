@@ -55,6 +55,22 @@ public class CLIRunner {
             }
         }
 
+        // Reaches the expert cache through system properties, like --threads above: the cache is
+        // built deep inside LLMEngine and does not need another constructor parameter.
+        if (options.getExpertCacheSizeMb() >= 0) {
+            System.setProperty("moe.expert.cache.mb", String.valueOf(options.getExpertCacheSizeMb()));
+        }
+        if (options.getExpertTopK() > 0) {
+            System.setProperty("moe.top.k", String.valueOf(options.getExpertTopK()));
+        }
+        if (options.isSsdStreaming()) {
+            // "Stream from SSD" means: do not try to pull the whole model into RAM, and do cache the
+            // routed experts. Both are already the automatic behaviour above 85% of RAM; the flag
+            // makes it explicit and applies it regardless of where the model falls against that line.
+            System.setProperty("no.preload", "true");
+            System.setProperty("moe.expert.cache", "true");
+        }
+
         Path modelPath = Paths.get(options.getModelPath());
 
         // Configure GPU: auto-detect unless explicitly disabled
@@ -86,13 +102,21 @@ public class CLIRunner {
             gpuConfig.setMemoryMode(options.getGpuMemoryMode());
         }
 
+        // Text-to-speech (Qwen3-TTS talker + mmproj): a separate pipeline, CPU only
+        if (options.getTtsOutput() != null) {
+            runTts(modelPath);
+            return;
+        }
+
         // Show hardware plan
         LLMEngine.HardwarePlan plan = LLMEngine.buildHardwarePlan(modelPath, options.getContextLength());
         System.out.println("\n--- Hardware Plan ---");
         System.out.println(plan.summary());
         System.out.println("--------------------\n");
 
-        if (!plan.isRecommended() && !options.isForce()) {
+        // --ssd-streaming is the explicit consent this prompt asks for, so it stands in for --force
+        // on the one case it covers: a model larger than RAM, which is now a supported mode.
+        if (!plan.isRecommended() && !options.isForce() && !options.isSsdStreaming()) {
             System.out.print("This configuration is not recommended. Continue? [y/N] ");
             System.out.flush();
             BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
@@ -122,6 +146,9 @@ public class CLIRunner {
                 ModelInfoPrinter.print(engine.getModelInfo());
                 return;
             }
+            if (options.getMmprojPath() != null) {
+                engine.loadVisionProjector(java.nio.file.Paths.get(options.getMmprojPath()));
+            }
 
             if (options.isInteractive()) {
                 runInteractive(engine);
@@ -134,6 +161,26 @@ public class CLIRunner {
         }
     }
 
+    private void runTts(java.nio.file.Path modelPath) throws IOException {
+        if (options.getMmprojPath() == null || options.getPrompt() == null) {
+            System.err.println("Error: --tts needs --mmproj <qwen3-tts mmproj> and --prompt <text>");
+            return;
+        }
+        try (it.denzosoft.llmplayer.tts.Qwen3Tts tts = it.denzosoft.llmplayer.tts.Qwen3Tts.load(
+                modelPath, java.nio.file.Paths.get(options.getMmprojPath()))) {
+            it.denzosoft.llmplayer.tts.Qwen3Tts.Options o = new it.denzosoft.llmplayer.tts.Qwen3Tts.Options();
+            o.language = options.getTtsLang();
+            if (options.getMaxTokens() > 0) o.maxFrames = options.getMaxTokens();
+            float[] pcm = tts.synthesize(options.getPrompt(), o, frames -> {
+                if (frames % 12 == 0) System.out.print("\r  frames: " + frames + " (" + (frames * 80) + " ms)");
+            });
+            System.out.println();
+            java.nio.file.Path out = java.nio.file.Paths.get(options.getTtsOutput());
+            it.denzosoft.llmplayer.tts.WavWriter.write(pcm, tts.sampleRate(), out);
+            System.out.printf("Wrote %s (%.2f s, %d Hz)%n", out, pcm.length / (double) tts.sampleRate(), tts.sampleRate());
+        }
+    }
+
     private void runSinglePrompt(LLMEngine engine, String prompt) {
         // Tier 3: speculative decoding when --draft-model provided. Standalone path,
         // does not affect the normal engine.generate() flow when the flag is absent.
@@ -142,11 +189,19 @@ public class CLIRunner {
             return;
         }
         SamplerConfig samplerConfig = options.toSamplerConfig();
-        GenerationRequest request = GenerationRequest.builder()
+        GenerationRequest.Builder builder = GenerationRequest.builder()
             .prompt(prompt)
             .maxTokens(options.getMaxTokens())
-            .samplerConfig(samplerConfig)
-            .build();
+            .samplerConfig(samplerConfig);
+        for (String img : options.getImagePaths()) {
+            try {
+                builder.image(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(img)));
+            } catch (java.io.IOException e) {
+                System.err.println("Error: cannot read image " + img + ": " + e.getMessage());
+                return;
+            }
+        }
+        GenerationRequest request = builder.build();
 
         System.out.println("\n--- Generation ---");
         GenerationResponse response = engine.generate(request, (token, id) -> {
@@ -221,7 +276,7 @@ public class CLIRunner {
         // User can override with environment but for first iteration we keep it simple.
         it.denzosoft.llmplayer.gpu.GpuConfig draftGpu = new it.denzosoft.llmplayer.gpu.GpuConfig();
         draftGpu.setEnabled(false);
-        try (LLMEngine draft = LLMEngine.load(java.nio.file.Path.of(draftPath),
+        try (LLMEngine draft = LLMEngine.load(java.nio.file.Paths.get(draftPath),
                 options.getContextLength(), draftGpu, false)) {
             it.denzosoft.llmplayer.spec.SpeculativeDecoder spec =
                 new it.denzosoft.llmplayer.spec.SpeculativeDecoder(target, draft, K);

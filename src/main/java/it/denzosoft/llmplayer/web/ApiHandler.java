@@ -150,6 +150,18 @@ public class ApiHandler {
             ", gpu=" + gpuConfig.isEnabled() + ")");
         long start = System.currentTimeMillis();
         engine = LLMEngine.load(Paths.get(path), contextLength, gpuConfig);
+        // Optional vision projector (Qwen3-VL / Qwen3.5 mmproj) for image input
+        Object mmproj = body.get("mmproj");
+        if (mmproj instanceof String && !((String) mmproj).trim().isEmpty()) {
+            try {
+                engine.loadVisionProjector(Paths.get((String) mmproj));
+            } catch (RuntimeException e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("error", "Model loaded, but the vision projector was rejected: " + e.getMessage());
+                sendJson(exchange, 400, err);
+                return;
+            }
+        }
         long elapsed = System.currentTimeMillis() - start;
         System.out.println("Model loaded in " + elapsed + "ms");
 
@@ -388,6 +400,19 @@ public class ApiHandler {
         mem.put("offHeapUsedMB", m.getOffHeapUsedMB());
         mem.put("kvCacheEstimateMB", m.getKvCacheEstimateMB());
         result.put("memory", mem);
+
+        // SSD-streaming expert cache (MoE models larger than RAM). Present but inactive for every
+        // other configuration, so clients can render it unconditionally.
+        Map<String, Object> expertCache = new LinkedHashMap<>();
+        expertCache.put("active", m.isExpertCacheActive());
+        expertCache.put("hitRatePercent", Math.round(m.getExpertCacheHitRate() * 10.0) / 10.0);
+        expertCache.put("hits", m.getExpertCacheHits());
+        expertCache.put("misses", m.getExpertCacheMisses());
+        expertCache.put("bytesReadMB", m.getExpertCacheBytesReadMB());
+        expertCache.put("readTimeMs", m.getExpertCacheReadTimeMs());
+        expertCache.put("slots", m.getExpertCacheSlots());
+        expertCache.put("sizeMB", m.getExpertCacheSizeMB());
+        result.put("expertCache", expertCache);
 
         // GPU
         Map<String, Object> gpu = new LinkedHashMap<>();

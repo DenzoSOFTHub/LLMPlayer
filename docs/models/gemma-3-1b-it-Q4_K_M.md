@@ -120,7 +120,7 @@ In v1.5.1, CudaForwardPass did not support post-norm architectures, so Gemma 3 w
 
 ## Known Issues
 
-1. **Output quality at 1B scale:** Gemma 3 1B IT produces somewhat coherent but imperfect output. This appears to be a model quality limitation at the 1B parameter scale, not a LLMPlayer code bug. Dequantization has been verified bit-exact against llama.cpp reference output.
+1. **Wrong RoPE pairing until 2026-09-23 (fixed).** The "somewhat coherent but imperfect" output previously attributed to the 1B scale was largely a LLMPlayer bug: Gemma used `ROPE_TYPE_NORMAL` instead of NEOX. Position 0 is unaffected, so short prompts looked plausible, but on any prompt longer than about 50 tokens the model predicted `<end_of_turn>` as its first token and produced no output. With NEOX the first-token logit margin rises from about 15 to 45–50 and long prompts are answered normally. Details in [`../optimization/cpu-dispatch-and-kernels.md`](../optimization/cpu-dispatch-and-kernels.md).
 
 2. **Q5_0 dequantization history:** Before v1.5.0, Q5_0 used incorrect interleaved nibble ordering (like Q4_0) instead of the correct split layout. This caused garbage output since Q5_0 is used for Q, K, gate, and up projections -- the most critical weight tensors. The fix was verified against llama.cpp reference values.
 

@@ -114,7 +114,7 @@ If `threads < logical`, the engine logs that it is using physical cores and that
 
 ---
 
-## 6. Lazy mmap for models > RAM + MADV_RANDOM
+## 6. Lazy mmap for models > RAM + pattern-aware madvise + next-layer prefetch
 
 **Rule (preload decision, LLMEngine.java:414–430).** The engine warms (preloads) the whole file into RAM only when it comfortably fits. With no explicit override:
 
@@ -124,13 +124,15 @@ preload = ramBytes <= 0 || modelBytes < (long)(0.85 * ramBytes)
 
 So a model at or above 85% of physical RAM (`getPhysicalMemorySize()`, LLMEngine.java:1394–1404, via the Sun `OperatingSystemMXBean.getTotalPhysicalMemorySize()`; returns -1 if unavailable, in which case preload defaults to true) skips preload and relies on lazy mmap — only the working set pages in on demand, read-only from the model file (never from swap), and for MoE the cold experts stay on disk. Explicit overrides take precedence (LLMEngine.java:415–420): `-Dpreload=true` or `-Dno.preload=false` force preload on; `-Dno.preload=true` or `-Dpreload=false` force it off.
 
-**Rule (MADV_RANDOM, LLMEngine.java:431–434).** When and only when preload is skipped, the engine sets `mmap.advise.random = String.valueOf(!preload)` (i.e. `true`). `MemorySegmentTensorData.mapFile()` reads that property (MemorySegmentTensorData.java:60) and, if true, calls `adviseRandom()` (MemorySegmentTensorData.java:34–48), which invokes the libc `madvise(addr, len, MADV_RANDOM=1)` via Panama FFM — best-effort, silently no-op where the `madvise` symbol is absent (non-Linux).
+**Rule (pattern-aware madvise, `LLMEngine.load`).** When and only when preload is skipped, the engine quick-parses the GGUF metadata for `expertCount` and sets the internal `mmap.advise` property to `random` for MoE models or `sequential` for dense ones (`none` when preloaded). `MemorySegmentTensorData.mapFile()` reads that property and issues the corresponding libc `madvise` (`MADV_RANDOM=1` or `MADV_SEQUENTIAL=2`) via Panama FFM — best-effort, silently no-op where the `madvise` symbol is absent (non-Linux).
 
-**Rationale.** Preloading a file larger than RAM is futile — it reads the whole file only for the OS to evict the pages again, turning the warm into a cold read in disguise. The 0.85 cap leaves a 15% safety margin against near-edge OOM. `MADV_RANDOM` then disables OS read-ahead, which would otherwise waste disk bandwidth fetching pages that the sparse, random MoE cold-expert access pattern will never use.
+**Rationale.** Preloading a file larger than RAM is futile — it reads the whole file only for the OS to evict the pages again, turning the warm into a cold read in disguise. The 0.85 cap leaves a 15% safety margin against near-edge OOM. The advice then matches the access pattern: an MoE model touches its cold experts sparsely, so `MADV_RANDOM` disables read-ahead that would fetch pages never used; a dense model walks its layers **sequentially every token**, so `MADV_SEQUENTIAL` keeps read-ahead aggressive and tells the kernel to drop the pages behind the walk first — the right eviction policy for a cyclic access pattern that otherwise defeats the page-cache LRU.
+
+**Rule (next-layer prefetch, `LayerPrefetcher`).** For a dense lazy load (`mmap.advise=sequential`), `LLMEngine` attaches a `LayerPrefetcher` to the standard `InferenceEngine`: while the CPU loop computes layer N, a background daemon thread pages in layer N+1's weight range (derived from the GGUF tensor directory `blk.N.*` offsets — no per-tensor plumbing), overlapping disk I/O with compute (the AirLLM prefetch pattern, ~10% end-to-end there). The request queue holds one entry and discards on overflow, so when the disk lags behind compute the dropped requests are harmless. Prefetch starts at the first CPU-resident layer (GPU layers never page in at inference time) and wraps past the last layer so the next token's first read is already in flight. Disable with `-Dmmap.prefetch=false`; force on (even when preloaded) with `-Dmmap.prefetch=true`. The prefetcher is created only for the standard engine — MoE lazy loads keep `MADV_RANDOM` and no prefetch, because the routed-expert access is unpredictable and a whole-layer range read would drag all experts in.
 
 **Related memory-safety check.** Separately, `checkMemory` / `buildHardwarePlan` marks a config unsafe (and `CLIRunner` prompts for confirmation unless `--force`/`-y`) when `estimatedRam = modelFileSize + KV` is **not** strictly below `0.90 * availableRam`, where `availableRam = min(jvmMaxMemory, physicalMemory)` (LLMEngine.java:1350–1366; 10% margin at line 1357).
 
-**Controlling flags:** `-Dpreload=true|false`, `-Dno.preload=true|false`, the internal `mmap.advise.random` property (set automatically, not user-facing), and `--force` / `-y` to skip the unsafe-config prompt.
+**Controlling flags:** `-Dpreload=true|false`, `-Dno.preload=true|false`, `-Dmmap.prefetch=true|false|auto`, the internal `mmap.advise` property (set automatically, not user-facing), and `--force` / `-y` to skip the unsafe-config prompt.
 
 ---
 
@@ -152,7 +154,8 @@ So a model at or above 85% of physical RAM (`getPhysicalMemorySize()`, LLMEngine
 | `-Dcuda.kv.fp16=true\|false` | unset (FP32) | LLMEngine.java:328–329, 376–378 | Force FP16 KV; setting it disables the auto-enable. |
 | `-Dpreload=true\|false` | auto | LLMEngine.java:415–418 | Force full-file preload on/off. |
 | `-Dno.preload=true\|false` | auto | LLMEngine.java:416–420 | Force lazy mmap on/off. |
-| `mmap.advise.random` (internal) | set by `load` | LLMEngine.java:434; MemorySegmentTensorData.java:60 | `true` ⇔ `!preload` ⇒ `madvise(MADV_RANDOM)`. |
+| `mmap.advise` (internal) | set by `load` | LLMEngine.load; MemorySegmentTensorData.mapFile | lazy MoE ⇒ `random` (MADV_RANDOM); lazy dense ⇒ `sequential` (MADV_SEQUENTIAL); preloaded ⇒ `none`. |
+| `-Dmmap.prefetch=auto\|true\|false` | `auto` | LayerPrefetcher.createIfEnabled | `auto` = on for dense lazy loads; `false` disables; `true` forces. Async page-in of layer N+1 during layer N compute. |
 | `-Djava.util.concurrent.ForkJoinPool.common.parallelism=<N>` | physical cores | CLIRunner.java:44 | Underlying property set by `--threads`. |
 
 **Fixed thresholds at a glance:** dense VRAM cap `0.90` (LLMEngine.java:370); MoE VRAM cap `0.80` (LLMEngine.java:345); preload / lazy-mmap cutoff `0.85 × physical RAM` (LLMEngine.java:424); memory-safety margin `0.90 × availableRam` (LLMEngine.java:1357); auto-tune warm-up 6 tokens, measured 24 tokens, GPU wins on tie (CLIRunner.java:178, 183, 199).

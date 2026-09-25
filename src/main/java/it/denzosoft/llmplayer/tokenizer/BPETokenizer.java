@@ -23,6 +23,66 @@ public class BPETokenizer implements Tokenizer {
         "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
     );
 
+    // Pre-tokenizers made of several regexes applied in sequence, as llama.cpp's
+    // unicode_regex_split does: each regex splits every piece produced by the previous one, and the
+    // unmatched stretches between matches are kept as pieces of their own. Selected by
+    // tokenizer.ggml.pre; null keeps the single GPT-2/Llama-3 pattern above.
+    private static final String CJK_KANA = "[\u4E00-\u9FA5\u3040-\u309F\u30A0-\u30FF]+";
+    private static final Pattern[] PRE_HUNYUAN = {
+        Pattern.compile("\\p{N}{1,3}"),
+        Pattern.compile(CJK_KANA),
+        Pattern.compile("[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"),
+    };
+    private static final Pattern[] PRE_SPARK2_5 = {
+        Pattern.compile("\\p{N}{1,3}"),
+        Pattern.compile(CJK_KANA),
+        Pattern.compile("[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+|[\r\n]|\\s+(?!\\S)|\\s+"),
+        Pattern.compile("\\p{N}"),
+    };
+    // Ling (bailingmoe / bailingmoe2): GPT-2 style but single digits (llama.cpp PRE_TYPE_BAILINGMOE)
+    private static final Pattern[] PRE_BAILINGMOE = {
+        Pattern.compile("'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]|\\s+(?!\\S)|\\s+"),
+    };
+    private Pattern[] preTokenizers;
+
+    /**
+     * Select the pre-tokenizer from {@code tokenizer.ggml.pre}. Only the multi-regex families that
+     * the single default pattern gets wrong are mapped; everything else keeps the default.
+     */
+    public void setPreTokenizer(String pre) {
+        if ("hunyuan-dense".equals(pre)) {
+            preTokenizers = PRE_HUNYUAN;
+        } else if ("bailingmoe".equals(pre) || "bailingmoe2".equals(pre)) {
+            preTokenizers = PRE_BAILINGMOE;
+        } else if ("spark2_5".equals(pre)) {
+            preTokenizers = PRE_SPARK2_5;
+        } else {
+            preTokenizers = null;
+        }
+    }
+
+    /** Sequential multi-regex split (llama.cpp unicode_regex_split semantics). */
+    private static List<String> multiRegexSplit(String text, Pattern[] patterns) {
+        List<String> pieces = new ArrayList<>();
+        pieces.add(text);
+        for (Pattern p : patterns) {
+            List<String> next = new ArrayList<>(pieces.size() * 2);
+            for (String piece : pieces) {
+                Matcher m = p.matcher(piece);
+                int last = 0;
+                while (m.find()) {
+                    if (m.start() == m.end()) continue;
+                    if (m.start() > last) next.add(piece.substring(last, m.start()));
+                    next.add(m.group());
+                    last = m.end();
+                }
+                if (last < piece.length()) next.add(piece.substring(last));
+            }
+            pieces = next;
+        }
+        return pieces;
+    }
+
     public BPETokenizer(String[] vocab, float[] scores, String[] merges, SpecialTokens specialTokens) {
         this.vocab = vocab;
         this.specialTokens = specialTokens;
@@ -97,7 +157,11 @@ public class BPETokenizer implements Tokenizer {
                 continue;
             }
 
-            if (useGpt2ByteMapping) {
+            if (useGpt2ByteMapping && preTokenizers != null) {
+                for (String word : multiRegexSplit(part, preTokenizers)) {
+                    allTokens.addAll(bpeEncode(word));
+                }
+            } else if (useGpt2ByteMapping) {
                 // GPT-2/Llama3 pre-tokenize using regex
                 Matcher matcher = PRE_TOKENIZE.matcher(part);
                 while (matcher.find()) {

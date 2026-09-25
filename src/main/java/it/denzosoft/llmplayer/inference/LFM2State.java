@@ -32,6 +32,15 @@ public class LFM2State {
     public final float[] gate;     // [ffnDim]
     public final float[] up;       // [ffnDim]
 
+    // LFM2-MoE buffers (null for dense LFM2)
+    public final float[] routerProbs;      // [expertCount] sigmoid(router logits)
+    public final float[] selectionScores;  // [expertCount] probs + exp_probs_b
+    public final int[] selectedExperts;    // [expertUsedCount]
+    public final float[] selectedWeights;  // [expertUsedCount]
+    public final float[][] expGate;        // [expertUsedCount][expertFfn]
+    public final float[][] expUp;          // [expertUsedCount][expertFfn]
+    public final float[][] expOut;         // [expertUsedCount][dim]
+
     public LFM2State(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();
         int vocabSize = config.vocabSize();
@@ -64,6 +73,27 @@ public class LFM2State {
 
         this.gate = new float[ffnDim];
         this.up = new float[ffnDim];
+
+        int experts = config.expertCount();
+        if (experts > 0) {
+            int used = config.expertUsedCount();
+            int efd = config.expertFfnLength();
+            this.routerProbs = new float[experts];
+            this.selectionScores = new float[experts];
+            this.selectedExperts = new int[used];
+            this.selectedWeights = new float[used];
+            this.expGate = new float[used][efd];
+            this.expUp = new float[used][efd];
+            this.expOut = new float[used][dim];
+        } else {
+            this.routerProbs = null;
+            this.selectionScores = null;
+            this.selectedExperts = null;
+            this.selectedWeights = null;
+            this.expGate = null;
+            this.expUp = null;
+            this.expOut = null;
+        }
 
         int hist = Math.max(1, lCache - 1);
         this.convState = new float[blockCount][][];

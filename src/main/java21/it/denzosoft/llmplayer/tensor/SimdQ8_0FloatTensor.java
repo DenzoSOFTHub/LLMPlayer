@@ -45,34 +45,93 @@ public class SimdQ8_0FloatTensor extends Q8_0FloatTensor {
 
     @Override
     public float dot(long thisOffset, float[] other, int otherOffset, int length) {
-        if (FloatVector.SPECIES_PREFERRED.length() != 8 || length % BLOCK_SIZE != 0) {
+        if (FloatVector.SPECIES_PREFERRED.length() < 8 || length % BLOCK_SIZE != 0) {
             return super.dot(thisOffset, other, otherOffset, length);
         }
 
         int numBlocks = length / BLOCK_SIZE;
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
-        int otherBase = otherOffset;
 
-        FloatVector acc = FloatVector.zero(F_SPECIES);
+        // Raw q.x per block in two short chains, scale applied once per 32 elements; blocks
+        // alternate between two accumulators. The previous form multiplied scale into every input
+        // vector and fed a single serial FMA chain. Measured +50 % single-thread on AVX2.
+        // Keep this shape: a single-accumulator variant of the same loop measured 5x slower
+        // (the Vector API intrinsics stopped applying).
+        FloatVector acc0 = FloatVector.zero(F_SPECIES);
+        FloatVector acc1 = FloatVector.zero(F_SPECIES);
+        for (int b = 0; b < numBlocks; b++) {
+            long bo = blockStart + (long) b * BLOCK_BYTES;
+            int xo = otherOffset + b * BLOCK_SIZE;
+            FloatVector p0 = quants(bo + 2).mul(FloatVector.fromArray(F_SPECIES, other, xo));
+            FloatVector p1 = quants(bo + 10).mul(FloatVector.fromArray(F_SPECIES, other, xo + 8));
+            p0 = quants(bo + 18).fma(FloatVector.fromArray(F_SPECIES, other, xo + 16), p0);
+            p1 = quants(bo + 26).fma(FloatVector.fromArray(F_SPECIES, other, xo + 24), p1);
+            FloatVector scale = FloatVector.broadcast(F_SPECIES, Float.float16ToFloat(segment.get(SHORT_LE, bo)));
+            if ((b & 1) == 0) {
+                acc0 = p0.add(p1).fma(scale, acc0);
+            } else {
+                acc1 = p0.add(p1).fma(scale, acc1);
+            }
+        }
+        return acc0.add(acc1).reduceLanes(VectorOperators.ADD);
+    }
 
+    /**
+     * Multi-token row-range matmul for batched prefill: each 8-weight vector is converted and
+     * scaled once and FMA'd against four inputs. Leftover tokens use {@link #dot}.
+     */
+    @Override
+    public void matmulRowsBatch(float[][] in, float[][] out, int n, int rowFrom, int rowTo, int cols) {
+        if (FloatVector.SPECIES_PREFERRED.length() < 8 || cols % BLOCK_SIZE != 0) {
+            super.matmulRowsBatch(in, out, n, rowFrom, rowTo, cols);
+            return;
+        }
+        int numBlocks = cols / BLOCK_SIZE;
+        float[] res = new float[4];
+        for (int row = rowFrom; row < rowTo; row++) {
+            long blockStart = (long) row * numBlocks * BLOCK_BYTES;
+            // Groups of four; a short last group repeats its last input and keeps only the real
+            // results. The single-token kernels are deliberately never called here: compiled by C2
+            // during prefill from these few calls, they kept a poor profile and made the following
+            // decode up to 40 % slower.
+            for (int t = 0; t < n; t += 4) {
+                int t1 = Math.min(t + 1, n - 1), t2 = Math.min(t + 2, n - 1), t3 = Math.min(t + 3, n - 1);
+                dot4(blockStart, in[t], in[t1], in[t2], in[t3], numBlocks, res);
+                out[t][row] += res[0];
+                if (t + 1 < n) out[t + 1][row] += res[1];
+                if (t + 2 < n) out[t + 2][row] += res[2];
+                if (t + 3 < n) out[t + 3][row] += res[3];
+            }
+        }
+    }
+
+    private void dot4(long blockStart, float[] x0, float[] x1, float[] x2, float[] x3, int numBlocks, float[] res) {
+        FloatVector a0 = FloatVector.zero(F_SPECIES);
+        FloatVector a1 = a0, a2 = a0, a3 = a0;
         for (int b = 0; b < numBlocks; b++) {
             long bo = blockStart + (long) b * BLOCK_BYTES;
             float scale = Float.float16ToFloat(segment.get(SHORT_LE, bo));
-            FloatVector vScale = FloatVector.broadcast(F_SPECIES, scale);
-            long qsBase = bo + 2;
-
-            // 4 × 8-element sub-chunks per 32-element block
+            int xb = b * BLOCK_SIZE;
             for (int i = 0; i < BLOCK_SIZE; i += F_LEN) {
-                ByteVector vqb = ByteVector.fromMemorySegment(B_SPECIES, segment, qsBase + i, BYTE_ORDER);
-                IntVector vqI = (IntVector) vqb.convertShape(VectorOperators.B2I, I_SPECIES, 0);
-                FloatVector vqF = (FloatVector) vqI.convertShape(VectorOperators.I2F, F_SPECIES, 0);
-                FloatVector in = FloatVector.fromArray(F_SPECIES, other, otherBase + i);
-                acc = vqF.fma(vScale.mul(in), acc);
+                FloatVector w = quants(bo + 2 + i).mul(scale);
+                int xo = xb + i;
+                a0 = w.fma(FloatVector.fromArray(F_SPECIES, x0, xo), a0);
+                a1 = w.fma(FloatVector.fromArray(F_SPECIES, x1, xo), a1);
+                a2 = w.fma(FloatVector.fromArray(F_SPECIES, x2, xo), a2);
+                a3 = w.fma(FloatVector.fromArray(F_SPECIES, x3, xo), a3);
             }
-            otherBase += BLOCK_SIZE;
         }
+        res[0] = a0.reduceLanes(VectorOperators.ADD);
+        res[1] = a1.reduceLanes(VectorOperators.ADD);
+        res[2] = a2.reduceLanes(VectorOperators.ADD);
+        res[3] = a3.reduceLanes(VectorOperators.ADD);
+    }
 
-        return acc.reduceLanes(VectorOperators.ADD);
+    /** 8 int8 quants at {@code offset}, widened to float. */
+    private FloatVector quants(long offset) {
+        ByteVector vqb = ByteVector.fromMemorySegment(B_SPECIES, segment, offset, BYTE_ORDER);
+        IntVector vqI = (IntVector) vqb.convertShape(VectorOperators.B2I, I_SPECIES, 0);
+        return (FloatVector) vqI.convertShape(VectorOperators.I2F, F_SPECIES, 0);
     }
 
     @Override
@@ -87,7 +146,7 @@ public class SimdQ8_0FloatTensor extends Q8_0FloatTensor {
      * Q8_0 × Q8_0 with lane-parallel integer accumulation.
      */
     private float dotQ8Q8Simd(long thisOffset, SimdQ8_0FloatTensor other, long otherOffset, int length) {
-        if (FloatVector.SPECIES_PREFERRED.length() != 8 || length % BLOCK_SIZE != 0) {
+        if (FloatVector.SPECIES_PREFERRED.length() < 8 || length % BLOCK_SIZE != 0) {
             return super.dot(thisOffset, (FloatTensor) other, otherOffset, length);
         }
 

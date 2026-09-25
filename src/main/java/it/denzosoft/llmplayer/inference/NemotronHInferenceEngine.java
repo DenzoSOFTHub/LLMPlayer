@@ -384,7 +384,7 @@ public class NemotronHInferenceEngine {
         int cOffset = ssmInnerSize + ssmGroupCount * ssmStateSize;
         final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
 
-        IntStream.range(0, ssmTimeStepRank).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(ssmTimeStepRank, h -> {
             int group = h / (ssmTimeStepRank / ssmGroupCount); // which B/C group this head belongs to
             float dtH = dt[h];
             float logA = lw.ssmA().getFloat(h);
@@ -441,7 +441,7 @@ public class NemotronHInferenceEngine {
         final int layerFinal = layer;
         final int positionFinal = position;
         final int headSizeFinal = headSize;
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOff = h * headSizeFinal;
             int kvHeadOff = kvHead * headSizeFinal;
@@ -559,7 +559,7 @@ public class NemotronHInferenceEngine {
         VectorOpsFactory.get().rmsnorm(state.xb2, state.x, normW, dim, normEps);
 
         final int expertCount = config.expertCount();
-        final int expertUsed = config.expertUsedCount();
+        final int expertUsed = MoERouting.effectiveTopK(config.expertUsedCount());
         final int eFfn = config.expertFfnLength() > 0 ? config.expertFfnLength() : config.intermediateSize();
         final int shFfn = config.expertSharedFeedForwardLength();
 
@@ -589,7 +589,7 @@ public class NemotronHInferenceEngine {
 
         // Routed experts (parallel; each reads normed input from xb2)
         final FloatTensor gateExps = lw.ffnGateExps(), upExps = lw.ffnUpExps(), downExps = lw.ffnDownExps();
-        IntStream.range(0, expertUsed).parallel().forEach(k -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(expertUsed, k -> {
             int e = state.selectedExperts[k];
             float[] gate = state.moeGatePerExpert[k];
             float[] up = state.moeUpPerExpert[k];

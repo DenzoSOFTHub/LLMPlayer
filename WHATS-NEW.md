@@ -1,5 +1,236 @@
 # LLMPlayer — What's New
 
+## v1.18.0 — New architectures, image input, text-to-speech, a faster CPU path and three RoPE/routing fixes (2026-09-25)
+
+This is the first published release since v1.16.1. Version 1.17.0 was prepared but never published
+as a GitHub release, so its changes (SSD streaming for MoE models larger than RAM, the prefill
+output-projection fix, layer-outer MoE prefill and `--expert-top-k`, described in the two v1.17.0
+sections below) also ship for the first time in this release.
+
+### New architectures, image input and text-to-speech
+
+Models chosen from the 3000 most-downloaded GGUF repositories on Hugging Face (30-day counts),
+restricted to builds of 6 GB or less, with a focus on coding, multimodal and audio models. Every
+text model was checked on the CPU with a short prompt and with an employee-registry retrieval
+prompt of about 1500 tokens. All answered the retrieval question correctly, except that
+LFM2.5-8B-A1B, a reasoning model, used up its 120-token budget thinking and gave only the badge
+number, not the city.
+
+- **New architectures.** Hunyuan dense (`hunyuan-dense`; Hy-MT2 translation models), Nanbeige
+  (`nanbeige`; looped depth, 22 layers run twice), Spark2.5 (`spark2_5`; sliding-window/full
+  interleave, per-layer RoPE, per-head output gate) and Ling 3.0 (`bailingmoe3`; Kimi Delta
+  Attention + gated MLA + group-limited MoE, in the new `BailingMoE3InferenceEngine`).
+- **New variants of supported families.** Qwen3-VL and Qwen2.5-VL text backbones (`qwen3vl`,
+  `qwen2vl`, with exact multi-axis RoPE) and LFM2-MoE (`lfm2moe`, LFM2.5-8B-A1B). Routed experts run
+  as row ranges across the matmul pool, which took LFM2.5-8B-A1B decode from 3.8 to 8.0 tok/s.
+- **Image input** for Qwen3-VL and Qwen3.5 (`qwen3vl_merger` mmproj) and Qwen2.5-VL
+  (`qwen2.5vl_merger`, with window attention): `--mmproj` and
+  `--image` on the CLI, `image_url` parts (data URLs) on `/v1/chat/completions`, `image` blocks
+  on `/v1/messages`, and `"mmproj"` on `/api/models/load`. All three families describe the
+  llama.cpp test image correctly. See `docs/architecture/vision-and-tts.md`.
+- **Text-to-speech with Qwen3-TTS** in the llama.cpp GGUF layout (talker + mmproj): `--tts out.wav
+  --tts-lang it`. Talker, code predictor and the full code2wav decoder are implemented; voice
+  cloning (the speaker encoder) is not. Output was checked numerically only (speech-like energy
+  envelope and pitch), not by listening.
+- **Batched prefill now covers fused Q/K/V** (split after one multi-token matmul) and the Spark2.5
+  per-head gate: Spark-X2.5-1.7B on a 1592-token prompt went from 191 to 93 s with the same answer.
+  Phi-3/4 still prefill token by token because of their packed gate/up FFN.
+- **Array message content on the OpenAI API.** A message whose `content` is an array of parts was
+  previously dropped; its text parts are now joined (and image parts become images).
+- **Qwen3 instruct-only checkpoints** (template without `<think>`, e.g. Qwen3-VL-Instruct and
+  Qwen3-2507-Instruct) no longer get the empty `<think></think>` suffix.
+- **GLM4 used the wrong RoPE pairing.** `ModelConfig` gave `glm4` NEOX RoPE, but llama.cpp uses
+  NORM for the dense `glm4` architecture (only `glm4moe` is NEOX), because the GGUF converter does
+  not permute Q/K for it. This is the same class of error as the Gemma fix below. On GLM-4-9B-0414
+  Q4_K_M the teacher-forced perplexity of the same 248-token text fell from 5.45 with NEOX to 2.60
+  with NORM, and the model now answers the 1375-token retrieval prompt correctly. GLM-4.xV
+  checkpoints, whose GGUFs carry `rope.dimension_sections` and have Q/K permuted to NEOX order for
+  M-RoPE, keep NEOX, as in llama.cpp.
+- **GLM4 MoE (`glm4moe`) now loads.** GLM-4.5, GLM-4.5-Air, GLM-4.6 and GLM-4.7 GGUFs were
+  rejected with "Unknown architecture", although the documentation listed GLM4 MoE as supported.
+  They now run on `Qwen3MoEInferenceEngine` with NEOX partial RoPE, sigmoid routing with the
+  `exp_probs_b` selection bias, `expert_weights_norm` and `expert_weights_scale`, and without the
+  NextN/MTP layers that `block_count` includes. Without `--thinking`, the GLM-4.5 chat template
+  gets `/nothink` and an empty `<think></think>`, as its Jinja template does. Verified on a tiny
+  random GGUF against an independent re-implementation of the llama.cpp graph (logits equal to
+  five decimal places); no full-size GLM-4.5 model has been run yet.
+- **The memory check no longer compares the weights with the Java heap.** `checkMemory` used
+  `min(-Xmx, RAM)` as the budget, so a 5.7 GB model run with `-Xmx6g` on a 15 GB machine was
+  reported as larger than RAM and the CLI asked for confirmation. The weights are memory-mapped
+  outside the heap, so they are now compared with physical RAM, using the same 85% threshold as
+  the preload decision. The KV cache, which is on the heap, is checked separately against `-Xmx`,
+  and the check now says when `-Xmx` is too small for the requested context length.
+
+### Build
+
+- **The Java 8 jar now runs on Java 8.** The `java8` profile compiled with `source`/`target` 1.8 on
+  a newer JDK, which links against that JDK's class library. A call such as
+  `MappedByteBuffer.duplicate()`, a covariant override added in Java 13, therefore compiled into a
+  method that Java 8 does not have, and the jar failed with `NoSuchMethodError` while reading the
+  first GGUF string. The profile now uses `<release>8</release>`, which also turned up one
+  `Path.of` call in the base code. The v1.18.0 jvm8 jar was run on OpenJDK 8 with Llama-3.2-1B and
+  with a GLM4-MoE model.
+
+### CPU dispatch, faster kernels, batched prefill for dense models, Gemma RoPE fix
+
+- **Gemma 2, 3, 3n and 4 used the wrong RoPE pairing.** `ModelConfig` gave the whole family
+  `ROPE_TYPE_NORMAL`; llama.cpp uses NEOX for Gemma, because the GGUF converter permutes Q/K only for
+  Llama-style checkpoints. Position 0 is unaffected, so short chats looked plausible, but quality
+  fell with position: Gemma-3-1B ended its turn without generating anything on any prompt longer
+  than about 50 tokens, and Gemma-2-2B degenerated into whitespace from about 75. With NEOX both
+  answer normally at every length tested, with much larger logit margins. The GPU passes read the
+  type from the same place, so they are fixed too.
+
+- **AVX-512 machines ran every quantised matmul through the scalar fallback.** The SIMD kernels
+  checked `SPECIES_PREFERRED.length() != 8`, which is true on AVX-512 (16 lanes). They use 256-bit
+  shapes explicitly and work there, so the guard is now `< 8`.
+
+- **`--threads` now works.** On Java 25 the default matmul split work into `availableProcessors()`
+  chunks regardless of the setting, and `--web` and the GUI never applied it at all.
+
+- **`MatmulPool`: one persistent CPU worker pool with dynamic scheduling** for matmuls, per-head
+  attention and per-expert MoE loops. Work is claimed in small chunks, so on hybrid P/E-core CPUs,
+  in VMs and on busy machines the fast cores take more of it instead of waiting on the slowest
+  static slice. Q/K/V is dispatched as one unit space, which also removes the GQA imbalance.
+  **1.28–1.77× decode on Llama-3.2-1B** in in-process A/B against the old dispatcher; together with the
+  kernel changes, Llama-1B decode went 119 → 86 ms/token (1.38×, 6 of 6 alternating process pairs).
+  `-Dmatmul.pool=false` restores the previous dispatchers.
+
+- **Faster Q4_K, Q5_K and Q8_0 kernels.** Raw per-sub-block accumulation with the scale applied once per
+  32 weights, per-range input sums, and, for Q4_K, one 32-byte packed load per group instead of four
+  widened 8-byte loads (Q5_K uses the same scheme for its fifth-bit array). Single-thread on real
+  tensors, quiet machine: **Q4_K 1.7×**, Q5_K +21 % (2× in the batched prefill kernel), Q8_0 up to
+  +30 %. Gemma-4-E2B, half of whose weights are Q5_K, went from 2.4 to 4.7 tok/s in decode. Relative
+  error against the scalar reference is 1e-6 or less, and generated text is unchanged.
+
+- **Opt-in lossless int8 repack for Q6_K** (`-Dq6k.repack=true`). Every `q − 32` fits an int8 and
+  `d·sc` is exact in float32, so weights and generated text are unchanged while the kernel runs 2.2×
+  faster on one core. Off by default because end to end it lost on the reference machine: decode is
+  memory-bandwidth bound with all threads running, and the copy is 1.31× the bytes (prefill +21 %,
+  decode slower in 9 of 10 paired runs).
+
+- **Batched prefill for Qwen3.5** (DeltaNet hybrid): the DeltaNet, attention and FFN projections run
+  as multi-token matmuls while the conv1d/recurrence and attention cores stay token by token.
+  Qwen3.5-0.8B 1.75×, 4B 1.43× on a ~175-token prompt, generated text identical.
+
+- **Decode after a batched prefill is no longer slowed by the JIT.** Batched prefill never ran the
+  single-token kernels, so they were only compiled once decode began and decode ran on unintrinsified
+  C1 code for a while (Llama-1B 3.8–7.4 instead of 8–11.8 tok/s). Each kernel class is now warmed on
+  a few rows before the first batched prefill (`-Dmatmul.warmup.ms`). The packed Q4_K/Q5_K kernels also
+  stopped allocating per call (968 → 20 young GCs over a short run).
+
+- **IQ4_NL and IQ4_XS kernels rewritten: 4–5× faster.** The codebook lookup now happens in
+  registers (`selectFrom` over two 8-entry halves) instead of a scalar table build plus gather per 32
+  weights. Llama-1B IQ4_NL decode 2.6 → 8.0 tok/s and Phi-3-mini IQ4_NL 0.6 → 1.7 tok/s, both with
+  identical text; Gemma-2-2B IQ4_XS, together with the RoPE fix, went from incoherent output at
+  0.9 tok/s to a correct answer at 2.7 tok/s.
+
+- **Batched prefill for the standard engine.** The prompt goes through each layer in 64-token chunks
+  and every projection is a multi-token matmul, with four-token kernels for Q4_K, Q6_K and Q8_0 that
+  unpack each weight once for four tokens. Attention stays token by token, so the per-token math is
+  unchanged. Measured back to back on ~290-token prompts, generated text identical:
+  **Llama-3.2-1B 117.7 s → 31.4 s (3.7×), Qwen2.5-Coder-3B 745.8 s → 217.9 s (3.4×),
+  Qwen3-1.7B Q8_0 96.6 s → 47.8 s (2.0×)**. Layers it does not cover fall back automatically;
+  `-Dprefill.batched=false` disables it.
+
+- Measured and rejected: an int8 activation path (the Vector API has no widening byte multiply-add,
+  so it is slower than the float path on CPU), packed loads for Q6_K, and a "magic float" conversion
+  that loses precision. Full write-up in `docs/optimization/cpu-dispatch-and-kernels.md`.
+
+## v1.17.0 — SSD streaming, plus a prefill defect that was costing a full output projection per prompt token (2026-08-11)
+
+- **Prefill no longer computes logits it throws away.** Only the last prompt token's logits are used
+  to sample the first generated token, but four of the eight `generate*` prefill loops ran
+  `logits = eng.forward(...)` on every iteration, paying the full vocabulary-sized output projection
+  each time and discarding all but the last. Every engine already had `forwardNoOutput`, and half the
+  call sites already used it correctly — the four that did not were **Standard** (Llama, Qwen2/3,
+  Gemma 2/3, Phi, Mistral, OLMo2, Granite, …), **Qwen3 MoE**, **DeepSeek2** and **Nemotron-H**. Fixed
+  by calling the method that already existed. Measured on a 153-token prompt with Llama-3.2-1B:
+  **35.5 s → 28.9 s, −18.6 %**, with perplexity, `avg_nll` and the generated text identical to the
+  digit. The saving is `(promptLen − 1) ×` one output projection, so it grows with prompt length, and
+  it is larger still when memory is tight because the output tensor is big enough to evict the page
+  cache on every pass. Analysis in `docs/optimization/per-token-latency-analysis.md`.
+
+- **Layer-outer prefill for Qwen3 MoE.** Prefill ran token by token, walking all 48 layers for one
+  token before moving to the next — the worst possible order for a model whose experts are streamed
+  from disk, because an expert loaded for one token is evicted long before the next token needs it.
+  `forwardPrefill` now drives layers in the outer loop and prompt tokens in the inner loop, in chunks
+  of 64 (`-Dprefill.batch`). The arithmetic and its per-(layer, token) order are unchanged, so output
+  is bit-identical; only the working set changes, collapsing from `layers × top-K` experts to the
+  union selected by one chunk at one layer. **Measured on Qwen3-Coder-30B with a 109-token prompt:
+  283.2 s → 65.7 s (4.3×), decode 0.4 → 1.7 tok/s, cache misses 19989 → 14774, time spent in disk
+  reads 52.8 s → 17.9 s, perplexity and `avg_nll` identical.** Note the disk time fell by 66 % while
+  the miss count fell by only 26 %: the surviving misses are also cheaper, because consecutive tokens
+  at one layer touch the same region of the file. Also applied to **DeepSeek2 / GLM-4.7-Flash**
+  (DeepSeek-Coder-V2-Lite: 137.6 s → 84.3 s, misses 11112 → 8726, disk time 66.3 s → 24.7 s, output
+  identical). Disable with `-Dprefill.batched=false`. Nemotron-H was deliberately left alone — the
+  reordering would be correct, but it carries per-layer Mamba-2 recurrent state plus a separate GPU
+  path, and its only MoE variant fits RAM and streams nothing. Dense models gain nothing either.
+
+- **`--expert-top-k N`** routes to fewer MoE experts than the model specifies, as an explicit
+  speed-for-quality knob (the same class of trade as `-Dkv.q8` / `-Dkv.q4`). Expert work scales
+  linearly with the count. Measured on Qwen3-Coder-30B (native top-8): **top-6 and top-4 stay
+  correct — top-6 byte-identical, top-4 the same algorithm with a cosmetic difference — while top-2
+  collapses into gibberish.** A warning for anyone tuning this: the perplexity evaluator reported
+  `1.00 (EXCELLENT)` for that gibberish, because it measures the model's confidence in its own
+  continuation over 3 tokens, not whether the continuation is right. PPL is a valid checksum for
+  changes meant to be numerically transparent, but it is not a quality gate for a deliberately lossy
+  knob — judge those by generated text at `--temperature 0`.
+
+- **A measured phase profile of the CPU forward pass**, which is what surfaced the above. On
+  Qwen3-Coder-30B the split is `moe_ffn` 49 % / `attn` 36 % / `output` 14 %, and the MoE path — the
+  one usually assumed to be the problem — turns out to be the *most* efficient phase per parameter
+  (2.83 G param/s against attention's 1.89) while also carrying the disk I/O. The document ranks the
+  remaining wins and records the machine-level context: the reference box now has 4 cores, 7.4 GB of
+  RAM and **no GPU at all**, so every CUDA path in the project is currently unreachable.
+
+## v1.17.0 — SSD streaming: a hot-expert RAM cache for MoE models larger than RAM (2026-08-11)
+
+v1.16.0 made models larger than RAM *load*; this release makes them *usable*. Qwen3-Coder-30B
+(18.6 GB against 7.8 GB of RAM) went from **0.1 to 1.0 decode tok/s**, 3.2× on wall clock, with
+bit-identical output. Reference designs: [Colibri](https://github.com/JustVugg/colibri) (pure C,
+zero deps, MoE experts streamed from disk) and [LLM in a flash](https://arxiv.org/abs/2312.11514).
+Full analysis in `docs/optimization/ssd-streaming-cache.md`.
+
+- **Expert RAM cache filled by explicit reads (`MappedExpertCache`).** The routed experts of a
+  lazily-loaded MoE model are cached in off-heap slots and filled with
+  `FileChannel.read(ByteBuffer, position)` straight into the slot — no intermediate copy, and the
+  call lowers to `pread`. One slot holds one expert's gate, up and down together, because the router
+  never needs one without the others; that also keeps each sub-slice at a single quantization type,
+  which matters on a Q4_K_M mix where `ffn_down_exps` is Q6_K on some layers and Q4_K on others.
+  Retention is least-frequently-used with an LRU tiebreak — that is the hot set, and it matches the
+  measured routing concentration (top-32 of 128 experts carry ~79 % of routing). Positional reads
+  are concurrent, so one layer's misses are filled in parallel. `ExpertCache` is a base-code
+  interface with the implementation in java21, loaded reflectively like `SimdVectorOps`; every
+  failure path falls back to the mmap. Wired into `Qwen3MoEInferenceEngine` and `MoEFFN`
+  (DeepSeek2 / GLM-4.7-Flash).
+
+- **`--ssd-streaming` and `--expert-cache-size <MB>`.** The first sets `no.preload` and
+  `moe.expert.cache` and carries the consent the interactive `[y/N]` prompt used to ask for, so a
+  model above the RAM budget is now a supported mode instead of a discouraged one. The second sets
+  the cache budget (default: a quarter of physical RAM, capped at 4 GB).
+
+- **The "will cause disk swap" warnings were wrong and are fixed.** Two separate messages claimed
+  swap. Since v1.16.0 there has been none — the loader skips the preload and reads pages from the
+  model file. The plan now distinguishes MoE (streams, with a cache) from dense (streams, but no
+  cache can help, since every weight is needed every token).
+
+- **Expert-granular read-ahead (`ExpertPrefetch`, `-Dmoe.expert.willneed`) — small, and instructive.**
+  Issuing `madvise(MADV_WILLNEED)` per selected expert before the matmuls measured only ~1.15×. A
+  `mincore()` probe showed why: over a 2.65 MB range the call returns success but leaves **32 of 647
+  pages resident**, because vboxsf caps read-ahead near 128 KB. That is the result that justified
+  the explicit read path — the storage can serve expert-sized reads at ~480 MB/s, but the mmap layer
+  cannot ask it to. Kept on: never negative, and better on storage that honours the hint.
+
+- **More cache is not monotonically better.** A budget sweep found a 3 GB cache reaching the *best*
+  hit rate (57.3 % vs 48.4 % at 2 GB) while running **4× slower end to end**, because cache plus heap
+  left the kernel nothing for the page cache — which is what absorbs every miss. A warning now fires
+  when budget + heap exceeds 60 % of RAM. The default lands at the measured sweet spot.
+
+- **Cache counters on JMX and `/api/metrics`** under an `expertCache` block (active, hit rate, hits,
+  misses, MB read, read time, slots, size), plus a shutdown summary line. No reflection needed, since
+  `ExpertCache` is base code. The block is always present, with `-1` when inactive.
+
 ## v1.16.1 — MADV_RANDOM for the lazy >RAM path; verification sweep; placement roadmap closed out
 
 A small follow-up to v1.16.0, focused on the models-larger-than-RAM path and closing out the

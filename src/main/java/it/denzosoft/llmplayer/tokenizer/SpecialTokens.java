@@ -62,6 +62,13 @@ public class SpecialTokens {
         boolean addBos = metadata.getBoolean("tokenizer.ggml.add_bos_token",
             metadata.getInt("tokenizer.ggml.bos_token_id", -1) >= 0);
 
+        // A ChatML <|im_start|> BOS (Nanbeige) is emitted by the chat template itself as the
+        // first turn opener, so prepending it again would open a turn twice.
+        String[] vocab = metadata.getStringArray("tokenizer.ggml.tokens");
+        if (addBos && vocab != null && bosId >= 0 && bosId < vocab.length && "<|im_start|>".equals(vocab[bosId])) {
+            addBos = false;
+        }
+
         // Load additional EOS token IDs from metadata array
         int[] additionalEos = metadata.getIntArray("tokenizer.ggml.eos_token_ids");
 

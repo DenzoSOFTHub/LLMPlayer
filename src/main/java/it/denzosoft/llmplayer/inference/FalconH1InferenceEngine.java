@@ -177,7 +177,7 @@ public class FalconH1InferenceEngine {
             ? config.attentionScale() : (1.0f / (float) Math.sqrt(headSize));
         final KVCache kv = state.kvCache;
         final int layerF = layer, posF = position, hsF = headSize;
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOff = h * hsF;
             int kvHeadOff = kvHead * hsF;
@@ -263,7 +263,7 @@ public class FalconH1InferenceEngine {
         int bOffset = ssmInner;
         int cOffset = ssmInner + ssmGroups * ssmState;
         final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
-        IntStream.range(0, nheads).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(nheads, h -> {
             int group = h / (nheads / ssmGroups);
             float dtH = dt[h];
             float aH = lw.ssmA().getFloat(h);          // stored as -exp(A_log)

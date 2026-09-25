@@ -46,7 +46,7 @@ public class SimdQ5_0FloatTensor extends Q5_0FloatTensor {
 
     @Override
     public float dot(long thisOffset, float[] other, int otherOffset, int length) {
-        if (FloatVector.SPECIES_PREFERRED.length() != 8 || length % BLOCK_SIZE != 0) {
+        if (FloatVector.SPECIES_PREFERRED.length() < 8 || length % BLOCK_SIZE != 0) {
             return super.dot(thisOffset, other, otherOffset, length);
         }
 

@@ -58,6 +58,9 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
     private final ModelWeights weights;
 
     private final int dim, vocabSize, blockCount, maxSeqLen, ffnDim;
+    private final int[] layerFfnLen;   // per-layer FFN width (Gemma 4 E2B/E4B double-wide MLP)
+    private final int[] layerKvHeads;  // per-layer KV head count (Gemma 4 12B: 1 on global layers)
+    private final int gpuLayers;       // number of leading GPU-resident layers (partial offload)
     private final int headCount, headCountKV, kvMul;
     private final int headSizeSwa, headSizeFull, maxHeadSize, maxQDim, maxKvDim;
     private final int slidingWindow, sharedKvLayers, pleDim;
@@ -129,6 +132,16 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         this.vocabSize = config.vocabSize();
         this.blockCount = config.blockCount();
         this.ffnDim = config.intermediateSize();
+        this.layerFfnLen = new int[config.blockCount()];
+        for (int i = 0; i < this.layerFfnLen.length; i++) this.layerFfnLen[i] = config.layerFfnLength(i);
+        this.layerKvHeads = new int[config.blockCount()];
+        for (int i = 0; i < this.layerKvHeads.length; i++) this.layerKvHeads[i] = config.layerKvHeads(i);
+        // Partial offload: count leading layers whose attention weight is GPU-resident. ModelLoader
+        // places only the first N layers on the GPU when the model is larger than VRAM (the 12B at
+        // 7 GB on a 6 GB card); the rest run on the CPU engine and we only drive 0..N-1 here.
+        int gl = 0;
+        while (gl < config.blockCount() && weights.layers()[gl].wq() instanceof CudaFloatTensor) gl++;
+        this.gpuLayers = gl;
         this.headCount = config.headCount();
         this.headCountKV = config.headCountKV();
         this.kvMul = headCount / headCountKV;
@@ -248,10 +261,10 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         gpuPlePostNorm  = new long[blockCount];
         gpuKeyCache     = new long[blockCount];
         gpuValueCache   = new long[blockCount];
-        for (int i = 0; i < blockCount; i++) {
+        for (int i = 0; i < gpuLayers; i++) {   // only the GPU-resident (first N) layers
             TransformerLayerWeights lw = weights.layers()[i];
             int hs = isSwa[i] ? headSizeSwa : headSizeFull;
-            int kvDim = headCountKV * hs;
+            int kvDim = layerKvHeads[i] * hs;
             gpuAttnNorm[i] = uploadNormWeights(lw.attnNorm(), dim);
             gpuFfnNorm[i]  = uploadNormWeights(lw.ffnNorm(), dim);
             if (lw.qNorm() != null) gpuQNorm[i] = uploadNormWeights(lw.qNorm(), hs);
@@ -322,17 +335,29 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
     public static boolean isSupported(ModelConfig config, ModelWeights weights,
                                       FloatTensor[] pleInpGate, FloatTensor[] pleProj) {
         if (weights.layers().length == 0) return false;
+        // The final output projection runs on GPU even under partial offload, so it must be resident.
         if (!(weights.output() instanceof CudaFloatTensor)) return false;
-        for (TransformerLayerWeights lw : weights.layers()) {
-            FloatTensor[] mm = { lw.wq(), lw.wk(), lw.wv(), lw.wo(), lw.wGate(), lw.wUp(), lw.wDown() };
-            for (FloatTensor t : mm) if (!(t instanceof CudaFloatTensor)) return false;
+        // Partial offload: count the leading GPU-resident layers. The CPU engine drives the rest.
+        TransformerLayerWeights[] layers = weights.layers();
+        int gl = 0;
+        while (gl < layers.length && layers[gl].wq() instanceof CudaFloatTensor) gl++;
+        if (gl == 0) return false;   // nothing offloaded → let the CPU engine run everything
+        for (int i = 0; i < gl; i++) {
+            TransformerLayerWeights lw = layers[i];
+            // wv may be absent on Gemma 4 global layers (alternative attention: V derived from K).
+            FloatTensor[] req = { lw.wq(), lw.wk(), lw.wo(), lw.wGate(), lw.wUp(), lw.wDown() };
+            for (FloatTensor t : req) if (!(t instanceof CudaFloatTensor)) return false;
+            if (lw.wv() != null && !(lw.wv() instanceof CudaFloatTensor)) return false;
         }
-        if (pleInpGate != null) for (FloatTensor t : pleInpGate) if (!(t instanceof CudaFloatTensor)) return false;
-        if (pleProj != null) for (FloatTensor t : pleProj) if (!(t instanceof CudaFloatTensor)) return false;
+        // PLE matmul tensors (E2B/E4B) must be GPU-resident for the GPU-resident layers.
+        if (pleInpGate != null) for (int i = 0; i < gl; i++)
+            if (pleInpGate[i] != null && !(pleInpGate[i] instanceof CudaFloatTensor)) return false;
+        if (pleProj != null) for (int i = 0; i < gl; i++)
+            if (pleProj[i] != null && !(pleProj[i] instanceof CudaFloatTensor)) return false;
         return true;
     }
 
-    public int getGpuLayerCount() { return blockCount; }
+    public int getGpuLayerCount() { return gpuLayers; }
 
     /** Upload the precomputed [pleDim*blockCount] PLE combined vector for this token. */
     public void uploadPleCombined(float[] pleCombined) {
@@ -362,7 +387,8 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         boolean swa = isSwa[li];
         int hs = swa ? headSizeSwa : headSizeFull;
         int qDim = headCount * hs;
-        int kvDim = headCountKV * hs;
+        int kvHeads = layerKvHeads[li];   // per-layer (Gemma 4 12B global layers use 1)
+        int kvDim = kvHeads * hs;
         boolean hasOwnKv = li < blockCount - sharedKvLayers;
         int kvLayer = kvSourceLayer[li];
         long cosTable = swa ? gpuCosTableSwa : gpuCosTableFull;
@@ -375,7 +401,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         int dimGrid   = (int) ((dim + blockSize - 1) / blockSize);
         int ffnGrid   = (int) ((ffnDim + blockSize - 1) / blockSize);
         int ropeQGrid = (int) ((headCount * halfRope + blockSize - 1) / blockSize);
-        int ropeKGrid = (int) ((headCountKV * halfRope + blockSize - 1) / blockSize);
+        int ropeKGrid = (int) ((kvHeads * halfRope + blockSize - 1) / blockSize);
 
         // === 1. Pre-attention RMSNorm: gpuX -> gpuNorm ===
         normPB.setLong(0, gpuNorm); normPB.setLong(1, gpuX); normPB.setLong(2, gpuAttnNorm[li]);
@@ -400,17 +426,23 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         // === 3. K/V projection (own-KV layers only) ===
         if (hasOwnKv) {
             matmul((CudaFloatTensor) lw.wk(), gpuNorm, gpuK, kvDim, dim);
-            matmul((CudaFloatTensor) lw.wv(), gpuNorm, gpuV, kvDim, dim);
+            if (lw.wv() != null) {
+                matmul((CudaFloatTensor) lw.wv(), gpuNorm, gpuV, kvDim, dim);
+            } else {
+                // Gemma 4 alternative attention (global layers): no V projection — V = raw K
+                // (copied before the K-norm/RoPE below mutate gpuK).
+                cudaContext.copyBufferDtoD(gpuV, gpuK, (long) kvDim * fb);
+            }
             // QK-norm on K (per-head, with learnable scale)
             if (gpuKNorm[li] != 0) {
                 perHeadPB.setLong(0, gpuK); perHeadPB.setLong(1, gpuKNorm[li]); perHeadPB.setInt(2, hs);
-                launch(perHeadNormFunc, headCountKV, perHeadBlockDim, perHeadSharedMem, perHeadPB);
+                launch(perHeadNormFunc, kvHeads, perHeadBlockDim, perHeadSharedMem, perHeadPB);
             }
             // V-norm: RMS without learnable scale (all-ones weights), per head
             perHeadPB.setLong(0, gpuV); perHeadPB.setLong(1, gpuOnes); perHeadPB.setInt(2, hs);
-            launch(perHeadNormFunc, headCountKV, perHeadBlockDim, perHeadSharedMem, perHeadPB);
+            launch(perHeadNormFunc, kvHeads, perHeadBlockDim, perHeadSharedMem, perHeadPB);
             // RoPE on K
-            ropePB.setLong(0, gpuK); ropePB.setInt(3, headCountKV);
+            ropePB.setLong(0, gpuK); ropePB.setInt(3, kvHeads);
             launch(ropeFunc, ropeKGrid, (int) blockSize, 0, ropePB);
             // KV cache update into THIS layer's cache
             kvPB.setLong(0, gpuKeyCache[li]); kvPB.setLong(1, gpuValueCache[li]); kvPB.setInt(4, kvDim);
@@ -419,6 +451,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
 
         // === 4. Attention: reads source layer's KV cache (same hs/kvDim as this layer) ===
         attnPB.setLong(2, gpuKeyCache[kvLayer]); attnPB.setLong(3, gpuValueCache[kvLayer]);
+        attnPB.setInt(5, kvHeads);   // per-layer KV head count (GQA grouping); 1 on global layers
         attnPB.setInt(6, hs); attnPB.setInt(7, kvDim);
         attnPB.setInt(9, (swa && slidingWindow > 0) ? slidingWindow : 0);
         int attnSM = (position + 1 + 32) * Float.BYTES;
@@ -444,13 +477,16 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
 
         // === 9. GeGLU FFN: gate=wGate@norm, up=wUp@norm, gelu(gate), gate*=up, down=wDown@gate ===
-        matmul((CudaFloatTensor) lw.wGate(), gpuNorm, gpuGate, ffnDim, dim);
-        matmul((CudaFloatTensor) lw.wUp(), gpuNorm, gpuUp, ffnDim, dim);
-        geluPB.setLong(0, gpuGate); geluPB.setInt(1, ffnDim);
-        launch(geluFunc, ffnGrid, (int) blockSize, 0, geluPB);
-        elemMulPB.setLong(0, gpuGate); elemMulPB.setLong(1, gpuUp); elemMulPB.setInt(2, ffnDim);
-        launch(elemMulFunc, ffnGrid, (int) blockSize, 0, elemMulPB);
-        matmul((CudaFloatTensor) lw.wDown(), gpuGate, gpuBx, dim, ffnDim);
+        // Per-layer FFN width (Gemma 4 E2B/E4B double-wide MLP); buffers are sized to the max.
+        int lf = layerFfnLen[li];
+        int lfGrid = (int) ((lf + blockSize - 1) / blockSize);
+        matmul((CudaFloatTensor) lw.wGate(), gpuNorm, gpuGate, lf, dim);
+        matmul((CudaFloatTensor) lw.wUp(), gpuNorm, gpuUp, lf, dim);
+        geluPB.setLong(0, gpuGate); geluPB.setInt(1, lf);
+        launch(geluFunc, lfGrid, (int) blockSize, 0, geluPB);
+        elemMulPB.setLong(0, gpuGate); elemMulPB.setLong(1, gpuUp); elemMulPB.setInt(2, lf);
+        launch(elemMulFunc, lfGrid, (int) blockSize, 0, elemMulPB);
+        matmul((CudaFloatTensor) lw.wDown(), gpuGate, gpuBx, dim, lf);
 
         // === 10. Post-FFN norm (in place on gpuBx, if present) ===
         if (gpuPostFfnNorm[li] != 0) {

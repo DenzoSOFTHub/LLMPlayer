@@ -56,7 +56,7 @@ Generates a model response from a multi-turn conversation.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model` | string | — | Accepted for compatibility, ignored (uses the loaded model) |
-| `messages` | array | **required** | Array of `{role, content}` messages. Roles: `system`, `user`, `assistant` |
+| `messages` | array | **required** | Array of `{role, content}` messages. Roles: `system`, `user`, `assistant`. `content` is a string or an array of parts: `{"type":"text","text":...}` and, for a model loaded with a vision `mmproj`, `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}` (see below) |
 | `stream` | boolean | `false` | If `true`, response is streamed via SSE |
 | `temperature` | float | `0.7` | Sampling temperature (0.0 = greedy, 2.0 = max) |
 | `max_tokens` | int | `256` | Maximum number of tokens to generate |
@@ -66,6 +66,29 @@ Generates a model response from a multi-turn conversation.
 | `stop` | string or array | `null` | Stop sequences. Generation stops when the output text contains any of these strings |
 | `frequency_penalty` | float | `0.0` | OpenAI frequency penalty. Mapped internally to `repetition_penalty = 1.0 + frequency_penalty * 0.5` |
 | `repetition_penalty` | float | `1.1` | Direct repetition penalty (extension, takes precedence over `frequency_penalty`) |
+
+#### Image input
+
+When the loaded model has a vision projector (Qwen3-VL, Qwen3.5 or Qwen2.5-VL with its mmproj,
+loaded through `mmproj` in `/api/models/load`), user messages may contain images as `image_url`
+parts. Only inline `data:` URLs with base64 content are accepted; the server does not fetch remote
+URLs. Each image is placed at the position of its part in the message.
+
+```json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ..."}},
+      {"type": "text", "text": "What does this page say?"}
+    ]
+  }],
+  "max_tokens": 200
+}
+```
+
+A request with images for a model without a projector returns HTTP 400. Requests with images bypass
+the conversation KV cache.
 
 #### Non-streaming Response (`stream: false`)
 
@@ -223,7 +246,7 @@ The `x-api-key` header is accepted and ignored (no authentication required — s
 
 ### POST `/v1/messages`
 
-Chat completion in Anthropic message format. Supports streaming (`stream: true` → SSE with `message_start` / `content_block_delta` / `message_delta` / `message_stop` events) and non-streaming. Accepts the standard Anthropic fields: `model` (accepted and ignored — uses the currently loaded model), `messages` (array of `{role, content}` with `user` / `assistant` roles), `system`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`.
+Chat completion in Anthropic message format. Supports streaming (`stream: true` → SSE with `message_start` / `content_block_delta` / `message_delta` / `message_stop` events) and non-streaming. Accepts the standard Anthropic fields: `model` (accepted and ignored — uses the currently loaded model), `messages` (array of `{role, content}` with `user` / `assistant` roles), `system`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`. With a vision projector loaded, content blocks may include images as `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`; other source types are rejected with HTTP 400.
 
 ### POST `/v1/messages/count_tokens`
 
@@ -270,13 +293,15 @@ Loads a GGUF model into memory. Automatically unloads the previous model if one 
   "contextLength": 2048,
   "gpu": true,
   "gpuDevice": 0,
-  "gpuLayers": -1
+  "gpuLayers": -1,
+  "mmproj": "gguf/mmproj-Qwen3-VL-4B-F16.gguf"
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `path` | string | **required** | Path to the GGUF file (relative to working directory or absolute) |
+| `mmproj` | string | — | Optional vision projector (`qwen3vl_merger` or `qwen2.5vl_merger` mmproj) for a Qwen3-VL, Qwen3.5 or Qwen2.5-VL model, enabling image input on the chat APIs. HTTP 400 if the projector does not fit the model |
 | `contextLength` | int | `2048` | Maximum context length (tokens) |
 | `gpu` | boolean | `false` | Enable GPU offloading via OpenCL |
 | `gpuDevice` | int | `0` | OpenCL device index |
@@ -579,6 +604,16 @@ Returns runtime metrics including model info, generation statistics, memory usag
     "offHeapUsedMB": 45,
     "kvCacheEstimateMB": 128
   },
+  "expertCache": {
+    "active": true,
+    "hitRatePercent": 52.2,
+    "hits": 3609,
+    "misses": 3303,
+    "bytesReadMB": 9052,
+    "readTimeMs": 5800,
+    "slots": 701,
+    "sizeMB": 2045
+  },
   "gpu": {
     "enabled": true,
     "deviceName": "NVIDIA RTX 4050 Laptop GPU",
@@ -596,6 +631,12 @@ Returns runtime metrics including model info, generation statistics, memory usag
 - `averageTokensPerSecond` — cumulative average since model load (or last `reset()`)
 - `recentTokensPerSecond` — 60-second rolling window over recent generations (live monitoring; 0.0 if no samples in window)
 - `recentSampleCount` — number of generations counted in the rolling window (max 256)
+
+The `expertCache` block reports the SSD-streaming cache used for MoE models larger than RAM (see
+`docs/optimization/ssd-streaming-cache.md`). It is always present so clients can render it
+unconditionally; when the cache is not active `active` is `false` and every counter is `-1`. A
+falling `hitRatePercent` alongside a rising `readTimeMs` is the signal to raise
+`--expert-cache-size`.
 
 These same metrics are also available via JMX MXBean at `it.denzosoft.llmplayer:type=LLMPlayer`.
 

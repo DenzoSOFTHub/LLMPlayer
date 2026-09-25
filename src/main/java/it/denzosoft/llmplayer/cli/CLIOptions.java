@@ -23,6 +23,9 @@ public class CLIOptions {
     private int dryRange = 1024;
     private int threads = detectPhysicalCores();  // default to physical cores (bandwidth-bound matmul)
     private boolean showInfo;
+    private int expertCacheSizeMb = -1;
+    private boolean ssdStreaming;
+    private int expertTopK = -1;
     private boolean help;
     private int contextLength = 2048;
     private boolean webMode;
@@ -34,6 +37,10 @@ public class CLIOptions {
 
     // Speculative decoding (Tier 3) — opt-in
     private String draftModelPath;       // path to draft GGUF; enables speculative decoding when set
+    private String mmprojPath;           // vision projector GGUF (Qwen3-VL mmproj) or TTS mmproj
+    private String ttsOutput;            // --tts <out.wav>: text-to-speech mode (Qwen3-TTS)
+    private String ttsLang = "en";
+    private final java.util.List<String> imagePaths = new java.util.ArrayList<>(); // --image, repeatable
     private int speculationDepth = 4;    // K candidate tokens per round
     private int gpuDeviceId;
     private boolean gpuList;
@@ -110,6 +117,12 @@ public class CLIOptions {
                 opts.seed = Long.parseLong(args[++i]);
             } else if ("--threads".equals(arg)) {
                 opts.threads = Integer.parseInt(args[++i]);
+            } else if ("--expert-top-k".equals(arg)) {
+                opts.expertTopK = Integer.parseInt(args[++i]);
+            } else if ("--ssd-streaming".equals(arg)) {
+                opts.ssdStreaming = true;
+            } else if ("--expert-cache-size".equals(arg)) {
+                opts.expertCacheSizeMb = Integer.parseInt(args[++i]);
             } else if ("--info".equals(arg)) {
                 opts.showInfo = true;
             } else if ("--context-length".equals(arg) || "-c".equals(arg)) {
@@ -147,6 +160,14 @@ public class CLIOptions {
                 opts.gpuMemoryMode = args[++i].toLowerCase();
             } else if ("--draft-model".equals(arg)) {
                 opts.draftModelPath = args[++i];
+            } else if ("--tts".equals(arg)) {
+                opts.ttsOutput = args[++i];
+            } else if ("--tts-lang".equals(arg)) {
+                opts.ttsLang = args[++i];
+            } else if ("--mmproj".equals(arg)) {
+                opts.mmprojPath = args[++i];
+            } else if ("--image".equals(arg)) {
+                opts.imagePaths.add(args[++i]);
             } else if ("--spec-depth".equals(arg)) {
                 opts.speculationDepth = Integer.parseInt(args[++i]);
             } else if ("--fine-tune".equals(arg)) {
@@ -217,6 +238,10 @@ public class CLIOptions {
     // Getters
     public String getModelPath() { return modelPath; }
     public String getDraftModelPath() { return draftModelPath; }
+    public String getMmprojPath() { return mmprojPath; }
+    public String getTtsOutput() { return ttsOutput; }
+    public String getTtsLang() { return ttsLang; }
+    public java.util.List<String> getImagePaths() { return imagePaths; }
     public int getSpeculationDepth() { return speculationDepth; }
     public String getPrompt() { return prompt; }
     public boolean isInteractive() { return interactive; }
@@ -224,6 +249,15 @@ public class CLIOptions {
     public float getTemperature() { return temperature; }
     public int getThreads() { return threads; }
     public boolean isShowInfo() { return showInfo; }
+
+    /** RAM budget in MB for the SSD-streaming MoE expert cache; -1 leaves the default. */
+    public int getExpertCacheSizeMb() { return expertCacheSizeMb; }
+
+    /** Run a model larger than RAM by streaming weights from the model file (MoE expert cache). */
+    public boolean isSsdStreaming() { return ssdStreaming; }
+
+    /** Reduced MoE top-K (speed for quality); -1 leaves the model's own value. */
+    public int getExpertTopK() { return expertTopK; }
 
     /**
      * Number of physical cores (not logical/hyperthreaded). The matmul hot path is memory-bandwidth
@@ -309,6 +343,10 @@ public class CLIOptions {
         System.out.println("Options:");
         System.out.println("  --model, -m <path>       Path to GGUF model file");
         System.out.println("  --prompt, -p <text>      Input prompt");
+        System.out.println("  --mmproj <file>          Vision projector GGUF (Qwen3-VL mmproj) for image input");
+        System.out.println("  --image <file>           Image for the prompt (JPEG/PNG; repeatable, needs --mmproj)");
+        System.out.println("  --tts <out.wav>          Text-to-speech: speak --prompt with a Qwen3-TTS --model/--mmproj pair");
+        System.out.println("  --tts-lang <code>        TTS language: en, it, de, fr, es, pt, zh, ja, ko, ru (default en)");
         System.out.println("  --interactive, -i        Interactive chat mode");
         System.out.println("  --max-tokens, -n <num>   Max tokens to generate (default: 256)");
         System.out.println("  --temperature, -t <num>  Sampling temperature (default: 0.7)");
@@ -342,6 +380,12 @@ public class CLIOptions {
         System.out.println("  --no-gpu-chain           Disable GPU kernel chaining");
         System.out.println("  --gpu-backend <backend>  GPU backend: auto, cuda, opencl (default: auto)");
         System.out.println("  --gpu-memory <mode>      GPU memory: device, managed, host-mapped (default: device)");
+        System.out.println("  --expert-top-k <N>       Route to only N MoE experts instead of the model's top-K");
+        System.out.println("                           (faster, lower quality — check perplexity)");
+        System.out.println("  --ssd-streaming          Run a model larger than RAM by streaming weights from disk");
+        System.out.println("                           (MoE: routed experts cached in RAM; skips the confirmation)");
+        System.out.println("  --expert-cache-size <MB> RAM budget for the SSD-streaming MoE expert cache");
+        System.out.println("                           (default: 1/4 of physical RAM, max 4 GB)");
         System.out.println("  --thinking               Enable extended thinking/reasoning (SmolLM3, Qwen3, Qwen3.5)");
         System.out.println();
         System.out.println("Fine-tuning:");

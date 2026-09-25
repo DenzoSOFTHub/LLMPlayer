@@ -19,7 +19,17 @@ public class InferenceState {
     public final float[] v;      // value [kvDim]
     public final float[] att;    // attention scores [headCount * maxSeqLen]
     public final float[] logits; // output logits [vocabSize]
+    public final float[] attnGate; // per-head attention output gate [headCount] (Spark2.5)
     public final KVCache kvCache;
+    /**
+     * Multi-axis RoPE positions of image tokens (Qwen-VL); null until an image is prefilled, in which
+     * case text rope positions equal the KV index.
+     */
+    public MRopePositions mrope;
+    final int[] ropePos4 = new int[4];
+    float[] mropeCos, mropeSin;
+    /** Batched-prefill buffers, created on first use by {@link InferenceEngine#forwardPrefill}. */
+    PrefillBatch prefillBatch;
 
     public InferenceState(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();
@@ -38,6 +48,7 @@ public class InferenceState {
         this.v = new float[kvDim];
         this.att = new float[config.headCount() * maxSeqLen];
         this.logits = new float[config.vocabSize()];
+        this.attnGate = new float[config.headCount()];
         // KV cache mode: FLOAT32 (default), Q8_0 (-Dkv.q8=true), or Q4_1 (-Dkv.q4=true; takes precedence
         // when both are set). Q8_0 saves ~72 % KV memory at ~0 quality loss; Q4_1 saves ~81 % at slightly
         // higher quant noise (val = q*d + m, q in [0,15]). Both are opt-in.

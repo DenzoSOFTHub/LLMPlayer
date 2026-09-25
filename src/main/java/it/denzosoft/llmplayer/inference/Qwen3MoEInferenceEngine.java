@@ -32,6 +32,8 @@ public class Qwen3MoEInferenceEngine {
     private final float[] outputNormCache;
     private final int maxSeqLen;
     private final boolean isGptOss;
+    // GLM4-MoE: sigmoid gating with the exp_probs_b selection bias (llama.cpp build_moe_ffn)
+    private final boolean sigmoidRouting;
     private final int slidingWindow; // ISWA: 0 = disabled, >0 = window size for SWA layers
     private final int noRopeLayerInterval; // Llama4 iRoPE: 0 = all layers use RoPE
 
@@ -42,6 +44,12 @@ public class Qwen3MoEInferenceEngine {
     private Object expertGpuCache;
     private java.lang.reflect.Method computeExpertsMethod;
     private int currentLayer; // tracks current layer for GPU cache keying
+
+    // SSD-streaming expert RAM cache (models larger than RAM), or null when the model is resident.
+    private it.denzosoft.llmplayer.tensor.ExpertCache expertCache;
+    /** Per-expert views for the row-kernel expert path and batched prefill (see {@link ExpertViews}). */
+    private final ExpertViews expertViews;
+    private boolean cacheLayerReady;
 
     private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
 
@@ -62,8 +70,10 @@ public class Qwen3MoEInferenceEngine {
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
         this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
+        this.sigmoidRouting = config.architecture() == ModelArchitecture.GLM4 && config.expertGatingFunc() == 2;
         this.slidingWindow = config.slidingWindow();
         this.noRopeLayerInterval = config.noRopeLayerInterval();
+        this.expertViews = new ExpertViews(config.blockCount(), Math.max(1, config.expertCount()));
 
         if (routingStats && config.expertCount() > 0) {
             expertHits = new long[config.blockCount()][config.expertCount()];
@@ -185,6 +195,11 @@ public class Qwen3MoEInferenceEngine {
         }
     }
 
+    /** Attach the SSD-streaming expert cache (models larger than RAM). */
+    public void setExpertCache(it.denzosoft.llmplayer.tensor.ExpertCache cache) {
+        this.expertCache = cache;
+    }
+
     /**
      * Get expert GPU cache statistics, or null if cache not active.
      */
@@ -223,15 +238,342 @@ public class Qwen3MoEInferenceEngine {
     }
 
     private float[] forwardInternal(Qwen3MoEState state, int token, int position, boolean computeLogits) {
-        int dim = config.embeddingLength();
-        int leadingDenseCount = config.leadingDenseBlockCount();
-        long t0 = 0, t1;
+        embedToken(state, token);
+        for (int layer = 0; layer < config.blockCount(); layer++) {
+            forwardLayer(state, layer, position);
+        }
+        if (!computeLogits) return null;
+        return outputProjection(state);
+    }
 
+    /** Tokens per layer-outer prefill chunk; see {@link #forwardPrefill}. */
+    private static final int PREFILL_BATCH = Integer.getInteger("prefill.batch", 64);
+    private static final boolean PREFILL_BATCHED =
+        !"false".equals(System.getProperty("prefill.batched", "true"));
+
+    /**
+     * Prefill positions {@code fromPos..toPos-1}, driving the layers in the outer loop and the
+     * tokens in the inner loop, and return the logits for the last position.
+     *
+     * This computes exactly the same values in the same per-(layer, token) order as calling
+     * {@code forward} once per token — token *t* at layer *L* still reads its own residual stream
+     * from layer *L-1* and attends over KV[L][0..t], which are written by the tokens processed
+     * before it in the same layer. Only the loop nesting changes, so output is bit-identical.
+     *
+     * What changes is the working set. Token-outer order walks all 48 layers for one token before
+     * moving on, so keeping an expert resident across tokens requires the cache to hold
+     * layers x top-K slots at once; on a model streamed from SSD most of them are evicted before the
+     * next token needs them and get re-read. Layer-outer order collapses the working set to the
+     * union of experts selected by the tokens of one chunk at one layer, which the existing cache
+     * absorbs easily — so each expert is read roughly once per layer instead of once per
+     * (layer, token). This is the "batch-union" effect that makes batched prefill fast, obtained by
+     * reordering alone, with no batched matmul.
+     *
+     * Chunked at {@link #PREFILL_BATCH} tokens to bound both the residual-stream buffer and the
+     * per-layer expert union. Disable with {@code -Dprefill.batched=false}.
+     */
+    public float[] forwardPrefill(Qwen3MoEState state, int[] tokens, int fromPos, int toPos) {
+        int count = toPos - fromPos;
+        if (count <= 0) return null;
+        if (!PREFILL_BATCHED || count == 1) {
+            float[] logits = null;
+            for (int i = fromPos; i < toPos; i++) {
+                if (i < toPos - 1) forwardInternal(state, tokens[i], i, false);
+                else logits = forwardInternal(state, tokens[i], i, true);
+            }
+            return logits;
+        }
+        if (ExpertViews.active() && expertGpuCache == null) return prefillBatched(state, tokens, fromPos, toPos);
+
+        int dim = config.embeddingLength();
+        int blockCount = config.blockCount();
+        for (int base = fromPos; base < toPos; base += PREFILL_BATCH) {
+            int n = Math.min(PREFILL_BATCH, toPos - base);
+            float[][] xs = new float[n][];
+            for (int t = 0; t < n; t++) {
+                embedToken(state, tokens[base + t]);
+                xs[t] = state.x.clone();
+            }
+            for (int layer = 0; layer < blockCount; layer++) {
+                for (int t = 0; t < n; t++) {
+                    System.arraycopy(xs[t], 0, state.x, 0, dim);
+                    forwardLayer(state, layer, base + t);
+                    System.arraycopy(state.x, 0, xs[t], 0, dim);
+                }
+            }
+            // Carry the last token of the final chunk into the output projection.
+            System.arraycopy(xs[n - 1], 0, state.x, 0, dim);
+        }
+        return outputProjection(state);
+    }
+
+    // ==================== Batched prefill ====================
+
+    // Indices into Qwen3MoEState.prefillBuffers
+    private static final int B_X = 0, B_XN = 1, B_XB = 2, B_Q = 3, B_K = 4, B_V = 5, B_ATT = 6,
+        B_HB = 7, B_HB2 = 8, B_SHOUT = 9, B_EGATE = 10, B_EUP = 11, B_EOUT = 12;
+
+    /**
+     * Layer-outer prefill with multi-token matmuls, on the CPU path. Per chunk and layer: the
+     * attention projections (Q, K, V, O) and the shared-expert and dense FFNs run as batched
+     * matmuls over the chunk; {@link #attentionCore} runs token by token in position order; and
+     * each routed expert runs once per projection over all the chunk's tokens routed to it
+     * ({@code matmulRowsBatch} on its per-expert view), so an expert's weights are read and
+     * dequantised once per chunk instead of once per (token, slot). Routing, the per-token sum of
+     * the expert outputs in slot order and the residuals are unchanged; only the summation order
+     * inside the matmul kernels differs from the one-token path.
+     */
+    private float[] prefillBatched(Qwen3MoEState state, int[] tokens, int fromPos, int toPos) {
+        warmDecodeKernels();
+        int dim = config.embeddingLength();
+        int cap = ExpertViews.prefillChunk(expertCache, PREFILL_BATCH);
+        float[][][] b = prefillBuffers(state, cap);
+        for (int base = fromPos; base < toPos; base += cap) {
+            int n = Math.min(cap, toPos - base);
+            for (int t = 0; t < n; t++) {
+                embedToken(state, tokens[base + t]);
+                System.arraycopy(state.x, 0, b[B_X][t], 0, dim);
+            }
+            for (int layer = 0; layer < config.blockCount(); layer++) {
+                attentionBatch(state, b, layer, base, n);
+                ffnBatch(state, b, layer, n);
+            }
+            if (base + n == toPos) System.arraycopy(b[B_X][n - 1], 0, state.x, 0, dim);
+        }
+        return outputProjection(state);
+    }
+
+    private float[][][] prefillBuffers(Qwen3MoEState state, int cap) {
+        if (state.prefillBuffers == null || state.prefillBuffers[B_X].length < cap) {
+            int dim = config.embeddingLength();
+            int qDim = config.headCount() * config.headSize();
+            int kvDim = config.kvDim();
+            int efd = config.expertFfnLength();
+            int ffn = Math.max(config.intermediateSize(), config.expertSharedCount() * efd);
+            int slots = cap * Math.max(1, config.expertUsedCount());
+            state.prefillBuffers = new float[][][] {
+                new float[cap][dim], new float[cap][dim], new float[cap][dim],
+                new float[cap][qDim], new float[cap][kvDim], new float[cap][kvDim], new float[cap][qDim],
+                new float[cap][ffn], new float[cap][ffn], new float[cap][dim],
+                new float[slots][efd], new float[slots][efd], new float[slots][dim]
+            };
+            int experts = Math.max(1, config.expertCount());
+            state.prefillExperts = new int[slots];
+            state.prefillWeights = new float[slots];
+            state.prefillGroupStart = new int[experts + 1];
+            state.prefillGroupSlots = new int[slots];
+            state.prefillUsed = new int[experts];
+        }
+        return state.prefillBuffers;
+    }
+
+    /** See {@link FloatTensor#warmUpRows}: batched prefill skips the kernels decode will use. */
+    private void warmDecodeKernels() {
+        int dim = config.embeddingLength();
+        int qDim = config.headCount() * config.headSize();
+        int kvDim = config.kvDim();
+        int efd = config.expertFfnLength();
+        int ffn = config.intermediateSize();
+        int sharedFfn = config.expertSharedCount() * efd;
+        for (int layer = 0; layer < config.blockCount(); layer++) {
+            Qwen3MoELayerWeights lw = weights.layers()[layer];
+            FloatTensor.warmUpRows(lw.wq(), qDim, dim);
+            FloatTensor.warmUpRows(lw.wk(), kvDim, dim);
+            FloatTensor.warmUpRows(lw.wv(), kvDim, dim);
+            FloatTensor.warmUpRows(lw.wo(), dim, qDim);
+            if (layer < config.leadingDenseBlockCount()) {
+                FloatTensor.warmUpRows(lw.wGate(), ffn, dim);
+                FloatTensor.warmUpRows(lw.wUp(), ffn, dim);
+                FloatTensor.warmUpRows(lw.wDown(), dim, ffn);
+                continue;
+            }
+            if (lw.ffnGateExps() != null) {
+                // Decode computes routed experts with one dot per row (expertMatmul)
+                FloatTensor.warmUpDot(lw.ffnGateExps(), efd, dim);
+                FloatTensor.warmUpDot(lw.ffnUpExps(), efd, dim);
+                FloatTensor.warmUpDot(lw.ffnDownExps(), dim, efd);
+            }
+            if (lw.ffnGateShexp() != null) {
+                FloatTensor.warmUpRows(lw.ffnGateShexp(), sharedFfn, dim);
+                FloatTensor.warmUpRows(lw.ffnUpShexp(), sharedFfn, dim);
+                FloatTensor.warmUpRows(lw.ffnDownShexp(), dim, sharedFfn);
+            }
+        }
+        FloatTensor.warmUpRows(weights.output(), config.vocabSize(), dim);
+    }
+
+    /** Multi-token {@link #gqaAttention} plus its residual, for the chunk's tokens at one layer. */
+    private void attentionBatch(Qwen3MoEState state, float[][][] b, int layer, int basePos, int n) {
+        Qwen3MoELayerWeights lw = weights.layers()[layer];
+        int dim = config.embeddingLength();
+        int qDim = config.headCount() * config.headSize();
+        int kvDim = config.kvDim();
+        float[][] x = b[B_X], xn = b[B_XN], xb = b[B_XB];
+        for (int t = 0; t < n; t++) {
+            RMSNorm.apply(xn[t], x[t], cachedAttnNorm[layer], dim, config.normEps());
+            Arrays.fill(b[B_Q][t], 0, qDim, 0f);
+            Arrays.fill(b[B_K][t], 0, kvDim, 0f);
+            Arrays.fill(b[B_V][t], 0, kvDim, 0f);
+        }
+        FloatTensor.fusedQKVBatchParallel(lw.wq(), lw.wk(), lw.wv(), xn, b[B_Q], b[B_K], b[B_V],
+            n, qDim, kvDim, dim);
+        for (int t = 0; t < n; t++) {
+            System.arraycopy(b[B_Q][t], 0, state.q, 0, qDim);
+            System.arraycopy(b[B_K][t], 0, state.k, 0, kvDim);
+            System.arraycopy(b[B_V][t], 0, state.v, 0, kvDim);
+            attentionCore(state, lw, layer, basePos + t);
+            System.arraycopy(state.xb2, 0, b[B_ATT][t], 0, qDim);
+            Arrays.fill(xb[t], 0f);
+        }
+        FloatTensor.matmulBatchParallel(lw.wo(), b[B_ATT], xb, n, dim, qDim);
+        for (int t = 0; t < n; t++) {
+            if (lw.woBias() != null) addBias(xb[t], lw.woBias(), dim);
+            VectorOpsFactory.get().accumulate(x[t], xb[t], dim);
+        }
+    }
+
+    /** Multi-token FFN half of {@link #forwardLayer}: norm, dense or MoE FFN, residual. */
+    private void ffnBatch(Qwen3MoEState state, float[][][] b, int layer, int n) {
+        Qwen3MoELayerWeights lw = weights.layers()[layer];
+        int dim = config.embeddingLength();
+        float[][] x = b[B_X], xn = b[B_XN], xb = b[B_XB];
+        for (int t = 0; t < n; t++) {
+            RMSNorm.apply(xn[t], x[t], cachedFfnNorm[layer], dim, config.normEps());
+        }
+        if (layer < config.leadingDenseBlockCount()) {
+            int ffn = config.intermediateSize();
+            swigluBatch(lw.wGate(), lw.wUp(), lw.wDown(), b, n, ffn, b[B_XB]);
+        } else {
+            moeBatch(state, b, lw, layer, n);
+        }
+        for (int t = 0; t < n; t++) {
+            VectorOpsFactory.get().accumulate(x[t], xb[t], dim);
+        }
+    }
+
+    /** {@code out[t] = down(silu(gate(xn[t])) * up(xn[t]))} over the chunk, as {@link #denseFFN}. */
+    private void swigluBatch(FloatTensor gate, FloatTensor up, FloatTensor down, float[][][] b, int n,
+                             int ffn, float[][] out) {
+        int dim = config.embeddingLength();
+        float[][] hb = b[B_HB], hb2 = b[B_HB2];
+        for (int t = 0; t < n; t++) {
+            Arrays.fill(hb[t], 0, ffn, 0f);
+            Arrays.fill(hb2[t], 0, ffn, 0f);
+        }
+        FloatTensor.fusedGateUpBatchParallel(gate, up, b[B_XN], hb, hb2, n, ffn, dim);
+        for (int t = 0; t < n; t++) {
+            VectorOpsFactory.get().silu(hb[t], ffn);
+            VectorOpsFactory.get().elementwiseMul(hb[t], hb2[t], hb[t], ffn);
+            Arrays.fill(out[t], 0, dim, 0f);
+        }
+        FloatTensor.matmulBatchParallel(down, hb, out, n, dim, ffn);
+    }
+
+    /**
+     * Multi-token {@link #moeFFN}: route every token, group the (token, slot) pairs by expert, run
+     * each expert once over its tokens, then sum each token's expert outputs in slot order and add
+     * the shared expert — the same per-token arithmetic as the one-token path.
+     */
+    private void moeBatch(Qwen3MoEState state, float[][][] b, Qwen3MoELayerWeights lw, int layer, int n) {
+        int dim = config.embeddingLength();
+        int expertCount = config.expertCount();
+        int k = MoERouting.effectiveTopK(config.expertUsedCount());
+        int efd = config.expertFfnLength();
+        long elementsPerSlice = (long) efd * dim;
+        float[][] xn = b[B_XN], xb = b[B_XB];
+        int[] sel = state.prefillExperts;
+        float[] selW = state.prefillWeights;
+
+        // 1. Route each token (same router code and state buffers as the one-token path)
+        currentLayer = layer;
+        for (int t = 0; t < n; t++) {
+            System.arraycopy(xn[t], 0, state.xbSaved, 0, dim);
+            routeExperts(state, lw);
+            System.arraycopy(state.selectedExperts, 0, sel, t * k, k);
+            System.arraycopy(state.selectedWeights, 0, selW, t * k, k);
+        }
+
+        // 2. Group the (token, slot) pairs by expert
+        int slots = n * k;
+        int[] start = state.prefillGroupStart;
+        int[] grouped = state.prefillGroupSlots;
+        int[] used = state.prefillUsed;
+        int nUsed = ExpertViews.groupByExpert(sel, slots, expertCount, start, grouped, used);
+        for (int s = 0; s < slots; s++) {
+            if (sel[s] < 0) Arrays.fill(b[B_EOUT][s], 0, dim, 0f);
+        }
+
+        // 3. Compute the experts (grouped for the SSD cache, the next group read while one computes)
+        expertViews.forEachExpert(expertCache, layer, used, nUsed, lw.ffnGateExps(), lw.ffnUpExps(),
+            lw.ffnDownExps(), elementsPerSlice,
+            (e, gate, up, down) -> expertBatch(b, lw, e, gate, up, down, start, grouped, k, efd, dim));
+
+        // 4. Per token: weighted sum of its expert outputs in slot order, then the shared expert
+        for (int t = 0; t < n; t++) {
+            Arrays.fill(xb[t], 0, dim, 0f);
+            for (int j = 0; j < k; j++) {
+                VectorOpsFactory.get().saxpy(selW[t * k + j], b[B_EOUT][t * k + j], 0, xb[t], 0, dim);
+            }
+        }
+        if (lw.ffnGateShexp() != null) {
+            int sharedFfn = config.expertSharedCount() * efd;
+            swigluBatch(lw.ffnGateShexp(), lw.ffnUpShexp(), lw.ffnDownShexp(), b, n, sharedFfn, b[B_SHOUT]);
+            for (int t = 0; t < n; t++) {
+                VectorOpsFactory.get().accumulate(xb[t], b[B_SHOUT][t], dim);
+            }
+        }
+    }
+
+    /** One routed expert over all its (token, slot) pairs of the chunk: gate, up, activation, down. */
+    private void expertBatch(float[][][] b, Qwen3MoELayerWeights lw, int e, FloatTensor wGate, FloatTensor wUp,
+                             FloatTensor wDown, int[] start, int[] grouped, int k, int efd, int dim) {
+        int from = start[e], m = start[e + 1] - from;
+        float[][] in = new float[m][], gate = new float[m][], up = new float[m][], out = new float[m][];
+        for (int i = 0; i < m; i++) {
+            int s = grouped[from + i];
+            in[i] = b[B_XN][s / k];
+            gate[i] = b[B_EGATE][s];
+            up[i] = b[B_EUP][s];
+            out[i] = b[B_EOUT][s];
+            Arrays.fill(gate[i], 0, efd, 0f);
+            Arrays.fill(up[i], 0, efd, 0f);
+            Arrays.fill(out[i], 0, dim, 0f);
+        }
+        wGate.matmulRowsBatch(in, gate, m, 0, efd, dim);
+        wUp.matmulRowsBatch(in, up, m, 0, efd, dim);
+        for (int i = 0; i < m; i++) {
+            if (lw.ffnGateExpsBias() != null) addExpertBias(gate[i], lw.ffnGateExpsBias(), e, efd);
+            if (lw.ffnUpExpsBias() != null) addExpertBias(up[i], lw.ffnUpExpsBias(), e, efd);
+            if (isGptOss) {
+                swigluOai(gate[i], up[i], efd);
+            } else {
+                VectorOpsFactory.get().silu(gate[i], efd);
+                VectorOpsFactory.get().elementwiseMul(gate[i], up[i], gate[i], efd);
+            }
+        }
+        wDown.matmulRowsBatch(gate, out, m, 0, dim, efd);
+        if (lw.ffnDownExpsBias() != null) {
+            for (int i = 0; i < m; i++) addExpertBias(out[i], lw.ffnDownExpsBias(), e, dim);
+        }
+    }
+
+    /** Load a token's embedding into the residual stream. */
+    private void embedToken(Qwen3MoEState state, int token) {
+        int dim = config.embeddingLength();
         for (int i = 0; i < dim; i++) {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
+    }
 
-        for (int layer = 0; layer < config.blockCount(); layer++) {
+    /**
+     * One transformer block, reading and writing {@code state.x}. Split out of {@code forwardInternal}
+     * so prefill can drive the layers in the outer loop — see {@link #forwardPrefill}.
+     */
+    private void forwardLayer(Qwen3MoEState state, int layer, int position) {
+        int dim = config.embeddingLength();
+        int leadingDenseCount = config.leadingDenseBlockCount();
+        long t0 = 0, t1;
+        {
             Qwen3MoELayerWeights layerWeights = weights.layers()[layer];
 
             if (cpuProfile) t0 = System.nanoTime();
@@ -260,9 +602,12 @@ public class Qwen3MoEInferenceEngine {
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
             if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; }
         }
+    }
 
-        if (!computeLogits) return null;
-
+    /** Final norm + logit projection over the current residual stream. */
+    private float[] outputProjection(Qwen3MoEState state) {
+        int dim = config.embeddingLength();
+        long t0 = 0;
         if (cpuProfile) t0 = System.nanoTime();
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
         int vocabSize = config.vocabSize();
@@ -293,12 +638,8 @@ public class Qwen3MoEInferenceEngine {
      */
     private void gqaAttention(Qwen3MoEState state, Qwen3MoELayerWeights weights, int layer, int position) {
         int dim = config.embeddingLength();
-        int headCount = config.headCount();
-        int headCountKV = config.headCountKV();
-        int headSize = config.headSize();
         int kvDim = config.kvDim();
-        int qDim = headCount * headSize; // may differ from dim (e.g., Qwen3-Coder-30B)
-        int kvMul = headCount / headCountKV;
+        int qDim = config.headCount() * config.headSize(); // may differ from dim (e.g., Qwen3-Coder-30B)
 
         // Project Q, K, V
         Arrays.fill(state.q, 0, qDim, 0f);
@@ -308,6 +649,28 @@ public class Qwen3MoEInferenceEngine {
         weights.wq().matmulParallel(state.xb, state.q, qDim, dim);
         weights.wk().matmulParallel(state.xb, state.k, kvDim, dim);
         weights.wv().matmulParallel(state.xb, state.v, kvDim, dim);
+
+        attentionCore(state, weights, layer, position);
+
+        // Output projection: qDim -> dim
+        Arrays.fill(state.xb, 0);
+        weights.wo().matmulParallel(state.xb2, state.xb, dim, qDim);
+        if (weights.woBias() != null) addBias(state.xb, weights.woBias(), dim);
+    }
+
+    /**
+     * The order-dependent part of attention for one token: Q/K/V biases, QK-norm, RoPE, KV store
+     * and attention over the cache. Reads the raw projections from {@code state.q/k/v} and writes
+     * the attention output, before Wo, to {@code state.xb2}. Shared by the one-token path and
+     * batched prefill, which feeds it one token at a time in position order.
+     */
+    private void attentionCore(Qwen3MoEState state, Qwen3MoELayerWeights weights, int layer, int position) {
+        int headCount = config.headCount();
+        int headCountKV = config.headCountKV();
+        int headSize = config.headSize();
+        int kvDim = config.kvDim();
+        int qDim = headCount * headSize;
+        int kvMul = headCount / headCountKV;
 
         // Apply attention biases (GPT-OSS)
         if (weights.wqBias() != null) addBias(state.q, weights.wqBias(), qDim);
@@ -355,7 +718,7 @@ public class Qwen3MoEInferenceEngine {
         final KVCache kv = state.kvCache;
         final int layerFinal = layer;
 
-        IntStream.range(0, headCount).parallel().forEach(new java.util.function.IntConsumer() {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, new java.util.function.IntConsumer() {
             @Override
             public void accept(int h) {
                 int kvHead = h / kvMul;
@@ -380,11 +743,6 @@ public class Qwen3MoEInferenceEngine {
                 }
             }
         });
-
-        // Output projection: qDim -> dim
-        Arrays.fill(state.xb, 0);
-        weights.wo().matmulParallel(state.xb2, state.xb, dim, qDim);
-        if (weights.woBias() != null) addBias(state.xb, weights.woBias(), dim);
     }
 
     /**
@@ -412,62 +770,25 @@ public class Qwen3MoEInferenceEngine {
      */
     private void moeFFN(Qwen3MoEState state, Qwen3MoELayerWeights weights) {
         int dim = config.embeddingLength();
-        int expertCount = config.expertCount();
-        int expertUsedCount = config.expertUsedCount();
+        int expertUsedCount = MoERouting.effectiveTopK(config.expertUsedCount());
         int expertFfnDim = config.expertFfnLength();
         int sharedFfnDim = config.expertSharedCount() * expertFfnDim;
 
-        // 1. Router: compute expert logits and select top-K
-        Arrays.fill(state.routerLogits, 0, expertCount, 0f);
-        weights.ffnGateInp().matmul(state.xbSaved, state.routerLogits, expertCount, dim);
-        if (weights.ffnGateInpBias() != null) addBias(state.routerLogits, weights.ffnGateInpBias(), expertCount);
+        // 1. Router: expert logits and top-K selection
+        routeExperts(state, weights);
 
-        if (isGptOss) {
-            // SOFTMAX_WEIGHT routing: select top-K by raw logits, then softmax over selected
-            selectTopK(state.routerLogits, expertCount, expertUsedCount,
-                state.selectedExperts, state.selectedWeights);
-
-            // Softmax only over the selected experts' raw logits
-            float maxW = Float.NEGATIVE_INFINITY;
-            for (int k = 0; k < expertUsedCount; k++) maxW = Math.max(maxW, state.selectedWeights[k]);
-            float sum = 0f;
-            for (int k = 0; k < expertUsedCount; k++) {
-                state.selectedWeights[k] = (float) Math.exp(state.selectedWeights[k] - maxW);
-                sum += state.selectedWeights[k];
-            }
-            if (sum > 0f) {
-                for (int k = 0; k < expertUsedCount; k++) {
-                    state.selectedWeights[k] /= sum;
-                }
-            }
-        } else {
-            // Standard Qwen3 MoE: softmax over all experts first, then top-K + renormalize
-            VectorOpsFactory.get().softmax(state.routerLogits, 0, expertCount);
-
-            selectTopK(state.routerLogits, expertCount, expertUsedCount,
-                state.selectedExperts, state.selectedWeights);
-
-            float weightSum = 0f;
-            for (int k = 0; k < expertUsedCount; k++) {
-                weightSum += state.selectedWeights[k];
-            }
-            // E18: clamp to smallest F16 normal (6.103515625e-5) to guard against NaN when
-            // the routing distribution has collapsed to near-zero — matches llama.cpp
-            // ggml_clamp in build_moe_ffn (llama-graph.cpp:1325).
-            if (weightSum > 6.103515625e-5f) {
-                for (int k = 0; k < expertUsedCount; k++) {
-                    state.selectedWeights[k] /= weightSum;
-                }
-            }
-        }
-
-        // Phase 2.2a: routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true). Counts
-        // how often each expert is selected per layer, to measure whether routing is concentrated
-        // enough to justify a hot-expert GPU cache. Additive only — no effect on the forward pass.
-        if (routingStats) {
-            long[] hits = expertHits[currentLayer];
-            for (int k = 0; k < expertUsedCount; k++) hits[state.selectedExperts[k]]++;
-            routingDecisions += expertUsedCount;
+        // SSD streaming: the top-K experts for this layer are now known. Prefer L1 — read the whole
+        // slices into the RAM cache with explicit positional reads — and fall back to the L0
+        // read-ahead hint when there is no cache. Both are no-ops when the model fits RAM. Skipped
+        // entirely when the GPU expert cache owns this path, which reads from the mapping itself.
+        boolean gpuOwnsExperts = expertGpuCache != null && computeExpertsMethod != null;
+        cacheLayerReady = !gpuOwnsExperts && expertCache != null
+            && expertCache.prepare(currentLayer, state.selectedExperts, expertUsedCount,
+                weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
+                (long) expertFfnDim * dim);
+        if (!cacheLayerReady && !gpuOwnsExperts) {
+            ExpertPrefetch.willNeed(weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
+                state.selectedExperts, expertUsedCount, (long) expertFfnDim * dim);
         }
 
         // 2. Compute routed expert outputs
@@ -548,12 +869,94 @@ public class Qwen3MoEInferenceEngine {
     }
 
     /**
+     * Router for one token: logits from {@code state.xbSaved}, top-K selection and weight
+     * normalisation into {@code state.selectedExperts} / {@code state.selectedWeights}.
+     */
+    private void routeExperts(Qwen3MoEState state, Qwen3MoELayerWeights weights) {
+        int dim = config.embeddingLength();
+        int expertCount = config.expertCount();
+        int expertUsedCount = MoERouting.effectiveTopK(config.expertUsedCount());
+
+        Arrays.fill(state.routerLogits, 0, expertCount, 0f);
+        weights.ffnGateInp().matmul(state.xbSaved, state.routerLogits, expertCount, dim);
+        if (weights.ffnGateInpBias() != null) addBias(state.routerLogits, weights.ffnGateInpBias(), expertCount);
+
+        if (sigmoidRouting) {
+            // llama.cpp build_moe_ffn with SIGMOID gating (GLM4-MoE): probs = sigmoid(logits); top-K
+            // on probs + exp_probs_b; the selected UNBIASED probs, sum-normalised when
+            // expert_weights_norm (clamped at the F16 epsilon), times expert_weights_scale.
+            float[] probs = state.routerLogits;
+            for (int e = 0; e < expertCount; e++) probs[e] = 1.0f / (1.0f + (float) Math.exp(-probs[e]));
+            float[] sel = state.selectionScores;
+            FloatTensor bias = weights.expProbsBias();
+            for (int e = 0; e < expertCount; e++) sel[e] = probs[e] + (bias != null ? bias.getFloat(e) : 0f);
+            selectTopK(sel, expertCount, expertUsedCount, state.selectedExperts, state.selectedWeights);
+            float sum = 0f;
+            for (int k = 0; k < expertUsedCount; k++) {
+                int e = state.selectedExperts[k];
+                state.selectedWeights[k] = e >= 0 ? probs[e] : 0f;
+                sum += state.selectedWeights[k];
+            }
+            float mul = config.expertWeightsNorm() ? 1f / Math.max(sum, 6.103515625e-5f) : 1f;
+            float scale = config.expertWeightsScale();
+            if (scale != 0f) mul *= scale;
+            for (int k = 0; k < expertUsedCount; k++) state.selectedWeights[k] *= mul;
+        } else if (isGptOss) {
+            // SOFTMAX_WEIGHT routing: select top-K by raw logits, then softmax over selected
+            selectTopK(state.routerLogits, expertCount, expertUsedCount,
+                state.selectedExperts, state.selectedWeights);
+
+            // Softmax only over the selected experts' raw logits
+            float maxW = Float.NEGATIVE_INFINITY;
+            for (int k = 0; k < expertUsedCount; k++) maxW = Math.max(maxW, state.selectedWeights[k]);
+            float sum = 0f;
+            for (int k = 0; k < expertUsedCount; k++) {
+                state.selectedWeights[k] = (float) Math.exp(state.selectedWeights[k] - maxW);
+                sum += state.selectedWeights[k];
+            }
+            if (sum > 0f) {
+                for (int k = 0; k < expertUsedCount; k++) {
+                    state.selectedWeights[k] /= sum;
+                }
+            }
+        } else {
+            // Standard Qwen3 MoE: softmax over all experts first, then top-K + renormalize
+            VectorOpsFactory.get().softmax(state.routerLogits, 0, expertCount);
+
+            selectTopK(state.routerLogits, expertCount, expertUsedCount,
+                state.selectedExperts, state.selectedWeights);
+
+            float weightSum = 0f;
+            for (int k = 0; k < expertUsedCount; k++) {
+                weightSum += state.selectedWeights[k];
+            }
+            // E18: clamp to smallest F16 normal (6.103515625e-5) to guard against NaN when
+            // the routing distribution has collapsed to near-zero — matches llama.cpp
+            // ggml_clamp in build_moe_ffn (llama-graph.cpp:1325).
+            if (weightSum > 6.103515625e-5f) {
+                for (int k = 0; k < expertUsedCount; k++) {
+                    state.selectedWeights[k] /= weightSum;
+                }
+            }
+        }
+
+        // Phase 2.2a: routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true). Counts
+        // how often each expert is selected per layer, to measure whether routing is concentrated
+        // enough to justify a hot-expert GPU cache. Additive only — no effect on the forward pass.
+        if (routingStats) {
+            long[] hits = expertHits[currentLayer];
+            for (int k = 0; k < expertUsedCount; k++) hits[state.selectedExperts[k]]++;
+            routingDecisions += expertUsedCount;
+        }
+    }
+
+    /**
      * CPU parallel expert computation (original path).
      */
     private void cpuExpertCompute(Qwen3MoEState state, Qwen3MoELayerWeights weights,
                                    int expertUsedCount, int expertFfnDim, int dim,
                                    boolean useSwigluOai) {
-        IntStream.range(0, expertUsedCount).parallel().forEach(new java.util.function.IntConsumer() {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(expertUsedCount, new java.util.function.IntConsumer() {
             @Override
             public void accept(int k) {
                 int e = state.selectedExperts[k];
@@ -570,8 +973,10 @@ public class Qwen3MoEInferenceEngine {
                 Arrays.fill(gate, 0, expertFfnDim, 0f);
                 Arrays.fill(up, 0, expertFfnDim, 0f);
 
-                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim);
-                expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim);
+                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim,
+                    it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_GATE);
+                expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim,
+                    it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_UP);
 
                 if (weights.ffnGateExpsBias() != null) addExpertBias(gate, weights.ffnGateExpsBias(), e, expertFfnDim);
                 if (weights.ffnUpExpsBias() != null) addExpertBias(up, weights.ffnUpExpsBias(), e, expertFfnDim);
@@ -584,7 +989,8 @@ public class Qwen3MoEInferenceEngine {
                 }
 
                 Arrays.fill(out, 0, dim, 0f);
-                expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim);
+                expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim,
+                    it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_DOWN);
                 if (weights.ffnDownExpsBias() != null) addExpertBias(out, weights.ffnDownExpsBias(), e, dim);
             }
         });
@@ -593,8 +999,19 @@ public class Qwen3MoEInferenceEngine {
     /**
      * Matrix-vector multiply for a single expert slice from a 3D tensor.
      */
-    private static void expertMatmul(FloatTensor weights3D, float[] input, float[] output,
-                                      int expert, int inDim, int outDim) {
+    private void expertMatmul(FloatTensor weights3D, float[] input, float[] output,
+                              int expert, int inDim, int outDim, int projection) {
+        // When the slice is cached, it is a standalone tensor holding just this expert, so the rows
+        // start at 0 instead of the expert's base offset inside the 3D tensor.
+        if (cacheLayerReady) {
+            FloatTensor cached = expertCache.tensorFor(currentLayer, expert, projection);
+            if (cached != null) {
+                for (int row = 0; row < outDim; row++) {
+                    output[row] += cached.dot((long) row * inDim, input, 0, inDim);
+                }
+                return;
+            }
+        }
         long expertOffset = (long) expert * outDim * inDim;
         for (int row = 0; row < outDim; row++) {
             output[row] += weights3D.dot(expertOffset + (long) row * inDim, input, 0, inDim);

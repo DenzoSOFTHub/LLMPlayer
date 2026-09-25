@@ -88,7 +88,7 @@ public class Gemma4InferenceEngine {
     // GPU-resident forward pass (Gemma 4 PLE-only; null on CPU / Gemma 3n AltUp / unsupported)
     private AutoCloseable gpuForwardPass;
     private int gpuLayerCount;
-    private Method gpuUploadX, gpuUploadPle, gpuForwardLayer, gpuForwardFinalLogits;
+    private Method gpuUploadX, gpuUploadPle, gpuForwardLayer, gpuForwardFinalLogits, gpuDownloadX;
 
     public Gemma4InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen,
                                   FloatTensor pleTokenEmbd, FloatTensor pleModelProj,
@@ -198,6 +198,15 @@ public class Gemma4InferenceEngine {
         return layer % 6 != 5; // fallback: Gemma 3 pattern
     }
 
+    private int layerQDim(int layer) {
+        return headCount * (isSwaLayer(layer) ? headSizeSwa : headSizeFull);
+    }
+
+    /** Per-layer K/V width: see {@link #attentionCore} for why the KV head count is per layer. */
+    private int layerKvDim(int layer) {
+        return config.layerKvHeads(layer) * (isSwaLayer(layer) ? headSizeSwa : headSizeFull);
+    }
+
     /** Try to enable the GPU-resident forward pass (Gemma 4 PLE-only; not Gemma 3n AltUp). */
     public void tryInitGpuForwardPass(Object bufferManager) {
         if (g3n != null && g3n.isFullyLoaded()) return; // Gemma 3n AltUp stays on CPU
@@ -214,6 +223,7 @@ public class Gemma4InferenceEngine {
             gpuUploadX = cls.getMethod("uploadXAndUpdateParams", float[].class, int.class);
             gpuUploadPle = cls.getMethod("uploadPleCombined", float[].class);
             gpuForwardLayer = cls.getMethod("forwardLayer", int.class, int.class);
+            gpuDownloadX = cls.getMethod("downloadX", float[].class);
             gpuForwardFinalLogits = cls.getMethod("forwardFinalLogits", float[].class);
             gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
             gpuForwardPass = (AutoCloseable) fwd;
@@ -227,6 +237,22 @@ public class Gemma4InferenceEngine {
         gpuUploadX.invoke(gpuForwardPass, state.x, position);
         if (doPle) gpuUploadPle.invoke(gpuForwardPass, state.pleCombined);
         for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
+
+        // Partial offload (e.g. the 12B at 7 GB on a 6 GB card): the first gpuLayerCount layers ran
+        // on the GPU; finish the remaining layers on the CPU engine. The GPU layers keep their KV
+        // in GPU buffers and the CPU layers in the CPU KVCache — disjoint sets, each self-consistent
+        // across tokens (Gemma 4 dense uses no shared KV).
+        if (gpuLayerCount < blockCount) {
+            gpuDownloadX.invoke(gpuForwardPass, state.x);   // activation after the GPU layers
+            for (int layer = gpuLayerCount; layer < blockCount; layer++) {
+                forwardLayer(state, layer, position, doPle);
+            }
+            if (!computeLogits) return null;
+            // The final output projection weight is GPU-resident; re-upload the CPU-finished
+            // activation so forwardFinalLogits can project it on the GPU.
+            gpuUploadX.invoke(gpuForwardPass, state.x, position);
+        }
+
         if (!computeLogits) return null;
         gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
         if (finalLogitSoftCap > 0f) {
@@ -296,7 +322,11 @@ public class Gemma4InferenceEngine {
         }
 
         if (!computeLogits) return null;
+        return finishLogits(state);
+    }
 
+    /** Final norm, output projection and logit soft-capping of {@code state.x}. */
+    private float[] finishLogits(Gemma4State state) {
         // 4. Final RMSNorm
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
 
@@ -314,41 +344,259 @@ public class Gemma4InferenceEngine {
         return state.logits;
     }
 
+    // ==================== Batched prefill ====================
+
+    private static final int PREFILL_BATCH = Integer.getInteger("prefill.batch", 64);
+    private static final boolean PREFILL_BATCHED =
+        !"false".equalsIgnoreCase(System.getProperty("prefill.batched", "true"));
+
+    // Indices into Gemma4State.prefillBuffers
+    private static final int B_X = 0, B_XB = 1, B_ATTN = 2, B_Q = 3, B_K = 4, B_V = 5, B_OUT = 6,
+        B_HB = 7, B_HB2 = 8, B_PLE = 9, B_PLE_GATE = 10;
+
+    /**
+     * Prefill {@code tokens[fromPos..toPos)} at positions {@code fromPos..toPos-1} and return the
+     * logits of the last one.
+     *
+     * <p>On the CPU path without AltUp (Gemma 4 E2B/E4B and dense) the prompt goes through each
+     * layer in chunks of {@link #PREFILL_BATCH} tokens, and every projection — the PLE model
+     * projection, Q, K, V, O, FFN gate, up and down, the PLE gate and PLE projection — runs as one
+     * multi-token matmul ({@code FloatTensor.matmulRowsBatch}). The order-dependent part
+     * ({@link #attentionCore}: norms, RoPE, KV store, attention) still runs token by token in
+     * position order with the same code as the one-token path; only the summation order inside the
+     * matmul kernels differs. Gemma 3n (AltUp) and the GPU pass keep the one-token loop. Disable
+     * with {@code -Dprefill.batched=false}.
+     */
+    public float[] forwardPrefill(Gemma4State st, int[] tokens, int fromPos, int toPos) {
+        this.state = st;
+        int count = toPos - fromPos;
+        if (count <= 0) return null;
+        boolean useAltup = g3n != null && g3n.isFullyLoaded() && st.altupStreams != null;
+        if (count == 1 || !PREFILL_BATCHED || useAltup || gpuForwardPass != null
+                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled()) {
+            float[] logits = null;
+            for (int i = fromPos; i < toPos; i++) {
+                logits = forward(tokens[i], i, i == toPos - 1);
+            }
+            return logits;
+        }
+        warmDecodeKernels();
+        boolean hasPle = pleTokenEmbd != null && pleDim > 0;
+        boolean doPle = hasPle && !Boolean.getBoolean("gemma4.nople");
+        int totalPleDim = hasPle ? pleDim * blockCount : 0;
+        int cap = Math.max(1, PREFILL_BATCH);
+        if (st.prefillBuffers == null) {
+            int maxFfn = 0;
+            for (int l = 0; l < blockCount; l++) maxFfn = Math.max(maxFfn, config.layerFfnLength(l));
+            st.prefillBuffers = new float[][][] {
+                new float[cap][dim], new float[cap][dim], new float[cap][dim],
+                new float[cap][maxQDim], new float[cap][maxKvDim], new float[cap][maxKvDim],
+                new float[cap][maxQDim], new float[cap][maxFfn], new float[cap][maxFfn],
+                new float[cap][totalPleDim], new float[cap][pleDim]
+            };
+        }
+        float[][][] b = st.prefillBuffers;
+        for (int base = fromPos; base < toPos; base += cap) {
+            int n = Math.min(cap, toPos - base);
+            for (int t = 0; t < n; t++) {
+                int token = tokens[base + t];
+                float[] x = b[B_X][t];
+                for (int i = 0; i < dim; i++) {
+                    x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
+                }
+                if (embeddingScale > 0f) {
+                    for (int i = 0; i < dim; i++) x[i] *= embeddingScale;
+                }
+            }
+            if (hasPle) {
+                // B_PLE first holds each token's raw projection, then its combined PLE input
+                for (int t = 0; t < n; t++) Arrays.fill(b[B_PLE][t], 0f);
+                FloatTensor.matmulBatchParallel(pleModelProj, b[B_X], b[B_PLE], n, totalPleDim, dim);
+                for (int t = 0; t < n; t++) {
+                    combinePle(tokens[base + t], b[B_PLE][t], st.pleEmb, b[B_PLE][t]);
+                }
+            }
+            for (int layer = 0; layer < blockCount; layer++) {
+                forwardLayerBatch(st, b, layer, base, n, doPle);
+            }
+            if (base + n == toPos) System.arraycopy(b[B_X][n - 1], 0, st.x, 0, dim);
+        }
+        return finishLogits(st);
+    }
+
+    /** See {@link FloatTensor#warmUpRows}: batched prefill skips the kernels decode will use. */
+    private void warmDecodeKernels() {
+        for (int layer = 0; layer < blockCount; layer++) {
+            TransformerLayerWeights lw = weights.layers()[layer];
+            int qDim = layerQDim(layer), kvDim = layerKvDim(layer), ffn = config.layerFfnLength(layer);
+            FloatTensor.warmUpRows(lw.wq(), qDim, dim);
+            if (layer < blockCount - sharedKvLayers) {
+                FloatTensor.warmUpRows(lw.wk(), kvDim, dim);
+                FloatTensor.warmUpRows(lw.wv(), kvDim, dim);
+            }
+            FloatTensor.warmUpRows(lw.wo(), dim, qDim);
+            FloatTensor.warmUpRows(lw.wGate(), ffn, dim);
+            FloatTensor.warmUpRows(lw.wUp(), ffn, dim);
+            FloatTensor.warmUpRows(lw.wDown(), dim, ffn);
+            if (pleInpGate[layer] != null) FloatTensor.warmUpRows(pleInpGate[layer], pleDim, dim);
+            if (pleProj[layer] != null) FloatTensor.warmUpRows(pleProj[layer], dim, pleDim);
+        }
+        if (pleModelProj != null) FloatTensor.warmUpRows(pleModelProj, pleDim * blockCount, dim);
+        FloatTensor.warmUpRows(weights.output(), vocabSize, dim);
+    }
+
+    /** Multi-token {@link #forwardLayer}: the same steps, with every projection batched. */
+    private void forwardLayerBatch(Gemma4State st, float[][][] b, int layer, int basePos, int n, boolean doPle) {
+        TransformerLayerWeights lw = weights.layers()[layer];
+        boolean hasOwnKv = layer < blockCount - sharedKvLayers;
+        int qDim = layerQDim(layer);
+        int kvDim = layerKvDim(layer);
+        int layerFfn = config.layerFfnLength(layer);
+        float[][] x = b[B_X], xb = b[B_XB], attnOut = b[B_ATTN];
+
+        // Pre-attention norm, then Q/K/V projections
+        for (int t = 0; t < n; t++) {
+            RMSNorm.apply(xb[t], x[t], attnNormCache[layer], dim, normEps);
+            Arrays.fill(b[B_Q][t], 0, qDim, 0f);
+            if (hasOwnKv) {
+                Arrays.fill(b[B_K][t], 0, kvDim, 0f);
+                Arrays.fill(b[B_V][t], 0, kvDim, 0f);
+            }
+        }
+        if (hasOwnKv && lw.wv() != null) {
+            FloatTensor.fusedQKVBatchParallel(lw.wq(), lw.wk(), lw.wv(), xb, b[B_Q], b[B_K], b[B_V],
+                n, qDim, kvDim, dim);
+        } else {
+            FloatTensor.matmulBatchParallel(lw.wq(), xb, b[B_Q], n, qDim, dim);
+            if (hasOwnKv) FloatTensor.matmulBatchParallel(lw.wk(), xb, b[B_K], n, kvDim, dim);
+        }
+
+        // Attention, token by token in position order
+        for (int t = 0; t < n; t++) {
+            System.arraycopy(b[B_Q][t], 0, st.qLarge, 0, qDim);
+            if (hasOwnKv) {
+                System.arraycopy(b[B_K][t], 0, st.kLarge, 0, kvDim);
+                if (lw.wv() != null) System.arraycopy(b[B_V][t], 0, st.vLarge, 0, kvDim);
+            }
+            attentionCore(st, layer, basePos + t);
+            System.arraycopy(st.xb2Large, 0, b[B_OUT][t], 0, qDim);
+            Arrays.fill(xb[t], 0f);
+        }
+        FloatTensor.matmulBatchParallel(lw.wo(), b[B_OUT], xb, n, dim, qDim);
+
+        // Post-attention norm, attention residual, pre-FFN norm
+        for (int t = 0; t < n; t++) {
+            if (postAttnNormCache[layer] != null) {
+                RMSNorm.apply(xb[t], xb[t], postAttnNormCache[layer], dim, normEps);
+            }
+            for (int i = 0; i < dim; i++) attnOut[t][i] = xb[t][i] + x[t][i];
+            RMSNorm.apply(xb[t], attnOut[t], ffnNormCache[layer], dim, normEps);
+            Arrays.fill(b[B_HB][t], 0, layerFfn, 0f);
+            Arrays.fill(b[B_HB2][t], 0, layerFfn, 0f);
+        }
+
+        // GeGLU FFN
+        if (lw.wGate() != null) {
+            FloatTensor.fusedGateUpBatchParallel(lw.wGate(), lw.wUp(), xb, b[B_HB], b[B_HB2], n, layerFfn, dim);
+        } else {
+            FloatTensor.matmulBatchParallel(lw.wUp(), xb, b[B_HB2], n, layerFfn, dim);
+        }
+        for (int t = 0; t < n; t++) {
+            float[] hb = b[B_HB][t], hb2 = b[B_HB2][t];
+            for (int i = 0; i < layerFfn; i++) {
+                float v = hb[i];
+                hb[i] = 0.5f * v * (1.0f + (float) Math.tanh(
+                        0.7978845608028654f * (v + 0.044715f * v * v * v)));
+                hb[i] *= hb2[i];
+            }
+            Arrays.fill(xb[t], 0f);
+        }
+        FloatTensor.matmulBatchParallel(lw.wDown(), b[B_HB], xb, n, dim, layerFfn);
+
+        // Post-FFN norm and FFN residual
+        for (int t = 0; t < n; t++) {
+            if (postFfnNormCache[layer] != null) {
+                RMSNorm.apply(xb[t], xb[t], postFfnNormCache[layer], dim, normEps);
+            }
+            for (int i = 0; i < dim; i++) x[t][i] = xb[t][i] + attnOut[t][i];
+        }
+
+        // PLE injection: x += post_norm(proj @ (gelu(inp_gate @ x) * ple_layer))
+        if (doPle && pleInpGate[layer] != null) {
+            float[][] gate = b[B_PLE_GATE];
+            for (int t = 0; t < n; t++) Arrays.fill(gate[t], 0f);
+            FloatTensor.matmulBatchParallel(pleInpGate[layer], x, gate, n, pleDim, dim);
+            int pleOffset = layer * pleDim;
+            for (int t = 0; t < n; t++) {
+                float[] g = gate[t], ple = b[B_PLE][t];
+                for (int i = 0; i < pleDim; i++) {
+                    float v = g[i];
+                    g[i] = 0.5f * v * (1.0f + (float) Math.tanh(
+                            0.7978845608028654f * (v + 0.044715f * v * v * v)));
+                    g[i] *= ple[pleOffset + i];
+                }
+                Arrays.fill(xb[t], 0f);
+            }
+            FloatTensor.matmulBatchParallel(pleProj[layer], gate, xb, n, dim, pleDim);
+            for (int t = 0; t < n; t++) {
+                if (plePostNorm[layer] != null) {
+                    RMSNorm.apply(xb[t], xb[t], plePostNorm[layer], dim, normEps);
+                }
+                for (int i = 0; i < dim; i++) x[t][i] += xb[t][i];
+            }
+        }
+
+        // Layer output scale
+        if (layerOutputScale != null && layer < layerOutputScale.length) {
+            float scale = layerOutputScale[layer];
+            if (scale != 1.0f && scale != 0f) {
+                for (int t = 0; t < n; t++) {
+                    for (int i = 0; i < dim; i++) x[t][i] *= scale;
+                }
+            }
+        }
+    }
+
     /**
      * Pre-compute PLE input for this token.
      * Combines token-identity embedding with context-aware projection.
      */
     private void computePleInput(int token, Gemma4State state) {
         int totalPleDim = pleDim * blockCount;
+        // Context-aware projection: per_layer_model_proj @ x → [totalPleDim]
+        Arrays.fill(state.pleProjected, 0, totalPleDim, 0f);
+        pleModelProj.matmulParallel(state.x, state.pleProjected, totalPleDim, dim);
+        combinePle(token, state.pleProjected, state.pleEmb, state.pleCombined);
+    }
 
-        // Step 1: Token-identity embedding lookup → [totalPleDim]
-        float[] pleEmb = state.pleEmb;
-        for (int i = 0; i < totalPleDim; i++) {
-            pleEmb[i] = pleTokenEmbd.getFloat((long) token * totalPleDim + i);
-        }
-        // Scale by sqrt(pleDim)
+    /**
+     * Turns the raw {@code per_layer_model_proj @ x} of one token ({@code projected}, modified in
+     * place) into its combined PLE input: scale and per-layer-norm the projection, add the scaled
+     * token-identity embedding (looked up into the {@code emb} scratch) and scale the sum.
+     */
+    private void combinePle(int token, float[] projected, float[] emb, float[] combined) {
+        int totalPleDim = pleDim * blockCount;
+
+        // Token-identity embedding lookup → [totalPleDim], scaled by sqrt(pleDim)
         float pleScale = (float) Math.sqrt(pleDim);
-        for (int i = 0; i < totalPleDim; i++) pleEmb[i] *= pleScale;
+        for (int i = 0; i < totalPleDim; i++) {
+            emb[i] = pleTokenEmbd.getFloat((long) token * totalPleDim + i) * pleScale;
+        }
 
-        // Step 2: Context-aware projection: per_layer_model_proj @ x → [totalPleDim]
-        float[] pleProjected = state.pleProjected;
-        Arrays.fill(pleProjected, 0, totalPleDim, 0f);
-        pleModelProj.matmulParallel(state.x, pleProjected, totalPleDim, dim);
-        // Scale by 1/sqrt(dim)
+        // Projection scaled by 1/sqrt(dim)
         float projScale = 1.0f / (float) Math.sqrt(dim);
-        for (int i = 0; i < totalPleDim; i++) pleProjected[i] *= projScale;
+        for (int i = 0; i < totalPleDim; i++) projected[i] *= projScale;
 
         // Apply per-layer RMSNorm to each pleDim-sized chunk of projected
         for (int l = 0; l < blockCount; l++) {
-            RMSNorm.apply(pleProjected, l * pleDim, pleProjected, l * pleDim,
+            RMSNorm.apply(projected, l * pleDim, projected, l * pleDim,
                     pleProjNormWeights, pleDim, normEps);
         }
 
-        // Step 3: Combine and scale: (projected + emb) * (1/sqrt(2))
+        // Combine and scale: (projected + emb) * (1/sqrt(2))
         float combineScale = 1.0f / (float) Math.sqrt(2.0);
-        float[] pleCombined = state.pleCombined;
         for (int i = 0; i < totalPleDim; i++) {
-            pleCombined[i] = (pleProjected[i] + pleEmb[i]) * combineScale;
+            combined[i] = (projected[i] + emb[i]) * combineScale;
         }
     }
 
@@ -359,124 +607,27 @@ public class Gemma4InferenceEngine {
         TransformerLayerWeights lw = weights.layers()[layer];
         boolean hasPle = pleTokenEmbd != null && pleDim > 0;
         boolean hasOwnKv = layer < blockCount - sharedKvLayers;
-        boolean isSwa = isSwaLayer(layer);
-        RoPE rope = isSwa ? ropeSwa : ropeFull;
-
-        // Per-layer dimensions: SWA and full attention layers have different headSize
-        int headSize = isSwa ? headSizeSwa : headSizeFull;
-        int qDim = headCount * headSize;
-        int kvDim = headCountKV * headSize;
+        int qDim = layerQDim(layer);
+        int kvDim = layerKvDim(layer);
 
         // === 1. Pre-attention RMSNorm ===
         RMSNorm.apply(state.xb, state.x, attnNormCache[layer], dim, normEps);
 
-        // === 2. Q projection === (use large buffers that fit both SWA and full layers)
-        final float[] qBuf = state.qLarge;
-        final float[] kBuf = state.kLarge;
-        final float[] vBuf = state.vLarge;
-        final float[] xb2Buf = state.xb2Large;
-        Arrays.fill(qBuf, 0, qDim, 0f);
-        lw.wq().matmulParallel(state.xb, qBuf, qDim, dim);
-
-        // QK-norm on Q (with learnable scale)
-        if (qNormCache[layer] != null) {
-            for (int h = 0; h < headCount; h++) {
-                RMSNorm.apply(qBuf, h * headSize, qBuf, h * headSize,
-                        qNormCache[layer], headSize, normEps);
-            }
-        }
-
-        // RoPE on Q
-        rope.applyAllHeads(qBuf, headCount, position);
-
-        // === 3. K/V projection (conditional on shared KV) ===
-        int kvLayer = kvSourceLayer[layer]; // which layer's KV cache to use
+        // === 2. Q/K/V projections === (use large buffers that fit both SWA and full layers)
+        Arrays.fill(state.qLarge, 0, qDim, 0f);
+        lw.wq().matmulParallel(state.xb, state.qLarge, qDim, dim);
         if (hasOwnKv) {
-            Arrays.fill(kBuf, 0, kvDim, 0f);
-            Arrays.fill(vBuf, 0, kvDim, 0f);
-            lw.wk().matmulParallel(state.xb, kBuf, kvDim, dim);
-            lw.wv().matmulParallel(state.xb, vBuf, kvDim, dim);
-
-            // QK-norm on K (with learnable scale)
-            if (kNormCache[layer] != null) {
-                for (int h = 0; h < headCountKV; h++) {
-                    RMSNorm.apply(kBuf, h * headSize, kBuf, h * headSize,
-                            kNormCache[layer], headSize, normEps);
-                }
+            Arrays.fill(state.kLarge, 0, kvDim, 0f);
+            lw.wk().matmulParallel(state.xb, state.kLarge, kvDim, dim);
+            if (lw.wv() != null) {
+                Arrays.fill(state.vLarge, 0, kvDim, 0f);
+                lw.wv().matmulParallel(state.xb, state.vLarge, kvDim, dim);
             }
-
-            // V-norm: rms_norm without learnable scale (both Gemma 3n and Gemma 4
-            // per llama.cpp gemma4-iswa.cpp: Vcur = ggml_rms_norm(ctx0, Vcur, eps)).
-            for (int h = 0; h < headCountKV; h++) {
-                RMSNorm.applyNoScale(vBuf, h * headSize, headSize, normEps);
-            }
-
-            // RoPE on K
-            rope.applyAllHeads(kBuf, headCountKV, position);
-
-            // Store K/V in per-layer cache (kvDim varies per layer type)
-            int kvCacheDim = state.gemma4KvCache.kvDim(layer);
-            System.arraycopy(kBuf, 0, state.gemma4KvCache.keyLayer(layer),
-                    position * kvCacheDim, kvDim);
-            System.arraycopy(vBuf, 0, state.gemma4KvCache.valueLayer(layer),
-                    position * kvCacheDim, kvDim);
         }
-        // else: shared KV — use kvLayer's cache (already populated)
 
-        // === 4. Attention ===
-        final int hs = headSize; // capture for lambda
-        final int kvd = kvDim;
-        // Gemma 4: attention scale = 1.0 (model handles scaling via QK-norm internally)
-        final float attnScale = 1.0f;
-        final int startPos = (isSwa && slidingWindow > 0)
-                ? Math.max(0, position - slidingWindow + 1) : 0;
-        final int seqLen = position + 1;
-        final int kvCacheDim = state.gemma4KvCache.kvDim(kvLayer);
-        final float[] keyCache = state.gemma4KvCache.keyLayer(kvLayer);
-        final float[] valueCache = state.gemma4KvCache.valueLayer(kvLayer);
-
-        // Parallel attention over heads
-        IntStream.range(0, headCount).parallel().forEach(h -> {
-            int kvHead = h / kvMul;
-            int qOffset = h * hs;
-
-            // Compute attention scores
-            for (int t = startPos; t < seqLen; t++) {
-                float score = 0f;
-                int kOffset = t * kvCacheDim + kvHead * hs;
-                for (int i = 0; i < hs; i++) {
-                    score += qBuf[qOffset + i] * keyCache[kOffset + i];
-                }
-                state.att[h * maxSeqLen + t] = score * attnScale;
-            }
-
-            // Softmax
-            float maxVal = Float.NEGATIVE_INFINITY;
-            for (int t = startPos; t < seqLen; t++) {
-                if (state.att[h * maxSeqLen + t] > maxVal) maxVal = state.att[h * maxSeqLen + t];
-            }
-            float sum = 0f;
-            for (int t = startPos; t < seqLen; t++) {
-                float v = (float) Math.exp(state.att[h * maxSeqLen + t] - maxVal);
-                state.att[h * maxSeqLen + t] = v;
-                sum += v;
-            }
-            float invSum = 1.0f / sum;
-            for (int t = startPos; t < seqLen; t++) {
-                state.att[h * maxSeqLen + t] *= invSum;
-            }
-
-            // Weighted V sum → xb2
-            int outOffset = h * hs;
-            for (int i = 0; i < hs; i++) {
-                float val = 0f;
-                for (int t = startPos; t < seqLen; t++) {
-                    val += state.att[h * maxSeqLen + t]
-                            * valueCache[t * kvCacheDim + kvHead * hs + i];
-                }
-                xb2Buf[outOffset + i] = val;
-            }
-        });
+        // === 3-4. QK-norm, V-norm, RoPE, KV store, attention → xb2Large ===
+        attentionCore(state, layer, position);
+        final float[] xb2Buf = state.xb2Large;
 
         // === 5. Wo projection ===
         Arrays.fill(state.xb, 0);
@@ -495,15 +646,19 @@ public class Gemma4InferenceEngine {
         RMSNorm.apply(state.xb, attnOut, ffnNormCache[layer], dim, normEps);
 
         // === 9. GeGLU FFN: gate * up with GELU activation ===
-        Arrays.fill(state.hb, 0, ffnDim, 0f);
-        Arrays.fill(state.hb2, 0, ffnDim, 0f);
+        // Gemma 4 E2B/E4B use a per-layer "double-wide MLP": feed_forward_length is a per-layer
+        // array, so the gate/up/down weights of the wider layers have more rows than the narrower
+        // ones. Use the per-layer width — the scalar max would over-read the narrow layers.
+        int layerFfn = config.layerFfnLength(layer);
+        Arrays.fill(state.hb, 0, layerFfn, 0f);
+        Arrays.fill(state.hb2, 0, layerFfn, 0f);
         if (lw.wGate() != null) {
-            lw.wGate().matmulParallel(state.xb, state.hb, ffnDim, dim);
+            lw.wGate().matmulParallel(state.xb, state.hb, layerFfn, dim);
         }
-        lw.wUp().matmulParallel(state.xb, state.hb2, ffnDim, dim);
+        lw.wUp().matmulParallel(state.xb, state.hb2, layerFfn, dim);
 
         // GELU activation on gate, then element-wise multiply
-        for (int i = 0; i < ffnDim; i++) {
+        for (int i = 0; i < layerFfn; i++) {
             float x = state.hb[i];
             // GELU with tanh approximation (gelu_pytorch_tanh)
             state.hb[i] = 0.5f * x * (1.0f + (float) Math.tanh(
@@ -513,7 +668,7 @@ public class Gemma4InferenceEngine {
 
         // Down projection
         Arrays.fill(state.xb, 0);
-        lw.wDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
+        lw.wDown().matmulParallel(state.hb, state.xb, dim, layerFfn);
 
         // === 10. Post-FFN norm (post_ffw_norm.weight) ===
         if (postFfnNormCache[layer] != null) {
@@ -565,6 +720,132 @@ public class Gemma4InferenceEngine {
                 for (int i = 0; i < dim; i++) state.x[i] *= scale;
             }
         }
+    }
+
+    /**
+     * The order-dependent part of an attention layer: QK-norm, V-norm, RoPE, KV store and the
+     * attention itself for one token at {@code position}. Reads the raw projections from
+     * {@code state.qLarge} (and {@code kLarge}/{@code vLarge} on layers with their own KV) and
+     * writes the attention output, before Wo, to {@code state.xb2Large}. Shared by the one-token
+     * path and batched prefill, which feeds it one token at a time in position order.
+     */
+    private void attentionCore(Gemma4State state, int layer, int position) {
+        TransformerLayerWeights lw = weights.layers()[layer];
+        boolean hasOwnKv = layer < blockCount - sharedKvLayers;
+        boolean isSwa = isSwaLayer(layer);
+        RoPE rope = isSwa ? ropeSwa : ropeFull;
+
+        // Per-layer dimensions: SWA and full attention layers have different headSize,
+        // and Gemma 4 dense (12B) also varies the KV head count per layer — the full count
+        // on SWA layers, a reduced count (often 1) on the every-6th global layers. Using the
+        // scalar max here would size the K/V matmul past the actual wk/wv rows on global
+        // layers and read out of bounds.
+        int headSize = isSwa ? headSizeSwa : headSizeFull;
+        int layerKvHeads = config.layerKvHeads(layer);
+        int layerKvMul = headCount / layerKvHeads;
+        int kvDim = layerKvHeads * headSize;
+
+        final float[] qBuf = state.qLarge;
+        final float[] kBuf = state.kLarge;
+        final float[] vBuf = state.vLarge;
+        final float[] xb2Buf = state.xb2Large;
+
+        // QK-norm on Q (with learnable scale)
+        if (qNormCache[layer] != null) {
+            for (int h = 0; h < headCount; h++) {
+                RMSNorm.apply(qBuf, h * headSize, qBuf, h * headSize,
+                        qNormCache[layer], headSize, normEps);
+            }
+        }
+
+        // RoPE on Q
+        rope.applyAllHeads(qBuf, headCount, position);
+
+        // === K/V (conditional on shared KV) ===
+        int kvLayer = kvSourceLayer[layer]; // which layer's KV cache to use
+        if (hasOwnKv) {
+            if (lw.wv() == null) {
+                // Gemma 4 "alternative attention": the global (full-attention) layers ship no V
+                // projection — llama.cpp gemma4.cpp marks wv TENSOR_NOT_REQUIRED and uses
+                // `Vcur = wv ? wv@x : Kcur`, i.e. the raw K projection becomes V. Capture kBuf
+                // here, before the K-norm/RoPE below mutate it (V then gets only its own V-norm).
+                System.arraycopy(kBuf, 0, vBuf, 0, kvDim);
+            }
+
+            // QK-norm on K (with learnable scale)
+            if (kNormCache[layer] != null) {
+                for (int h = 0; h < layerKvHeads; h++) {
+                    RMSNorm.apply(kBuf, h * headSize, kBuf, h * headSize,
+                            kNormCache[layer], headSize, normEps);
+                }
+            }
+
+            // V-norm: rms_norm without learnable scale (both Gemma 3n and Gemma 4
+            // per llama.cpp gemma4-iswa.cpp: Vcur = ggml_rms_norm(ctx0, Vcur, eps)).
+            for (int h = 0; h < layerKvHeads; h++) {
+                RMSNorm.applyNoScale(vBuf, h * headSize, headSize, normEps);
+            }
+
+            // RoPE on K
+            rope.applyAllHeads(kBuf, layerKvHeads, position);
+
+            // Store K/V in per-layer cache (kvDim varies per layer type)
+            int kvCacheDim = state.gemma4KvCache.kvDim(layer);
+            System.arraycopy(kBuf, 0, state.gemma4KvCache.keyLayer(layer),
+                    position * kvCacheDim, kvDim);
+            System.arraycopy(vBuf, 0, state.gemma4KvCache.valueLayer(layer),
+                    position * kvCacheDim, kvDim);
+        }
+        // else: shared KV — use kvLayer's cache (already populated)
+
+        // === Attention ===
+        final int hs = headSize; // capture for lambda
+        // Gemma 4: attention scale = 1.0 (model handles scaling via QK-norm internally)
+        final float attnScale = 1.0f;
+        final int startPos = (isSwa && slidingWindow > 0)
+                ? Math.max(0, position - slidingWindow + 1) : 0;
+        final int seqLen = position + 1;
+        final int kvCacheDim = state.gemma4KvCache.kvDim(kvLayer);
+        final float[] keyCache = state.gemma4KvCache.keyLayer(kvLayer);
+        final float[] valueCache = state.gemma4KvCache.valueLayer(kvLayer);
+
+        // Parallel attention over heads
+        final int kvMulLayer = layerKvMul;
+        final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
+            int kvHead = h / kvMulLayer;
+            int qOffset = h * hs;
+
+            // Compute attention scores
+            for (int t = startPos; t < seqLen; t++) {
+                float score = ops.dot(qBuf, qOffset, keyCache, t * kvCacheDim + kvHead * hs, hs);
+                state.att[h * maxSeqLen + t] = score * attnScale;
+            }
+
+            // Softmax
+            float maxVal = Float.NEGATIVE_INFINITY;
+            for (int t = startPos; t < seqLen; t++) {
+                if (state.att[h * maxSeqLen + t] > maxVal) maxVal = state.att[h * maxSeqLen + t];
+            }
+            float sum = 0f;
+            for (int t = startPos; t < seqLen; t++) {
+                float v = (float) Math.exp(state.att[h * maxSeqLen + t] - maxVal);
+                state.att[h * maxSeqLen + t] = v;
+                sum += v;
+            }
+            float invSum = 1.0f / sum;
+            for (int t = startPos; t < seqLen; t++) {
+                state.att[h * maxSeqLen + t] *= invSum;
+            }
+
+            // Weighted V sum → xb2 (per element, still accumulated in position order)
+            int outOffset = h * hs;
+            Arrays.fill(xb2Buf, outOffset, outOffset + hs, 0f);
+            for (int t = startPos; t < seqLen; t++) {
+                ops.saxpy(state.att[h * maxSeqLen + t], valueCache, t * kvCacheDim + kvHead * hs,
+                        xb2Buf, outOffset, hs);
+            }
+        });
     }
 
     // === Public API matching InferenceEngine pattern ===
@@ -1015,15 +1296,12 @@ public class Gemma4InferenceEngine {
         final float[] valueCache = state.gemma4KvCache.valueLayer(kvLayer);
 
         final float attnScale = 1.0f;
-        java.util.stream.IntStream.range(0, headCount).parallel().forEach(h -> {
+        final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOffset = h * hs;
             for (int t = startPos; t < seqLen; t++) {
-                float score = 0f;
-                int kOffset = t * kvCacheDim + kvHead * hs;
-                for (int i = 0; i < hs; i++) {
-                    score += qBuf[qOffset + i] * keyCache[kOffset + i];
-                }
+                float score = ops.dot(qBuf, qOffset, keyCache, t * kvCacheDim + kvHead * hs, hs);
                 state.att[h * maxSeqLen + t] = score * attnScale;
             }
             // Softmax
@@ -1039,14 +1317,12 @@ public class Gemma4InferenceEngine {
             }
             float invSum = 1.0f / sum;
             for (int t = startPos; t < seqLen; t++) state.att[h * maxSeqLen + t] *= invSum;
-            // Weighted V sum
+            // Weighted V sum (per element, still accumulated in position order)
             int outOffset = h * hs;
-            for (int i = 0; i < hs; i++) {
-                float val = 0f;
-                for (int t = startPos; t < seqLen; t++) {
-                    val += state.att[h * maxSeqLen + t] * valueCache[t * kvCacheDim + kvHead * hs + i];
-                }
-                xb2Buf[outOffset + i] = val;
+            Arrays.fill(xb2Buf, outOffset, outOffset + hs, 0f);
+            for (int t = startPos; t < seqLen; t++) {
+                ops.saxpy(state.att[h * maxSeqLen + t], valueCache, t * kvCacheDim + kvHead * hs,
+                        xb2Buf, outOffset, hs);
             }
         });
 

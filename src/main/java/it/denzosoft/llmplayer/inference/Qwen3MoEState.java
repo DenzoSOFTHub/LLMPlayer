@@ -28,6 +28,7 @@ public class Qwen3MoEState {
     // MoE buffers
     public final float[] xbSaved;         // [dim] - saved input for MoE
     public final float[] routerLogits;    // [expertCount]
+    public final float[] selectionScores; // [expertCount] sigmoid probs + exp_probs_b, top-K selection only (GLM4-MoE)
     public final int[] selectedExperts;   // [expertUsedCount]
     public final float[] selectedWeights; // [expertUsedCount]
     public final float[] expertOut;       // [dim] - single expert output
@@ -37,6 +38,14 @@ public class Qwen3MoEState {
     public final float[][] moeHbPerExpert;    // [expertUsedCount][expertFfnDim]
     public final float[][] moeHb2PerExpert;   // [expertUsedCount][expertFfnDim]
     public final float[][] expertOutPerExpert; // [expertUsedCount][dim]
+
+    /** Batched-prefill buffers, created on first use by {@link Qwen3MoEInferenceEngine#forwardPrefill}. */
+    float[][][] prefillBuffers;
+    int[] prefillExperts;     // [chunk * topK] expert of each (token, slot)
+    float[] prefillWeights;   // [chunk * topK] routing weight of each (token, slot)
+    int[] prefillGroupStart;  // [expertCount + 1] start of each expert's run in prefillGroupSlots
+    int[] prefillGroupSlots;  // [chunk * topK] (token, slot) indices grouped by expert
+    int[] prefillUsed;        // [expertCount] distinct experts of the current layer
 
     public Qwen3MoEState(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();
@@ -74,6 +83,7 @@ public class Qwen3MoEState {
         // MoE
         this.xbSaved = new float[dim];
         this.routerLogits = new float[Math.max(expertCount, 1)];
+        this.selectionScores = new float[Math.max(expertCount, 1)];
         this.selectedExperts = new int[Math.max(expertUsedCount, 1)];
         this.selectedWeights = new float[Math.max(expertUsedCount, 1)];
         this.expertOut = new float[dim];

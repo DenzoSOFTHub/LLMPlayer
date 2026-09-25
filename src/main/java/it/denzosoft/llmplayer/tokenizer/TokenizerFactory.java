@@ -24,7 +24,9 @@ public final class TokenizerFactory {
 
         specialTokens.setModelType(model);
         if ("gpt2".equals(model) || "bpe".equals(model) || "gemma4".equals(model)) {
-            return new BPETokenizer(tokens, scores, merges, specialTokens);
+            BPETokenizer bpe = new BPETokenizer(tokens, scores, merges, specialTokens);
+            bpe.setPreTokenizer(metadata.getString("tokenizer.ggml.pre", ""));
+            return bpe;
         } else {
             return new SentencePieceTokenizer(tokens, scores, specialTokens);
         }

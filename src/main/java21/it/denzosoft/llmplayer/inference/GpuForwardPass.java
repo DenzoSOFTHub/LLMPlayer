@@ -145,6 +145,8 @@ public class GpuForwardPass implements AutoCloseable {
      * Returns true for pre-norm dense models with separate Q/K/V and SiLU activation.
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
+        // Layer math only the CPU TransformerBlock implements (Hunyuan, Spark2.5, looped Nanbeige)
+        if (config.requiresCpuLayerPath()) return false;
         // Must be dense (no MoE)
         if (config.expertCount() > 0) return false;
 

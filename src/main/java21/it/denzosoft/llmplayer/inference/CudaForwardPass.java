@@ -1226,6 +1226,8 @@ public class CudaForwardPass implements AutoCloseable {
      * Returns true if at least the first layer has CudaFloatTensor weights (partial offload OK).
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
+        // Layer math only the CPU TransformerBlock implements (Hunyuan, Spark2.5, looped Nanbeige)
+        if (config.requiresCpuLayerPath()) return false;
         if (config.expertCount() > 0) return false;
         // Command-R uses centered LayerNorm, not RMSNorm — CUDA path implements RMSNorm only.
         // Force CPU until a layernorm.cu kernel is added.

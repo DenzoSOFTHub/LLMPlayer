@@ -11,6 +11,11 @@ import it.denzosoft.llmplayer.model.ModelConfig;
  * - Conv1d state buffer per DeltaNet layer
  */
 public class Qwen35State {
+    /** Multi-axis RoPE positions of image tokens; null for text-only sequences. */
+    public MRopePositions mrope;
+    final int[] ropePos4 = new int[4];
+    float[] mropeCos, mropeSin;
+
 
     public final float[] x;      // current activation [embeddingLength]
     public final float[] xb;     // activation after rmsnorm [embeddingLength]
@@ -46,6 +51,9 @@ public class Qwen35State {
 
     // Attention output gate buffer (for full attention layers with Q+gate packing)
     public final float[] attnGate;
+
+    /** Per-token buffers for batched prefill, created on first use by {@link Qwen35InferenceEngine#forwardPrefill}. */
+    float[][][] prefillBuffers;
 
     public Qwen35State(ModelConfig config, int maxSeqLen) {
         this.blockCount = config.blockCount();

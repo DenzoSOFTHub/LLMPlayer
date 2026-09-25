@@ -54,6 +54,18 @@ public class DeepSeek2State {
     public final float[][] moeHb2PerExpert;  // [expertUsedCount][expertFfnDim]
     public final float[][] expertOutPerExpert; // [expertUsedCount][dim]
 
+    /** Batched-prefill buffers of MLAAttention (see {@link MLAAttention#forwardBatch}), created on first use. */
+    float[][][] mlaPrefill;
+    /** Batched-prefill buffers of the engine, created on first use. */
+    float[][][] prefillBuffers;
+    /** Batched-prefill buffers of MoEFFN (see {@link MoEFFN#forwardBatch}), created on first use. */
+    float[][][] moePrefill;
+    int[] prefillExperts;     // [chunk * topK] expert of each (token, slot)
+    float[] prefillWeights;   // [chunk * topK] routing weight of each (token, slot)
+    int[] prefillGroupStart;  // [expertCount + 1] start of each expert's run in prefillGroupSlots
+    int[] prefillGroupSlots;  // [chunk * topK] (token, slot) indices grouped by expert
+    int[] prefillUsed;        // [expertCount] distinct experts of the current layer
+
     public DeepSeek2State(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();
         int headCount = config.headCount();

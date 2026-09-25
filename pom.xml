@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>it.denzosoft</groupId>
     <artifactId>LLMPlayer</artifactId>
-    <version>1.16.1</version>
+    <version>1.18.0</version>
     <packaging>jar</packaging>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -147,8 +147,10 @@
                         <artifactId>maven-compiler-plugin</artifactId>
                         <version>3.11.0</version>
                         <configuration>
-                            <source>1.8</source>
-                            <target>1.8</target>
+                            <!-- release (not source/target): link against the Java 8 API, otherwise
+                                 covariant overrides added later (MappedByteBuffer.duplicate(),
+                                 ByteBuffer.flip()) compile into calls that fail on a Java 8 JVM -->
+                            <release>8</release>
                         </configuration>
                     </plugin>
                 </plugins>

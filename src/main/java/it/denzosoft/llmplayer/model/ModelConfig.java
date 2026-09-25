@@ -80,6 +80,70 @@ public final class ModelConfig {
     public void setRopeFreqBaseSwa(float v) { this.ropeFreqBaseSwa = v; }
     public void setRopeDimCountSwa(int v) { this.ropeDimCountSwa = v; }
     public boolean[] slidingWindowPattern() { return slidingWindowPattern; }
+
+    // Nanbeige looped depth: the GGUF stores physicalBlockCount layers that are run numLoops times
+    // with shared weights (llama.cpp nanbeige.cpp). blockCount() is the LOGICAL layer count
+    // (physical × loops): every logical layer has its own KV-cache slot, and the model's output norm
+    // is also applied at each loop boundary unless skipLoopFinalNorm is set.
+    private int numLoops = 1;
+    private int physicalBlockCount;
+    private boolean skipLoopFinalNorm;
+    public int numLoops() { return numLoops; }
+    public int physicalBlockCount() { return physicalBlockCount > 0 ? physicalBlockCount : blockCount; }
+    public boolean skipLoopFinalNorm() { return skipLoopFinalNorm; }
+
+    // Qwen2-VL / Qwen3-VL multi-axis RoPE: rope.dimension_sections splits the rotated pairs into
+    // (temporal, height, width, extra) sections; Qwen3-VL interleaves them (IMROPE). Null for
+    // every other model. nDeepstackLayers: Qwen3-VL adds vision "deepstack" features to the
+    // hidden state after its first n layers.
+    private int[] ropeSections;
+    private boolean ropeSectionsInterleaved;
+    private int nDeepstackLayers;
+    public int[] ropeSections() { return ropeSections; }
+    public boolean ropeSectionsInterleaved() { return ropeSectionsInterleaved; }
+    public int nDeepstackLayers() { return nDeepstackLayers; }
+
+    /**
+     * Whether the output norm is applied to the residual stream after logical layer {@code layer}
+     * (a loop boundary that is not the last layer). Always false for non-looped models.
+     */
+    public boolean isLoopBoundary(int layer) {
+        return numLoops > 1 && !skipLoopFinalNorm
+            && (layer + 1) % physicalBlockCount() == 0 && (layer + 1) < blockCount;
+    }
+
+    /**
+     * Hunyuan dense applies the per-head Q/K RMSNorm AFTER RoPE, whereas Qwen3/Gemma normalise
+     * before it (llama.cpp hunyuan-vl.cpp builds ggml_rope_ext first, then build_norm).
+     */
+    public boolean qkNormAfterRope() {
+        return architecture == ModelArchitecture.HUNYUAN_DENSE;
+    }
+
+    /**
+     * Architectures whose layer math only the CPU {@code TransformerBlock} implements: the
+     * GPU-resident forward passes must decline them (their per-tensor GPU matmuls still apply).
+     * Hunyuan (QK-norm after RoPE), Spark2.5 (per-head attention output gate, per-layer RoPE
+     * dims) and looped Nanbeige (shared weights across logical layers, mid-stack norm).
+     */
+    public boolean requiresCpuLayerPath() {
+        return architecture == ModelArchitecture.HUNYUAN_DENSE
+            || architecture == ModelArchitecture.SPARK2_5
+            || numLoops > 1
+            || mropeDiffersFromNeox();
+    }
+
+    /**
+     * True when the multi-axis RoPE sections leave some rotated pairs in the "extra" section, whose
+     * position is 0 for text (Qwen3-VL, the Qwen3-TTS talker). The text rotation is then not plain
+     * NEOX, which is all the GPU-resident passes implement.
+     */
+    public boolean mropeDiffersFromNeox() {
+        if (ropeSections == null) return false;
+        int[] map = mropeSectionMap(ropeSections, ropeSectionsInterleaved, ropeDimensionCount / 2);
+        for (int sec : map) if (sec == 3) return true;
+        return false;
+    }
     public int sharedKvLayers() { return sharedKvLayers; }
     public int embeddingLengthPerLayer() { return embeddingLengthPerLayer; }
     public float ropeFreqBaseSwa() { return ropeFreqBaseSwa; }
@@ -199,6 +263,9 @@ public final class ModelConfig {
     public int noRopeLayerInterval() { return noRopeLayerInterval; }
     public int qLoraRank() { return qLoraRank; }
     public int expertGatingFunc() { return expertGatingFunc; }
+    // expert_weights_norm: renormalise the selected routing weights to sum 1 (sigmoid routing)
+    private boolean expertWeightsNorm;
+    public boolean expertWeightsNorm() { return expertWeightsNorm; }
     public float expertWeightsScale() { return expertWeightsScale; }
     public float embeddingScale() { return embeddingScale; }
     public float attentionScale() { return attentionScale; }
@@ -240,6 +307,27 @@ public final class ModelConfig {
         return (perLayerKvHeads != null && layer < perLayerKvHeads.length) ? perLayerKvHeads[layer] : headCountKV;
     }
 
+    /**
+     * Per-layer KV head count, falling back to the scalar when the GGUF stores a single value.
+     * Gemma 4 dense (12B/31B) stores attention.head_count_kv as a per-layer array — the
+     * sliding-window layers use the full count (e.g. 8) while the every-6th global layers use
+     * a reduced count (e.g. 1). Architectures with a scalar head_count_kv (E2B/E4B, Llama, …)
+     * get the uniform value for every layer.
+     */
+    public int layerKvHeads(int layer) {
+        return (perLayerKvHeads != null && layer < perLayerKvHeads.length) ? perLayerKvHeads[layer] : headCountKV;
+    }
+
+    /**
+     * Per-layer FFN intermediate size, falling back to the scalar when uniform. Gemma 4 E2B/E4B
+     * use a "double-wide MLP": the GGUF stores feed_forward_length as a per-layer array (e.g. the
+     * E2B's first 15 layers are 6144-wide, the last 20 are 12288-wide). Architectures with a
+     * scalar feed_forward_length get the uniform value for every layer.
+     */
+    public int layerFfnLength(int layer) {
+        return (perLayerFfnLength != null && layer < perLayerFfnLength.length) ? perLayerFfnLength[layer] : intermediateSize;
+    }
+
     /** LFM2: a layer is GQA attention when its per-layer kv-head count > 0, else a short-conv layer. */
     public boolean lfm2IsAttentionLayer(int layer) {
         return perLayerKvHeads != null && layer < perLayerKvHeads.length && perLayerKvHeads[layer] > 0;
@@ -257,6 +345,16 @@ public final class ModelConfig {
         String name = metadata.getString("general.name", "unknown");
         int embeddingLength = metadata.getInt(prefix + "embedding_length");
         int blockCount = metadata.getInt(prefix + "block_count");
+        // GLM4-MoE: block_count also counts the NextN/MTP layers appended after the trunk (used only
+        // for speculative decoding in llama.cpp, and often stripped from the file). Run the trunk only.
+        if ("glm4moe".equals(archName)) {
+            blockCount -= metadata.getInt(prefix + "nextn_predict_layers", 0);
+        }
+        // Nanbeige looped depth: block_count is the physical layer count; the model runs it
+        // num_loops times, so the logical depth (and the KV cache) is block_count × num_loops.
+        int physicalBlockCount = blockCount;
+        int numLoops = Math.max(1, metadata.getInt(prefix + "num_loops", 1));
+        blockCount = physicalBlockCount * numLoops;
         int headCount = metadata.getInt(prefix + "attention.head_count");
         // head_count_kv and feed_forward_length may be per-layer arrays (Nemotron-H)
         int headCountKV;
@@ -302,29 +400,38 @@ public final class ModelConfig {
         int headSize = defaultHeadSize;
         int kvDim = headSize * headCountKV;
 
-        // Llama/DeepSeek2/Mistral3/Command-R/Gemma/Llama4 use ROPE_TYPE_NORMAL (consecutive pairs),
-        // Qwen/Falcon/GLM4/Phi3/Qwen3MoE/OLMo2/GPT-OSS use ROPE_TYPE_NEOX (split-half)
+        // Llama/DeepSeek2/Mistral3/Command-R/Llama4/GLM4 use ROPE_TYPE_NORMAL (consecutive pairs),
+        // Qwen/Falcon/Phi3/Qwen3MoE/OLMo2/GPT-OSS/Gemma use ROPE_TYPE_NEOX (split-half).
+        // GLM4 is NORM as in llama.cpp (only glm4moe is NEOX): NEOX gave PPL 5.45 vs 2.60 on GLM-4-9B.
         int ropeType;
         if (arch == ModelArchitecture.LLAMA || arch == ModelArchitecture.DEEPSEEK2
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
                 || arch == ModelArchitecture.COHERE2
-                || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
                 || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
-                || arch == ModelArchitecture.GRANITE || arch == ModelArchitecture.GEMMA4
-                || arch == ModelArchitecture.GEMMA3N
-                || arch == ModelArchitecture.ERNIE4_5) {
+                || arch == ModelArchitecture.GRANITE
+                || arch == ModelArchitecture.ERNIE4_5 || arch == ModelArchitecture.GLM4) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
-                || arch == ModelArchitecture.GLM4 || arch == ModelArchitecture.PHI3
+                || arch == ModelArchitecture.PHI3
                 || arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.OLMO2
                 || arch == ModelArchitecture.GPT_OSS
                 || arch == ModelArchitecture.GRANITE_HYBRID
-                || arch == ModelArchitecture.LFM2 || arch == ModelArchitecture.FALCON_H1) {
+                || arch == ModelArchitecture.LFM2 || arch == ModelArchitecture.FALCON_H1
+                || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
+                || arch == ModelArchitecture.GEMMA3N || arch == ModelArchitecture.GEMMA4
+                || arch == ModelArchitecture.HUNYUAN_DENSE || arch == ModelArchitecture.SPARK2_5) {
             ropeType = 2;  // ROPE_TYPE_NEOX
         } else if (arch == ModelArchitecture.QWEN35) {
             ropeType = 2;  // ROPE_TYPE_NEOX (IMROPE uses split-half pairing like NEOX)
         } else {
             ropeType = 0;
+        }
+        // GLM-4.xV (glm4 with rope.dimension_sections): the converter permutes Q/K to NEOX order for
+        // M-RoPE, whose text rotation (all axes equal, non-interleaved sections) is plain NEOX.
+        // glm4moe is NEOX in llama.cpp (its checkpoints already use NEOX ordering).
+        if (arch == ModelArchitecture.GLM4 && ("glm4moe".equals(archName)
+                || metadata.getIntArray(prefix + "rope.dimension_sections") != null)) {
+            ropeType = 2;
         }
 
         // Attention key/value lengths from metadata (may override computed headSize)
@@ -359,6 +466,13 @@ public final class ModelConfig {
         // For DeepSeek2, override kvDim since Q/K/V dimensions differ from standard (MLA)
         if (arch == ModelArchitecture.DEEPSEEK2) {
             kvDim = headCountKV * valueLength;
+        }
+
+        // Hunyuan XDRoPE / NTK-aware scaling: base = theta * alpha^(d / (d - 2)) (llama.cpp
+        // hunyuan-vl.cpp). Current converters bake this into rope.freq_base and omit the key.
+        float ropeScalingAlpha = metadata.getFloat(prefix + "rope.scaling.alpha", 0f);
+        if (ropeScalingAlpha > 0f && headSize > 2) {
+            ropeFreqBase = (float) (ropeFreqBase * Math.pow(ropeScalingAlpha, (double) headSize / (headSize - 2)));
         }
 
         // RoPE dimension count: read AFTER headSize override so default is correct
@@ -439,6 +553,8 @@ public final class ModelConfig {
 
         // MoE gating function: 0=softmax (default/DeepSeek V2), 2=sigmoid (GLM-4.7-Flash)
         int expertGatingFunc = metadata.getInt(prefix + "expert_gating_func", 0);
+        // llama.cpp glm4-moe.cpp: an absent (NONE) gating function means sigmoid
+        if ("glm4moe".equals(archName) && expertGatingFunc == 0) expertGatingFunc = 2;
 
         // MoE expert weight scale (applied after optional L2 normalization)
         float expertWeightsScale = metadata.getFloat(prefix + "expert_weights_scale", 1.0f);
@@ -458,6 +574,20 @@ public final class ModelConfig {
             ssmConvKernel, ssmStateSize, ssmGroupCount, ssmTimeStepRank, ssmInnerSize,
             fullAttentionInterval, noRopeLayerInterval,
             qLoraRank, expertGatingFunc, expertWeightsScale);
+
+        if ("qwen3vl".equals(archName) || "qwen2vl".equals(archName) || "qwen35".equals(archName)
+                || "qwen3tts".equals(archName)) {
+            int[] sections = metadata.getIntArray(prefix + "rope.dimension_sections");
+            if (sections != null && sections.length >= 3) {
+                config.ropeSections = java.util.Arrays.copyOf(sections, 4);
+                config.ropeSectionsInterleaved = !"qwen2vl".equals(archName);
+            }
+            config.nDeepstackLayers = metadata.getInt(prefix + "n_deepstack_layers", 0);
+        }
+        config.expertWeightsNorm = metadata.getBoolean(prefix + "expert_weights_norm", false);
+        config.numLoops = numLoops;
+        config.physicalBlockCount = physicalBlockCount;
+        config.skipLoopFinalNorm = metadata.getBoolean(prefix + "skip_loop_final_norm", false);
 
         // Set per-layer arrays for Nemotron-H
         if (perLayerKvHeads != null) config.perLayerKvHeads = perLayerKvHeads;
@@ -496,6 +626,15 @@ public final class ModelConfig {
             }
         }
 
+        // Spark2.5: 3 sliding-window layers per full-attention layer, given as a boolean pattern
+        // (true = SWA). SWA layers rotate every dim at theta_swa; full layers rotate
+        // rope.dimension_count dims (a quarter) at the main theta (llama.cpp spark2-5.cpp).
+        if (arch == ModelArchitecture.SPARK2_5) {
+            config.setRopeFreqBaseSwa(metadata.getFloat(prefix + "rope.freq_base_swa", ropeFreqBase));
+            config.setRopeDimCountSwa(metadata.getInt(prefix + "rope.dimension_count_swa", ropeDimensionCount));
+            config.setSlidingWindowPattern(parseBoolArray(metadata.get(prefix + "attention.sliding_window_pattern")));
+        }
+
         // Gemma 4: PLE config, shared KV, sliding window pattern, dual RoPE
         if (arch == ModelArchitecture.GEMMA4) {
             config.setSharedKvLayers(metadata.getInt(prefix + "attention.shared_kv_layers", 0));
@@ -521,6 +660,46 @@ public final class ModelConfig {
         return config;
     }
 
+    /**
+     * Section of each rotated pair for multi-axis RoPE (0 = temporal, 1 = height, 2 = width,
+     * 3 = extra), as ggml's mrope cache: sequential sections for MROPE (Qwen2-VL), interleaved
+     * t/h/w for IMROPE (Qwen3-VL, Qwen3.5), with pairs past the sections going to "extra".
+     */
+    public static int[] mropeSectionMap(int[] sections, boolean interleaved, int halfRope) {
+        int s0 = sections[0], s1 = sections[1], s2 = sections[2], s3 = sections.length > 3 ? sections[3] : 0;
+        int sectDims = s0 + s1 + s2 + s3;
+        int[] map = new int[halfRope];
+        for (int i = 0; i < halfRope; i++) {
+            int sector = sectDims > 0 ? i % sectDims : i;
+            int sec;
+            if (interleaved) {
+                if (sector % 3 == 1 && sector < 3 * s1) sec = 1;
+                else if (sector % 3 == 2 && sector < 3 * s2) sec = 2;
+                else if (sector % 3 == 0 && sector < 3 * s0) sec = 0;
+                else sec = 3;
+            } else {
+                if (sector < s0) sec = 0;
+                else if (sector < s0 + s1) sec = 1;
+                else if (sector < s0 + s1 + s2) sec = 2;
+                else sec = 3;
+            }
+            map[i] = sec;
+        }
+        return map;
+    }
+
+    private static boolean[] parseBoolArray(Object obj) {
+        if (!(obj instanceof Object[])) return null;
+        Object[] arr = (Object[]) obj;
+        boolean[] out = new boolean[arr.length];
+        for (int i = 0; i < arr.length; i++) {
+            out[i] = arr[i] instanceof Boolean
+                    ? ((Boolean) arr[i]).booleanValue()
+                    : Boolean.parseBoolean(String.valueOf(arr[i]));
+        }
+        return out;
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
@@ -543,6 +722,7 @@ public final class ModelConfig {
                 embeddingScale, attentionScale, residualScale));
         }
         if (logitScale > 0) sb.append(String.format(", logitScale=%.1f", logitScale));
+        if (numLoops > 1) sb.append(String.format(", loops=%dx%d", numLoops, physicalBlockCount()));
         sb.append('}');
         return sb.toString();
     }

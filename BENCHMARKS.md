@@ -2,13 +2,261 @@
 
 ## Test Configuration
 
-- **Hardware:** Intel Core Ultra 7 155H (22 cores) + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM) + 31 GB RAM
+- **Hardware:** Intel Core Ultra 7 155H + NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM). **RAM: 31 GB for
+  every section up to and including 2026-06-17; 7.8 GB from the v1.17.0-dev section (2026-08-11)
+  onward**, after the VM was reconfigured. That change is what finally made the models-larger-than-RAM
+  regime measurable here — `docs/optimization/placement-autotuning.md` had parked the hot-expert cache
+  as "untestable on this box (no >RAM model)", and with 7.8 GB the local 18–24 GB MoE models are
+  2.4–3.1× RAM. Do not compare absolute CPU numbers across that boundary.
 - **JVM:** OpenJDK 25.0.2, SimdVectorOps (Vector API), Panama FFI mmap
 - **Prompt:** varies per sweep — see each section header
 - **GPU:** CUDA auto-detected (LLMPlayer auto-detects NVIDIA GPU and enables CUDA when available)
 - **Dates:** v1.14.0-dev GPU sweep 2026-06-07 • v1.13.0 GPU sweep 2026-04-17 • v1.12.0 CPU rewrite sweep 2026-04-15 • v1.11.0 GPU sweep 2026-04-14 • older sections carry their own dates
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
+
+## v1.17.0-dev — CPU forward-pass optimisations (2026-08-11)
+
+Same box as the SSD-streaming section below: **4 cores, 7.8 GB RAM, no GPU**, `vboxsf` volume.
+All runs CPU-only at `--temperature 0`. Analysis in
+[`docs/optimization/per-token-latency-analysis.md`](../docs/optimization/per-token-latency-analysis.md).
+
+### Phase profile — where per-token time actually goes
+
+`-Dcpu.profile=true`, Qwen3-Coder-30B-A3B Q4_K_M, 2 GB expert cache:
+
+| Phase | ms/token | Share | Params/token | Throughput |
+|---|---:|---:|---:|---:|
+| `moe_ffn` (routed experts, incl. disk reads) | 641.3 | 49 % | 1.81 G | 2.83 G param/s |
+| `attn(GQA)` | 479.6 | 36 % | 0.91 G | 1.89 G param/s |
+| `output` (logit projection) | 185.7 | 14 % | 0.31 G | 1.68 G param/s |
+| norms + residuals | 8.1 | 1 % | — | — |
+
+The MoE path is the *most* efficient phase per parameter while also carrying the disk I/O; attention
+and the output projection are 1.5–1.7× less efficient despite being dense matmuls over resident
+weights. Aggregate is ~1.4 GB/s of weight bytes, far below DDR5, so the pass is compute-bound in the
+dequantise-and-FMA loop rather than memory-bound.
+
+### Prefill: skip the discarded output projection (4 engines)
+
+Only the last prompt token's logits are used, but Standard, Qwen3 MoE, DeepSeek2 and Nemotron-H
+computed the full vocabulary projection for every prompt token and threw it away. Back-to-back A/B
+against a build of the previous code; perplexity, `avg_nll` and generated text identical in every
+pair.
+
+| Model | Engine | Prompt | Before | After | Δ |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | Standard | 153 tok | 35.48 s | **28.87 s** | **−18.6 %** |
+| Qwen3-Coder-30B Q4_K_M | Qwen3 MoE | 9 tok | 58.86 s | 37.74 s | −35.9 % |
+| Nemotron-3-Nano-4B Q4_K_M | Nemotron-H | 15 tok | 215.05 s | 74.82 s | −65.2 % |
+| DeepSeek-Coder-V2-Lite Q4_K_M | DeepSeek2 | 11 tok | 153.65 s | 98.47 s | −35.9 % |
+
+Only the Llama row is a clean measurement of the matmul (43.5 ms per skipped token). The other three
+ran under variable external load or with `--ssd-streaming` forcing a lazy mmap on a resident model;
+they are real but inflated. The saving scales with prompt length.
+
+### Layer-outer prefill (Qwen3 MoE)
+
+Prefill reordered so layers are the outer loop and prompt tokens the inner one, in chunks of 64.
+Identical arithmetic and per-(layer, token) order, so output is bit-identical. Qwen3-Coder-30B,
+109-token prompt, 12 generated, 2 GB cache:
+
+| | token-outer | layer-outer | Δ |
+|---|---:|---:|---:|
+| Wall clock | 283.2 s | **65.7 s** | **−76.8 % (4.3×)** |
+| Decode | 0.4 tok/s | **1.7 tok/s** | 4.3× |
+| Cache misses | 19 989 | **14 774** | −26.1 % |
+| Hit rate | 57.0 % | **68.2 %** | +11.2 pt |
+| Read from disk | 53.35 GB | **39.52 GB** | −25.9 % |
+| Time in disk reads | 52.8 s | **17.9 s** | **−66 %** |
+| PPL / `avg_nll` | 0.98 / 0.1043 | 0.98 / 0.1043 | identical |
+
+Expert selections are identical in both runs (46 464 = 121 passes × 48 layers × 8), so only the order
+of access changed. Disk time fell 66 % against a 26 % drop in misses — the surviving misses are also
+cheaper, because consecutive tokens at one layer touch the same region of the file.
+
+
+Also applied to `DeepSeek2InferenceEngine` (DeepSeek2 / GLM-4.7-Flash), which is structurally
+identical. DeepSeek-Coder-V2-Lite Q4_K_M (9.7 GB against 7.4 GB RAM), 98-token prompt, 1.5 GB cache:
+
+| | token-outer | layer-outer | Δ |
+|---|---:|---:|---:|
+| Wall clock | 137.6 s | **84.3 s** | −38.8 % |
+| Cache misses | 11 112 | **8 726** | −21.5 % |
+| Hit rate | 34.0 % | **48.2 %** | +14.2 pt |
+| Read from disk | 59.46 GB | **46.70 GB** | −21.5 % |
+| Time in disk reads | 66.3 s | **24.7 s** | **−62.7 %** |
+| PPL / `avg_nll` | 1.00 / 0.0005 | 1.00 / 0.0005 | identical |
+
+Selections identical in both (16 848 = 108 passes × 26 MoE layers × top-6). Nemotron-H was left
+alone: the reordering would be correct, but it carries per-layer Mamba-2 recurrent state plus a
+separate GPU path, and its only MoE variant fits RAM and streams nothing.
+
+### `--expert-top-k` — speed for quality
+
+Qwen3-Coder-30B, native top-8. Wall clock was unusable under load, so the load-independent counters
+and the generated text are reported instead:
+
+| top-K | Expert work | Disk read | Hit rate | Output on *"capital of France"* |
+|---:|---:|---:|---:|---|
+| 8 | 100 % | 13.6 s | 47.8 % | `The capital of France is Paris.` |
+| 6 | 75 % | 7.2 s | 51.2 % | identical |
+| **4** | **50 %** | 4.7 s | 54.2 % | identical |
+| 2 | 25 % | 2.7 s | 55.3 % | gibberish |
+
+Usable to top-4; top-6 is the limit for bit-identical output. **The perplexity evaluator reported
+`1.00 (EXCELLENT)` for the top-2 gibberish** — it measures the model's confidence in its own
+continuation over 3 tokens, not correctness. PPL is a valid checksum for numerically-transparent
+changes but is not a quality gate for a deliberately lossy knob.
+
+### Regression sweep — `test-architectures.sh`, CPU-only
+
+Run after the F1/F2/F6 changes. **22 pass, 2 fail, 1 skip — and both failures are `exit=124`, the
+`timeout(1)` code, not crashes or wrong output.** Re-run individually with an adequate limit, both
+generate correctly:
+
+| Model | In-sweep (300 s cap) | Re-run | PPL |
+|---|---|---:|---:|
+| Mistral-7B-Instruct-v0.3 Q4_K_M | timeout | 113 s | 0.92 EXCELLENT |
+| gemma-4-12b-it Q4_K_M | timeout | 737 s | 0.99 EXCELLENT |
+
+The gemma-4-12b figure is the honest picture of a 7 GB model on a 7.4 GB box: it streams from disk,
+and 300 s was never going to be enough. Qwen3-Coder-30B is skipped by the script's own design
+(`INCLUDE_LARGE=1` to include it); it is the model all the measurements above were taken on.
+
+So the effective result is **25/25 functional**. Notably this closes the coverage gap on the four
+engines the F1 work had not exercised — Qwen3.5, LFM2, Falcon-H1 and Gemma 4 (E2B, E4B, 3n) all pass.
+
+### Measured and reverted
+
+Two rebalancings of the GQA load imbalance in `VirtualThreadMatmul.fusedMatmulQKV` (the first chunk
+carries 2048 dots against 1024 for its peers, ~62.5 % utilisation). Separate Q and K/V chunk sets:
+1/6 paired wins, +6.0 % slower. Equal-work boundaries at the same task count: 3/6, −4.2 % — noise.
+Both reverted. Load imbalance only costs you when you own the cores, and these runs had a load
+average of 6.5–9.2 on 4 cores from foreign processes.
+
+**Method note.** An unpaired A/B on this box returns whatever the background load dictates: the first
+attempt showed −18.6 % purely because external load fell during the run, and an interleaved paired
+design reversed the sign. Use paired designs and check `uptime` first.
+
+## v1.17.0-dev — SSD streaming for MoE models larger than RAM (2026-08-11)
+
+**7.8 GB RAM box** (see the note above), CPU-only (`--no-gpu`), `--temperature 0`, prompt `"Hello"`,
+`--context-length 512`. Model: `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M` (18.6 GB, 48 layers, 128
+experts, top-8) — **2.4× the machine's RAM**. Analysis in `docs/optimization/ssd-streaming-cache.md`.
+
+### The levers, 5 tokens
+
+| Configuration | Wall clock | Decode tok/s | PPL | Output |
+|---|---:|---:|---:|---|
+| Baseline v1.16.1 (cold page cache) | 152.3 s | 0.1 | 0.99 | `Hello! How can I` |
+| L0 `MADV_WILLNEED` per expert | 93.9 s | 0.1 | 0.99 | identical |
+| L0 off, control (warmer page cache) | 107.9 s | 0.1 | 0.99 | identical |
+| **L1 expert RAM cache, 2 GB** | **34.1 s** | **1.0** | 0.99 | identical |
+
+Two metrics because they measure different things. Wall clock includes prefill, where every expert
+is a cold miss, so **L1 is 3.2×** against the control. The reported tok/s is decode only
+(`genTokenCount / genTimeNs`), and there the cache does its real work: **0.1 → 1.0 tok/s**. The 3.2×
+is the honest headline.
+
+**L0 is only ~1.15×** (93.9 s against the 107.9 s control), well inside this box's noise. A
+`mincore()` probe explains it: `MADV_WILLNEED` over a 2.65 MB expert range returns success but leaves
+**32 of 647 pages resident** after 1.5 s — vboxsf caps read-ahead near 128 KB — while an explicit read
+of the same range takes 21.7 ms. The storage can serve expert-sized reads; the mmap layer cannot ask
+it to. That is what promoted the explicit-read design from optional to necessary.
+
+### Read bandwidth against request size
+
+In-process `pread`, random offsets, fixed seed, same volume. (`dd` measurements were discarded —
+~3.5 ms of fork overhead per invocation dominated them.)
+
+| Granularity | MB/s | IOPS |
+|---|---:|---:|
+| 4 KB (page fault) | 15.9 | 4058 |
+| 64 KB | 76.4 | 1223 |
+| 256 KB | 205.1 | 820 |
+| 1 MB | 395.6 | 396 |
+| 2.5 MB (one expert) | 481.7 | 194 |
+| 8 MB | 521.0 | 65 |
+| sequential | 613 | — |
+
+**~30× between page-fault and expert granularity.** The cost is per request, not per byte.
+
+### Cache budget sweep — more is not monotonically better
+
+Same model and prompt, 2 GB heap.
+
+| Budget | Slots | Hit rate | Read from disk | Read time | Wall clock |
+|---|---:|---:|---:|---:|---:|
+| 256 MB | 87 | 6.4 % | 13.40 GB | 5.7 s | 15.8 s |
+| 512 MB | 175 | 16.8 % | 11.93 GB | 5.2 s | 16.5 s |
+| 1024 MB | 350 | 31.0 % | 9.91 GB | 4.2 s | 15.6 s |
+| **2048 MB** | 701 | **48.4 %** | 7.42 GB | 4.0 s | **17.5 s** |
+| 3072 MB | 1052 | **57.3 %** | 6.14 GB | 2.6 s | **68.4 s** |
+
+The 3 GB row wins every cache-internal metric and loses 4× overall: 3 GB of slots plus a 2 GB heap on
+a 7.8 GB machine starves the page cache, which is what absorbs every miss. A warning now fires when
+budget + heap exceeds 60 % of RAM; the default (a quarter of RAM, capped at 4 GB) lands at 1.95 GB
+here, at the measured sweet spot. Note also that wall clock is flat from 256 MB to 2048 MB — with a
+warm page cache the two caches are substitutes, and L1's large win above was against a thrashing
+system.
+
+Hit rate scales cleanly with budget, and 57.3 % at ~22 experts per layer matches the top-16 figure
+from the v1.16.0 routing instrumentation, which indicates the LFU retention is holding the hot set
+rather than churning.
+
+### Second engine, and a benchmarking caveat
+
+`GLM-4.7-Flash-Q4_K_M` (18.3 GB, `deepseek2` arch, exercises `MoEFFN`): **164.8 s vs 247.1 s** for 3
+tokens — 1.5×, at a 44.5 % hit rate. The smaller gain fits its geometry: experts twice the size
+(5976 KB slots vs 2988 KB), so the same 2 GB holds 350 experts instead of 701.
+
+Its first measurement looked like a correctness failure — PPL 2.42 with the cache against 1.38
+without — and was not. The CLI defaults to `--temperature 0.7` with no seed, so both runs sampled
+stochastically. At `--temperature 0` the cache reproduces `PPL=1.38, avg_nll=0.3233` digit for digit.
+**Always compare MoE quality at `--temperature 0`:** noise in the attention output perturbs the
+router's matmul and flips the top-K selection, so a sampled run diverges for reasons unrelated to the
+change under test.
+
+### Regression
+
+Models that fit RAM are untouched — the cache never engages (`mmap.advise` is `none` when
+preloading). `Llama-3.2-1B-Instruct-Q4_K_M` PPL 0.98 (`PPL=1.11`) and `Qwen3-0.6B-Q8_0` PPL 0.99
+(`PPL=1.07`), both unchanged from before the change.
+
+## Gemma 4 family — E2B / E4B / 12B (2026-06-17)
+
+Added the full **Gemma 4** lineage: the **E2B** (2B-class) and **E4B** (4B-class) PLE models plus the
+**dense 12B**. Models downloaded from HuggingFace (`unsloth/gemma-4-{E2B,E4B,12b}-it-GGUF`, Q4_K_M).
+The implementation was cross-checked against llama.cpp `src/models/gemma4.cpp`, which surfaced five
+things the dense 12B exercises that the previously-validated E4B did not:
+
+1. **Dispatch** — dense Gemma 4 (`embedding_length_per_layer_input == 0`) was routed to the standard
+   `InferenceEngine`; it now goes to `Gemma4InferenceEngine` (which runs with PLE disabled).
+2. **Per-layer KV heads** — the 12B stores `attention.head_count_kv` as a 48-element array (8 on the
+   sliding-window layers, **1** on every 6th global layer); the scalar max over-read the K/V weights.
+3. **Double-wide MLP** — E2B/E4B store `feed_forward_length` as a per-layer array (E2B: 6144 ×15 then
+   12288 ×20); the scalar max over-read the narrow layers' gate/up/down weights.
+4. **Alternative attention** — the 12B's global layers ship **no V projection**; V is the raw K
+   projection (`Vcur = wv ? wv@x : Kcur`).
+5. **`layer_output_scale`** — was loaded only when PLE was present, so the dense 12B silently dropped
+   its trained per-layer residual scaling.
+
+All fixed; the per-layer FFN/KV and alternative-attention paths are mirrored on `Gemma4CudaForwardPass`,
+which also gained **first-N-layer partial offload** so the 12B (7 GB Q4_K_M) runs on the 6 GB RTX 4050.
+RTX 4050 Laptop, 24 tokens, prompt `"What is the capital of France? Answer in one short sentence."`,
+`--force`. CPU = `--no-gpu`. All three produce *"The capital of France is Paris."*
+
+| Model | Quant | Arch | CPU tok/s | GPU tok/s | GPU placement | PPL | Verdict |
+|-------|-------|------|----------:|----------:|---------------|----:|---------|
+| gemma-4-E2B-it (2B) | Q4_K_M | gemma4 | ~1.0 | **16.6** | 35/35 full offload | 1.00 | EXCELLENT |
+| gemma-4-E4B-it (4B) | Q4_K_M | gemma4 | ~1.9 | **11.6** | 42/42 full offload | 1.00 | EXCELLENT |
+| gemma-4-12b-it | Q4_K_M | gemma4 | ~0.8 | ~0.8 | **37/48 partial** (FP16 KV auto) | 0.91 | EXCELLENT |
+
+The 12B's partial-GPU throughput is comparable to CPU on this 6 GB card: only 37 of 48 layers fit, and
+the 11 CPU-resident layers of a 12B (plus the per-token GPU↔CPU sync) dominate the decode step — a
+12B is memory-bandwidth-bound at batch = 1. The win is correctness and fitting the model at all; on a
+larger GPU (more layers resident) the partial path scales toward the E4B numbers.
 
 ## v1.16.0 — verification sweep (2026-06-08)
 

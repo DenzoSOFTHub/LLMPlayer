@@ -104,7 +104,9 @@ public class ModelLoader {
 
         ModelArchitecture arch = config.architecture();
         boolean isMoEArch = config.expertCount() > 0;
-        if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
+        if (arch == ModelArchitecture.BAILINGMOE3) {
+            // BailingMoE3InferenceEngine loads its own tensors from the GGUF (hybrid KDA/MLA layers)
+        } else if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
             weights = loadWeights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.LFM2) {
             lfm2Weights = loadLFM2Weights(gguf, config, gpuLayers);
@@ -234,8 +236,11 @@ public class ModelLoader {
         boolean partialOffload = gpuLayers >= 0 && TensorFactory.getGpuBufferManager() != null;
         Object savedGpuManager = partialOffload ? TensorFactory.getGpuBufferManager() : null;
 
+        // Looped models (Nanbeige) store physicalBlockCount layers and reuse them for every loop;
+        // for all others the physical and logical counts are equal.
+        int physicalLayers = config.physicalBlockCount();
         TransformerLayerWeights[] layers = new TransformerLayerWeights[config.blockCount()];
-        for (int i = 0; i < config.blockCount(); i++) {
+        for (int i = 0; i < physicalLayers; i++) {
             // Disable GPU for layers beyond the limit
             if (partialOffload && i >= gpuLayers) {
                 TensorFactory.setGpuBufferManager(null);
@@ -275,6 +280,11 @@ public class ModelLoader {
                 tryLoadTensor(gguf, ArchitectureRegistry.postAttnNorm(i)),
                 tryLoadTensor(gguf, ArchitectureRegistry.postFfnNorm(i))
             );
+            // Spark2.5 per-head attention output gate (null for every other architecture)
+            layers[i].setAttnGate(tryLoadTensor(gguf, ArchitectureRegistry.attnGate(i)));
+        }
+        for (int i = physicalLayers; i < layers.length; i++) {
+            layers[i] = layers[i % physicalLayers];
         }
 
         // Restore GPU manager if it was temporarily disabled
@@ -574,6 +584,14 @@ public class ModelLoader {
             }
         }
 
+        // GLM4-MoE selection-only router bias (exp_probs_b): read per element, so it stays on CPU
+        Object gpuBeforeBias = TensorFactory.getGpuBufferManager();
+        TensorFactory.setGpuBufferManager(null);
+        for (int i = leadingDenseCount; i < blockCount; i++) {
+            layers[i].setExpProbsBias(tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i)));
+        }
+        TensorFactory.setGpuBufferManager(gpuBeforeBias);
+
         // Restore GPU manager
         if (savedGpuManager != null) {
             TensorFactory.setGpuBufferManager(savedGpuManager);
@@ -619,9 +637,11 @@ public class ModelLoader {
 
             FloatTensor opNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i)); // "operator_norm"
             FloatTensor ffnNorm = loadTensor(gguf, ArchitectureRegistry.ffnNorm(i));
-            FloatTensor ffnGate = loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
-            FloatTensor ffnUp = loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
-            FloatTensor ffnDown = loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
+            // LFM2-MoE: layers past the leading dense blocks carry routed experts instead of a dense FFN
+            boolean moeLayer = config.expertCount() > 0 && i >= config.leadingDenseBlockCount();
+            FloatTensor ffnGate = moeLayer ? null : loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+            FloatTensor ffnUp = moeLayer ? null : loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
+            FloatTensor ffnDown = moeLayer ? null : loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
 
             if (config.lfm2IsAttentionLayer(i)) {
                 layers[i] = LFM2LayerWeights.attention(opNorm, ffnNorm,
@@ -638,6 +658,18 @@ public class ModelLoader {
                     loadTensor(gguf, ArchitectureRegistry.shortconvConv(i)),
                     loadTensor(gguf, ArchitectureRegistry.shortconvOutProj(i)),
                     ffnGate, ffnUp, ffnDown);
+            }
+            if (moeLayer) {
+                // Router and expert weights stay on CPU: only top-K experts run per token
+                Object gpuForLayer = TensorFactory.getGpuBufferManager();
+                TensorFactory.setGpuBufferManager(null);
+                layers[i].setMoE(
+                    loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ffnGateExps(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i)),
+                    loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i)),
+                    tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i)));
+                TensorFactory.setGpuBufferManager(gpuForLayer);
             }
         }
         if (partialOffload) TensorFactory.setGpuBufferManager(savedGpuManager);

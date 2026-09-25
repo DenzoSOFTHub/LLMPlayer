@@ -302,6 +302,8 @@ public class BatchedCudaForwardPass implements AutoCloseable {
      * {@link CudaFloatTensor}. Caller falls back to sequential single-token forwards when false.
      */
     public static boolean isSupported(ModelConfig config, ModelWeights weights) {
+        // Layer math only the CPU TransformerBlock implements (Hunyuan, Spark2.5, looped Nanbeige)
+        if (config.requiresCpuLayerPath()) return false;
         if (config.expertCount() > 0) return false;
         if (config.useLayerNorm()) return false;
         if (config.slidingWindow() > 0) return false;           // SWA out of scope (attnPB[9]=0 only)

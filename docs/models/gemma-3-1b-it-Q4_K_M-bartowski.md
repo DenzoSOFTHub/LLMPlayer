@@ -96,7 +96,7 @@ CPU performance is identical to the official variant.
 
 Same as the official Gemma 3 1B IT Q4_K_M variant:
 
-1. Output quality limitations at 1B scale (model limitation)
+1. Wrong RoPE pairing (NORMAL instead of NEOX) until 2026-09-23, which degraded output with prompt length and was previously mistaken for a 1B-scale limitation — fixed
 2. Historical Q5_0 dequantization bug (fixed in v1.5.0)
 3. Norm weight handling (GGUF stores final values, no +1 adjustment)
 

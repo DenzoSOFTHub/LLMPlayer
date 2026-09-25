@@ -10,6 +10,7 @@ public final class GenerationRequest {
     private final boolean useChat;
     private final boolean rawMode;
     private final String cacheKey;
+    private final java.util.List<byte[]> images; // encoded images (JPEG/PNG), empty when text-only
 
     public GenerationRequest(String prompt, String systemMessage, int maxTokens,
                              SamplerConfig samplerConfig, boolean useChat) {
@@ -24,6 +25,14 @@ public final class GenerationRequest {
     public GenerationRequest(String prompt, String systemMessage, int maxTokens,
                              SamplerConfig samplerConfig, boolean useChat, boolean rawMode,
                              String cacheKey) {
+        this(prompt, systemMessage, maxTokens, samplerConfig, useChat, rawMode, cacheKey, null);
+    }
+
+    public GenerationRequest(String prompt, String systemMessage, int maxTokens,
+                             SamplerConfig samplerConfig, boolean useChat, boolean rawMode,
+                             String cacheKey, java.util.List<byte[]> images) {
+        this.images = images != null ? java.util.Collections.unmodifiableList(new java.util.ArrayList<>(images))
+                                     : java.util.Collections.<byte[]>emptyList();
         this.prompt = prompt;
         this.systemMessage = systemMessage;
         this.maxTokens = maxTokens;
@@ -42,6 +51,13 @@ public final class GenerationRequest {
     public boolean rawMode() { return rawMode; }
     /** Optional cache key for KV cache reuse across requests. */
     public String cacheKey() { return cacheKey; }
+    /**
+     * Encoded images (JPEG, PNG, ...) for a vision-capable model, in prompt order. In chat mode they
+     * are placed before the user text; in raw mode the prompt must already contain one image marker
+     * ({@link LLMEngine#imageMarker()}) per image.
+     */
+    public java.util.List<byte[]> images() { return images; }
+    public boolean hasImages() { return !images.isEmpty(); }
 
     public static Builder builder() { return new Builder(); }
 
@@ -53,6 +69,7 @@ public final class GenerationRequest {
         private boolean useChat = true;
         private boolean rawMode = false;
         private String cacheKey = null;
+        private final java.util.List<byte[]> images = new java.util.ArrayList<>();
 
         public Builder prompt(String p) { this.prompt = p; return this; }
         public Builder systemMessage(String s) { this.systemMessage = s; return this; }
@@ -61,8 +78,10 @@ public final class GenerationRequest {
         public Builder useChat(boolean uc) { this.useChat = uc; return this; }
         public Builder rawMode(boolean rm) { this.rawMode = rm; return this; }
         public Builder cacheKey(String ck) { this.cacheKey = ck; return this; }
+        public Builder image(byte[] encoded) { this.images.add(encoded); return this; }
+        public Builder images(java.util.List<byte[]> encoded) { if (encoded != null) this.images.addAll(encoded); return this; }
         public GenerationRequest build() {
-            return new GenerationRequest(prompt, systemMessage, maxTokens, samplerConfig, useChat, rawMode, cacheKey);
+            return new GenerationRequest(prompt, systemMessage, maxTokens, samplerConfig, useChat, rawMode, cacheKey, images);
         }
     }
 }

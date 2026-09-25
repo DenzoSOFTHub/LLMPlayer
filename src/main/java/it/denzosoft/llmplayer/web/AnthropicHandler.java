@@ -87,6 +87,7 @@ public class AnthropicHandler {
 
         // Convert Anthropic messages to List<String[]> for ChatTemplate
         List<String[]> messages = new ArrayList<>();
+        List<byte[]> images = new ArrayList<>();
 
         // Handle top-level system field
         Object systemObj = body.get("system");
@@ -104,7 +105,13 @@ public class AnthropicHandler {
             if (role == null) continue;
 
             Object contentObj = msg.get("content");
-            String content = extractMessageContent(contentObj);
+            String content;
+            try {
+                content = extractMessageContent(contentObj, images);
+            } catch (ImageContent.BadImageException e) {
+                sendError(exchange, 400, "invalid_request_error", e.getMessage());
+                return;
+            }
 
             if ("user".equals(role) || "assistant".equals(role)) {
                 messages.add(new String[]{role, content != null ? content : ""});
@@ -114,6 +121,11 @@ public class AnthropicHandler {
         if (messages.isEmpty() || (messages.size() == 1 && "system".equals(messages.get(0)[0]))) {
             sendError(exchange, 400, "invalid_request_error",
                     "messages must contain at least one user or assistant message");
+            return;
+        }
+        if (!images.isEmpty() && !engine.hasVision()) {
+            sendError(exchange, 400, "invalid_request_error",
+                    "the loaded model has no vision projector (load it with an mmproj file)");
             return;
         }
 
@@ -185,6 +197,7 @@ public class AnthropicHandler {
                 .useChat(false)
                 .rawMode(true)
                 .cacheKey(cacheKey)
+                .images(images)
                 .build();
 
         String modelName = engine.getModelName();
@@ -486,8 +499,20 @@ public class AnthropicHandler {
      * Extract message content from a content field.
      * Can be a string or array of content blocks (text, tool_use, tool_result).
      */
-    @SuppressWarnings("unchecked")
     private String extractMessageContent(Object contentObj) {
+        try {
+            return extractMessageContent(contentObj, null);
+        } catch (ImageContent.BadImageException e) {
+            return null; // unreachable: images are skipped when no list is given
+        }
+    }
+
+    /**
+     * As {@link #extractMessageContent(Object)}, also turning {@code image} blocks into image markers
+     * with their bytes appended to {@code images} (skipped when {@code images} is null).
+     */
+    @SuppressWarnings("unchecked")
+    private String extractMessageContent(Object contentObj, List<byte[]> images) throws ImageContent.BadImageException {
         if (contentObj instanceof String) {
             return (String) contentObj;
         }
@@ -500,6 +525,9 @@ public class AnthropicHandler {
                     if ("text".equals(type)) {
                         if (sb.length() > 0) sb.append("\n");
                         sb.append(b.get("text"));
+                    } else if ("image".equals(type) && images != null) {
+                        images.add(ImageContent.decodeAnthropicImage(b));
+                        sb.append(LLMEngine.imageMarker());
                     } else if ("tool_use".equals(type)) {
                         if (sb.length() > 0) sb.append("\n");
                         String name = (String) b.get("name");

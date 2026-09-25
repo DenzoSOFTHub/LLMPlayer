@@ -5,8 +5,8 @@ package it.denzosoft.llmplayer.inference;
  * Pre-computes cos/sin tables and applies rotation to Q and K vectors.
  *
  * Supports two modes:
- * - NORMAL (Llama, DeepSeek2): consecutive pairs (vec[2i], vec[2i+1])
- * - NEOX (Qwen, Falcon, GLM4): split-half pairs (vec[i], vec[halfRope+i])
+ * - NORMAL (Llama, DeepSeek2, GLM4): consecutive pairs (vec[2i], vec[2i+1])
+ * - NEOX (Qwen, Falcon, Gemma): split-half pairs (vec[i], vec[halfRope+i])
  *
  * Supports partial RoPE: only the first ropeDimCount dimensions are rotated,
  * the rest pass through unchanged (used by GLM4 with ropeDimCount=64, headSize=128).
@@ -189,6 +189,33 @@ public class RoPE {
             for (int h = 0; h < nHeads; h++) {
                 apply(vec, h * headSize, position);
             }
+        }
+    }
+
+    /**
+     * Section of each rotated pair for multi-axis RoPE (0 = temporal, 1 = height, 2 = width,
+     * 3 = extra), as ggml's mrope cache: sequential sections for MROPE (Qwen2-VL), interleaved
+     * t/h/w for IMROPE (Qwen3-VL), with pairs past the sections going to "extra".
+     */
+    public static int[] mropeSectionMap(int[] sections, boolean interleaved, int halfRope) {
+        return it.denzosoft.llmplayer.model.ModelConfig.mropeSectionMap(sections, interleaved, halfRope);
+    }
+
+    /**
+     * Multi-axis RoPE (NEOX pairing) on all heads: pair i rotates by the angle of position
+     * {@code pos4[sectionMap[i]]}. Positions index the precomputed tables, so each must be below
+     * maxSeqLen (true for Qwen-VL, whose rope positions never exceed the KV index).
+     */
+    public void applyMrope(float[] vec, int nHeads, int[] sectionMap, int[] pos4, float[] cosBuf, float[] sinBuf) {
+        int halfRope = ropeDimCount / 2;
+        for (int i = 0; i < halfRope; i++) {
+            int t = pos4[sectionMap[i]] * halfRope + i;
+            cosBuf[i] = cosTable[t];
+            sinBuf[i] = sinTable[t];
+        }
+        it.denzosoft.llmplayer.tensor.VectorOps vecOps = it.denzosoft.llmplayer.tensor.VectorOpsFactory.get();
+        for (int h = 0; h < nHeads; h++) {
+            vecOps.ropeNeox(vec, h * headSize, cosBuf, sinBuf, 0, halfRope);
         }
     }
 

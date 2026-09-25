@@ -88,4 +88,10 @@ public final class TransformerLayerWeights {
     public FloatTensor kNorm() { return kNorm; }
     public FloatTensor postAttnNorm() { return postAttnNorm; }
     public FloatTensor postFfnNorm() { return postFfnNorm; }
+
+    // Spark2.5: per-head attention output gate, [dim -> headCount]; the attention output of head h
+    // is multiplied by sigmoid(attnGate · normedInput)[h] before the output projection. Null elsewhere.
+    private FloatTensor attnGate;
+    public FloatTensor attnGate() { return attnGate; }
+    public void setAttnGate(FloatTensor attnGate) { this.attnGate = attnGate; }
 }

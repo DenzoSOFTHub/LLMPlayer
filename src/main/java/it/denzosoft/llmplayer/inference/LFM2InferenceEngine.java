@@ -40,6 +40,10 @@ public class LFM2InferenceEngine {
 
     private final RoPE rope;
 
+    // LFM2-MoE: per-expert views over the 3D expert tensors (no copy), so the SIMD matmulRows
+    // kernels run on each expert's rows. Null for dense LFM2.
+    private final ExpertViews expertViews;
+
     // GPU-resident forward pass (reflection-loaded from java21; null on CPU/unsupported)
     private AutoCloseable gpuForwardPass;
     private int gpuLayerCount;
@@ -79,6 +83,22 @@ public class LFM2InferenceEngine {
 
         this.rope = new RoPE(headSize, config.ropeDimensionCount(), maxSeqLen,
             config.ropeFreqBase(), config.ropeType(), ropeFreqFactors);
+
+        if (config.expertCount() > 0) {
+            int experts = config.expertCount();
+            int[] all = new int[experts];
+            for (int e = 0; e < experts; e++) all[e] = e;
+            long elementsPerSlice = (long) config.expertFfnLength() * dim;
+            this.expertViews = new ExpertViews(blockCount, experts);
+            for (int i = 0; i < blockCount; i++) {
+                LFM2LayerWeights lw = weights.layers()[i];
+                if (lw.isMoE()) {
+                    expertViews.ensure(i, lw.gateExps(), lw.upExps(), lw.downExps(), all, experts, elementsPerSlice);
+                }
+            }
+        } else {
+            this.expertViews = null;
+        }
     }
 
     public void tryInitGpuForwardPass(Object bufferManager) {
@@ -150,7 +170,11 @@ public class LFM2InferenceEngine {
 
             // ffn_norm -> SwiGLU -> residual
             VectorOpsFactory.get().rmsnorm(state.nrm, state.x, ffnNormPerLayer[layer], dim, normEps);
-            swiglu(state, lw);
+            if (lw.isMoE()) {
+                moe(state, lw, layer);
+            } else {
+                swiglu(state, lw);
+            }
             for (int i = 0; i < dim; i++) state.x[i] += state.out[i];
         }
 
@@ -185,7 +209,7 @@ public class LFM2InferenceEngine {
         final float invSqrt = 1.0f / (float) Math.sqrt(headSize);
         final KVCache kv = state.kvCache;
         final int layerF = layer, posF = position, hsF = headSize;
-        IntStream.range(0, headCount).parallel().forEach(h -> {
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOff = h * hsF;
             int kvHeadOff = kvHead * hsF;
@@ -252,6 +276,103 @@ public class LFM2InferenceEngine {
         }
         Arrays.fill(state.out, 0);
         lw.ffnDown().matmulParallel(state.gate, state.out, dim, ffnDim);
+    }
+
+    // ==================== Routed-expert FFN (LFM2-MoE) ====================
+
+    /**
+     * llama.cpp build_moe_ffn as called by lfm2.cpp: probs = sigmoid(router logits) (gating func
+     * 2); top-K selection on probs + exp_probs_b; the selected UNBIASED probs are sum-normalised
+     * (norm_w=true, clamped at the F16 epsilon) and scaled by expert_weights_scale when it is not
+     * 0 or 1; out = sum_k w_k * down_k(silu(gate_k(x)) * up_k(x)).
+     */
+    private void moe(LFM2State state, LFM2LayerWeights lw, int layer) {
+        int experts = config.expertCount();
+        int k = MoERouting.effectiveTopK(config.expertUsedCount());
+        int efd = config.expertFfnLength();
+
+        float[] probs = state.routerProbs;
+        Arrays.fill(probs, 0, experts, 0f);
+        lw.gateInp().matmul(state.nrm, probs, experts, dim);
+        boolean sigmoid = config.expertGatingFunc() == 2;
+        if (sigmoid) {
+            for (int e = 0; e < experts; e++) probs[e] = 1.0f / (1.0f + (float) Math.exp(-probs[e]));
+        } else {
+            VectorOpsFactory.get().softmax(probs, 0, experts);
+        }
+        float[] sel = state.selectionScores;
+        FloatTensor bias = lw.expProbsBias();
+        for (int e = 0; e < experts; e++) sel[e] = probs[e] + (bias != null ? bias.getFloat(e) : 0f);
+
+        // top-K by selection score (ties: lower index first, as a stable argsort)
+        int[] ids = state.selectedExperts;
+        float[] w = state.selectedWeights;
+        for (int j = 0; j < k; j++) {
+            int best = -1;
+            for (int e = 0; e < experts; e++) {
+                boolean taken = false;
+                for (int q = 0; q < j; q++) if (ids[q] == e) { taken = true; break; }
+                if (!taken && (best < 0 || sel[e] > sel[best])) best = e;
+            }
+            ids[j] = best;
+            w[j] = probs[best];
+        }
+        float sum = 0f;
+        for (int j = 0; j < k; j++) sum += w[j];
+        sum = Math.max(sum, 6.103515625e-5f);
+        float scale = config.expertWeightsScale();
+        float mul = (scale != 0f && scale != 1f) ? scale / sum : 1f / sum;
+        for (int j = 0; j < k; j++) w[j] *= mul;
+
+        // gate/up rows of all K experts as one parallel range, then SiLU*up, then the down rows
+        final int kk = k;
+        final float[] xin = state.nrm;
+        rowsOverExperts(kk, efd, (j, r0, r1) -> {
+            float[] g = state.expGate[j], u = state.expUp[j];
+            Arrays.fill(g, r0, r1, 0f);
+            Arrays.fill(u, r0, r1, 0f);
+            expertViews.get(layer, 0, ids[j]).matmulRows(xin, g, r0, r1, dim);
+            expertViews.get(layer, 1, ids[j]).matmulRows(xin, u, r0, r1, dim);
+            for (int r = r0; r < r1; r++) {
+                float gv = g[r];
+                g[r] = (gv / (1.0f + (float) Math.exp(-gv))) * u[r];
+            }
+        });
+        rowsOverExperts(kk, dim, (j, r0, r1) -> {
+            float[] o = state.expOut[j];
+            Arrays.fill(o, r0, r1, 0f);
+            expertViews.get(layer, 2, ids[j]).matmulRows(state.expGate[j], o, r0, r1, efd);
+        });
+        Arrays.fill(state.out, 0);
+        for (int j = 0; j < k; j++) {
+            VectorOpsFactory.get().saxpy(w[j], state.expOut[j], 0, state.out, 0, dim);
+        }
+    }
+
+    private interface ExpertRows { void run(int expert, int rowFrom, int rowTo); }
+
+    /**
+     * Runs {@code body} over the rows [0, rowsPerExpert) of each of {@code k} experts, splitting the
+     * k × rowsPerExpert rows into chunks across the matmul pool (a chunk never spans two experts).
+     * With top-4 routing a per-expert loop would keep only four workers busy.
+     */
+    private static void rowsOverExperts(int k, int rowsPerExpert, ExpertRows body) {
+        it.denzosoft.llmplayer.tensor.MatmulPool pool = it.denzosoft.llmplayer.tensor.MatmulPool.enabled()
+            ? it.denzosoft.llmplayer.tensor.MatmulPool.get() : null;
+        if (pool == null) {
+            it.denzosoft.llmplayer.tensor.MatmulPool.forEach(k, j -> body.run(j, 0, rowsPerExpert));
+            return;
+        }
+        pool.parallelFor(k * rowsPerExpert, 16, (from, to) -> {
+            int pos = from;
+            while (pos < to) {
+                int j = pos / rowsPerExpert;
+                int r0 = pos - j * rowsPerExpert;
+                int r1 = Math.min(rowsPerExpert, r0 + (to - pos));
+                body.run(j, r0, r1);
+                pos += r1 - r0;
+            }
+        });
     }
 
     // ==================== Utility ====================

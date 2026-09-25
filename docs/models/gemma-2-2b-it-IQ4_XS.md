@@ -122,7 +122,9 @@ Both share: pre+post norm, GQA 2:1, dual RoPE, attention logit soft-capping, GeG
 
 1. **Gemma 2 sliding window pattern was incorrect before v1.5.0:** Used the Gemma 3 every-6th-layer pattern instead of alternating. This caused incorrect attention masking on half the layers.
 
-2. **No SIMD IQ4_XS implementation:** CPU path uses scalar dequantization for IQ4_XS tensors, limiting CPU throughput to 1.1 tok/s.
+2. **Wrong RoPE pairing until 2026-09-23 (fixed):** Gemma used `ROPE_TYPE_NORMAL` instead of NEOX. Output was plausible on short prompts, but from about 75 prompt tokens the model's top prediction degenerated into whitespace. Fixed by switching the Gemma family to NEOX, as in llama.cpp; see [`../optimization/cpu-dispatch-and-kernels.md`](../optimization/cpu-dispatch-and-kernels.md).
+
+3. **IQ4_XS CPU kernel was slow until 2026-09-23 (fixed):** the SIMD kernel rebuilt a scaled codebook and index arrays with a scalar loop for every 32 weights and then gathered, limiting CPU throughput to about 1 tok/s. The codebook lookup now runs in registers: 0.85–0.97 → 3.9–4.2 Gelem/s per core, and 0.9 → 2.7 tok/s end to end together with the RoPE fix.
 
 ## Version History
 

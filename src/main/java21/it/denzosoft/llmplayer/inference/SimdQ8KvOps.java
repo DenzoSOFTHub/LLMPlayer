@@ -20,7 +20,7 @@ import jdk.incubator.vector.VectorSpecies;
  * the matching query slice. Block scale is applied on the per-block partial
  * reduction (one scalar multiply per block, not per lane).
  *
- * <p>If {@code SPECIES_PREFERRED.length() != 8} (e.g. AVX-512 or NEON 128-bit),
+ * <p>If {@code SPECIES_PREFERRED.length() < 8} (e.g. NEON 128-bit, where 256-bit shapes are emulated),
  * each method falls back to a scalar inline loop — so loading this class never
  * regresses correctness or perf vs the {@code KVCache} scalar path.
  */
@@ -30,7 +30,7 @@ public final class SimdQ8KvOps implements KVCache.Q8Ops {
     private static final VectorSpecies<Integer> I_SPECIES = IntVector.SPECIES_256;
     private static final VectorSpecies<Byte> B_SPECIES = ByteVector.SPECIES_64;
     private static final int Q8_BLOCK = 32;
-    private static final boolean SIMD_OK = FloatVector.SPECIES_PREFERRED.length() == 8;
+    private static final boolean SIMD_OK = FloatVector.SPECIES_PREFERRED.length() >= 8;
 
     public SimdQ8KvOps() {}
 

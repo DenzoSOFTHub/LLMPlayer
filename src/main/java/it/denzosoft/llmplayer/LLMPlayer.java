@@ -23,13 +23,20 @@ import java.io.IOException;
  */
 public class LLMPlayer {
 
-    public static final String VERSION = "1.16.1";
+    public static final String VERSION = "1.18.0";
 
     public static void main(String[] args) {
         System.out.println("LLMPlayer v" + VERSION + " - Pure Java LLM Inference Engine");
         System.out.println();
 
         CLIOptions options = CLIOptions.parse(args);
+
+        // Size the matmul worker pool for every launch mode (CLI, --web, GUI, fine-tune). The
+        // default is the physical core count; --threads overrides it and an explicit
+        // -Dmatmul.threads wins over both.
+        if (options.getThreads() > 0 && System.getProperty("matmul.threads") == null) {
+            System.setProperty("matmul.threads", String.valueOf(options.getThreads()));
+        }
 
         try {
             if (options.isHelp()) {

@@ -45,4 +45,14 @@ public interface LLMPlayerMXBean {
 
     // --- KV Cache ---
     long getKvCacheEstimateMB();
+
+    // --- SSD-streaming expert cache (MoE models larger than RAM); -1 when not active ---
+    boolean isExpertCacheActive();
+    double getExpertCacheHitRate();       // 0..100, -1 when inactive
+    long getExpertCacheHits();
+    long getExpertCacheMisses();
+    long getExpertCacheBytesReadMB();
+    long getExpertCacheReadTimeMs();
+    int getExpertCacheSlots();
+    long getExpertCacheSizeMB();
 }

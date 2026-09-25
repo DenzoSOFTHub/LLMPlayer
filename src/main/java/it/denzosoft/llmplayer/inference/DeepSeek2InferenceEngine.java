@@ -3,6 +3,7 @@ package it.denzosoft.llmplayer.inference;
 import it.denzosoft.llmplayer.model.DeepSeek2LayerWeights;
 import it.denzosoft.llmplayer.model.DeepSeek2Weights;
 import it.denzosoft.llmplayer.model.ModelConfig;
+import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.VectorOpsFactory;
 
 import java.util.Arrays;
@@ -30,6 +31,8 @@ public class DeepSeek2InferenceEngine {
     private final int maxSeqLen;
 
     private final boolean cpuProfile;
+    /** SSD-streaming expert cache (also held by {@link MoEFFN}), or null when the model is resident. */
+    private it.denzosoft.llmplayer.tensor.ExpertCache expertCache;
     private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
     private int profTokenCount;
 
@@ -71,6 +74,12 @@ public class DeepSeek2InferenceEngine {
         }
     }
 
+    /** Attach the SSD-streaming expert cache (models larger than RAM). */
+    public void setExpertCache(it.denzosoft.llmplayer.tensor.ExpertCache cache) {
+        this.expertCache = cache;
+        moeFFN.setExpertCache(cache);
+    }
+
     public DeepSeek2State createState(int maxSeqLen) {
         return new DeepSeek2State(config, maxSeqLen);
     }
@@ -84,17 +93,165 @@ public class DeepSeek2InferenceEngine {
     }
 
     private float[] forwardInternal(DeepSeek2State state, int token, int position, boolean computeLogits) {
-        int dim = config.embeddingLength();
-        int leadingDenseCount = config.leadingDenseBlockCount();
-        long t0 = 0, t1;
+        embedToken(state, token);
+        for (int layer = 0; layer < config.blockCount(); layer++) {
+            forwardLayer(state, layer, position);
+        }
+        if (!computeLogits) return null;
+        return outputProjection(state);
+    }
 
-        // 1. Token embedding lookup
+    /** Tokens per layer-outer prefill chunk; see {@link #forwardPrefill}. */
+    private static final int PREFILL_BATCH = Integer.getInteger("prefill.batch", 64);
+    private static final boolean PREFILL_BATCHED =
+        !"false".equals(System.getProperty("prefill.batched", "true"));
+
+    /**
+     * Prefill positions {@code fromPos..toPos-1} with the layers in the outer loop, returning the
+     * logits for the last position. Same rationale and same guarantees as
+     * {@code Qwen3MoEInferenceEngine.forwardPrefill}: identical arithmetic in an identical
+     * per-(layer, token) order, so the output is bit-identical, but the expert working set collapses
+     * from {@code layers × top-K} to the union selected by one chunk at one layer — which is what
+     * makes prefill affordable when the experts are streamed from SSD.
+     *
+     * Disable with {@code -Dprefill.batched=false}; chunk size via {@code -Dprefill.batch}.
+     */
+    public float[] forwardPrefill(DeepSeek2State state, int[] tokens, int fromPos, int toPos) {
+        int count = toPos - fromPos;
+        if (count <= 0) return null;
+        if (!PREFILL_BATCHED || count == 1) {
+            float[] logits = null;
+            for (int i = fromPos; i < toPos; i++) {
+                if (i < toPos - 1) forwardInternal(state, tokens[i], i, false);
+                else logits = forwardInternal(state, tokens[i], i, true);
+            }
+            return logits;
+        }
+        if (MoEFFN.batchAvailable()) return prefillBatched(state, tokens, fromPos, toPos);
+
+        int dim = config.embeddingLength();
+        int blockCount = config.blockCount();
+        for (int base = fromPos; base < toPos; base += PREFILL_BATCH) {
+            int n = Math.min(PREFILL_BATCH, toPos - base);
+            float[][] xs = new float[n][];
+            for (int t = 0; t < n; t++) {
+                embedToken(state, tokens[base + t]);
+                xs[t] = state.x.clone();
+            }
+            for (int layer = 0; layer < blockCount; layer++) {
+                for (int t = 0; t < n; t++) {
+                    System.arraycopy(xs[t], 0, state.x, 0, dim);
+                    forwardLayer(state, layer, base + t);
+                    System.arraycopy(state.x, 0, xs[t], 0, dim);
+                }
+            }
+            System.arraycopy(xs[n - 1], 0, state.x, 0, dim);
+        }
+        return outputProjection(state);
+    }
+
+    // Indices into DeepSeek2State.prefillBuffers
+    private static final int B_X = 0, B_XN = 1, B_XB = 2, B_HB = 3, B_HB2 = 4;
+
+    /**
+     * Layer-outer prefill with multi-token matmuls, on the CPU path: per chunk and layer, MLA
+     * ({@link MLAAttention#forwardBatch}) and the MoE FFN ({@link MoEFFN#forwardBatch}) batch every
+     * projection over the chunk — each routed expert runs once over all the tokens routed to it —
+     * while attention runs token by token in position order. Disable with {@code -Dmoe.expert.rows=false}
+     * (layer-outer order with one-token matmuls) or {@code -Dprefill.batched=false} (token by token).
+     */
+    private float[] prefillBatched(DeepSeek2State state, int[] tokens, int fromPos, int toPos) {
+        warmDecodeKernels();
+        int dim = config.embeddingLength();
+        int cap = ExpertViews.prefillChunk(expertCache, PREFILL_BATCH);
+        if (state.prefillBuffers == null || state.prefillBuffers[B_X].length < cap) {
+            int ffn = Math.max(1, config.intermediateSize());
+            state.prefillBuffers = new float[][][] {
+                new float[cap][dim], new float[cap][dim], new float[cap][dim], new float[cap][ffn], new float[cap][ffn]
+            };
+        }
+        float[][][] b = state.prefillBuffers;
+        float[][] x = b[B_X], xn = b[B_XN], xb = b[B_XB];
+        for (int base = fromPos; base < toPos; base += cap) {
+            int n = Math.min(cap, toPos - base);
+            for (int t = 0; t < n; t++) {
+                embedToken(state, tokens[base + t]);
+                System.arraycopy(state.x, 0, x[t], 0, dim);
+            }
+            for (int layer = 0; layer < config.blockCount(); layer++) {
+                DeepSeek2LayerWeights lw = weights.layers()[layer];
+                for (int t = 0; t < n; t++) {
+                    RMSNorm.apply(xn[t], x[t], cachedAttnNorm[layer], dim, config.normEps());
+                }
+                mlaAttention.forwardBatch(state, lw, layer, base, n, xn, xb);
+                for (int t = 0; t < n; t++) {
+                    VectorOpsFactory.get().accumulate(x[t], xb[t], dim);
+                    RMSNorm.apply(xn[t], x[t], cachedFfnNorm[layer], dim, config.normEps());
+                }
+                if (layer < config.leadingDenseBlockCount()) {
+                    denseFFNBatch(b, lw, n);
+                } else {
+                    moeFFN.forwardBatch(state, lw, layer, n, xn, xb);
+                }
+                for (int t = 0; t < n; t++) {
+                    VectorOpsFactory.get().accumulate(x[t], xb[t], dim);
+                }
+            }
+            if (base + n == toPos) System.arraycopy(x[n - 1], 0, state.x, 0, dim);
+        }
+        return outputProjection(state);
+    }
+
+    /** Multi-token {@link #denseFFN}: {@code xb[t] = down(silu(gate(xn[t])) * up(xn[t]))}. */
+    private void denseFFNBatch(float[][][] b, DeepSeek2LayerWeights lw, int n) {
+        int dim = config.embeddingLength();
+        int ffn = config.intermediateSize();
+        float[][] hb = b[B_HB], hb2 = b[B_HB2];
+        for (int t = 0; t < n; t++) {
+            Arrays.fill(hb[t], 0, ffn, 0f);
+            Arrays.fill(hb2[t], 0, ffn, 0f);
+        }
+        FloatTensor.fusedGateUpBatchParallel(lw.wGate(), lw.wUp(), b[B_XN], hb, hb2, n, ffn, dim);
+        for (int t = 0; t < n; t++) {
+            VectorOpsFactory.get().silu(hb[t], ffn);
+            VectorOpsFactory.get().elementwiseMul(hb[t], hb2[t], hb[t], ffn);
+            Arrays.fill(b[B_XB][t], 0, dim, 0f);
+        }
+        FloatTensor.matmulBatchParallel(lw.wDown(), hb, b[B_XB], n, dim, ffn);
+    }
+
+    /** See {@link FloatTensor#warmUpRows}: batched prefill skips the kernels decode will use. */
+    private void warmDecodeKernels() {
+        int dim = config.embeddingLength();
+        int ffn = config.intermediateSize();
+        for (int layer = 0; layer < config.blockCount(); layer++) {
+            DeepSeek2LayerWeights lw = weights.layers()[layer];
+            mlaAttention.warmUp(lw);
+            if (layer < config.leadingDenseBlockCount()) {
+                FloatTensor.warmUpRows(lw.wGate(), ffn, dim);
+                FloatTensor.warmUpRows(lw.wUp(), ffn, dim);
+                FloatTensor.warmUpRows(lw.wDown(), dim, ffn);
+            } else {
+                moeFFN.warmUp(lw);
+            }
+        }
+        FloatTensor.warmUpRows(weights.output(), config.vocabSize(), dim);
+    }
+
+    /** Load a token's embedding into the residual stream. */
+    private void embedToken(DeepSeek2State state, int token) {
+        int dim = config.embeddingLength();
         for (int i = 0; i < dim; i++) {
             state.x[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
         }
+    }
 
-        // 2. Forward through all layers
-        for (int layer = 0; layer < config.blockCount(); layer++) {
+    /** One transformer block (MLA attention + dense or MoE FFN), reading and writing {@code state.x}. */
+    private void forwardLayer(DeepSeek2State state, int layer, int position) {
+        int dim = config.embeddingLength();
+        int leadingDenseCount = config.leadingDenseBlockCount();
+        long t0 = 0, t1;
+        {
             DeepSeek2LayerWeights layerWeights = weights.layers()[layer];
 
             if (cpuProfile) t0 = System.nanoTime();
@@ -115,16 +272,19 @@ public class DeepSeek2InferenceEngine {
                 if (cpuProfile) { t1 = System.nanoTime(); profDenseFfnNs += t1 - t0; t0 = t1; }
             } else {
                 System.arraycopy(state.xb, 0, state.xbSaved, 0, dim);
-                moeFFN.forward(state, layerWeights);
+                moeFFN.forward(state, layerWeights, layer);
                 if (cpuProfile) { t1 = System.nanoTime(); profMoeFfnNs += t1 - t0; t0 = t1; }
             }
 
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
             if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; }
         }
+    }
 
-        if (!computeLogits) return null;
-
+    /** Final norm + logit projection over the current residual stream. */
+    private float[] outputProjection(DeepSeek2State state) {
+        int dim = config.embeddingLength();
+        long t0 = 0;
         if (cpuProfile) t0 = System.nanoTime();
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
         int vocabSize = config.vocabSize();

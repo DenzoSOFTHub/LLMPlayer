@@ -23,11 +23,12 @@ public class SwiGLUFFN {
 
     public SwiGLUFFN(ModelConfig config) {
         this.config = config;
-        // Gemma2/3 uses GELU activation instead of SiLU
+        // Gemma2/3 and Spark2.5 use GELU activation instead of SiLU
         this.useGelu = config.architecture() == ModelArchitecture.GEMMA2
                      || config.architecture() == ModelArchitecture.GEMMA3
                      || config.architecture() == ModelArchitecture.GEMMA4
-                     || config.architecture() == ModelArchitecture.GEMMA3N;
+                     || config.architecture() == ModelArchitecture.GEMMA3N
+                     || config.architecture() == ModelArchitecture.SPARK2_5;
     }
 
     /**
@@ -65,6 +66,36 @@ public class SwiGLUFFN {
         // xb = wDown * hb
         Arrays.fill(state.xb, 0);
         weights.wDown().matmulParallel(state.hb, state.xb, dim, ffnDim);
+    }
+
+    /** Whether {@link #forwardBatch} can run this layer: it needs separate gate and up matrices. */
+    boolean supportsBatch(TransformerLayerWeights weights) {
+        return weights.wGate() != null;
+    }
+
+    /**
+     * Multi-token forward for batched prefill: reads {@code b.xb[t]}, writes {@code b.xb[t]} for
+     * {@code t < n}. Same math as {@link #forward}; the three projections each run as one
+     * multi-token matmul.
+     */
+    void forwardBatch(PrefillBatch b, TransformerLayerWeights weights, int n) {
+        int dim = config.embeddingLength();
+        int ffnDim = config.intermediateSize();
+        for (int t = 0; t < n; t++) {
+            Arrays.fill(b.hb[t], 0, ffnDim, 0f);
+            Arrays.fill(b.hb2[t], 0, ffnDim, 0f);
+        }
+        FloatTensor.fusedGateUpBatchParallel(weights.wGate(), weights.wUp(), b.xb, b.hb, b.hb2, n, ffnDim, dim);
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(n, t -> {
+            if (useGelu) {
+                gelu(b.hb[t], ffnDim);
+            } else {
+                VectorOpsFactory.get().silu(b.hb[t], ffnDim);
+            }
+            VectorOpsFactory.get().elementwiseMul(b.hb[t], b.hb2[t], b.hb[t], ffnDim);
+            Arrays.fill(b.xb[t], 0, dim, 0f);
+        });
+        FloatTensor.matmulBatchParallel(weights.wDown(), b.hb, b.xb, n, dim, ffnDim);
     }
 
     /**

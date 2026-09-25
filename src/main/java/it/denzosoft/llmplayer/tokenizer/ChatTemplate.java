@@ -40,7 +40,11 @@ public class ChatTemplate {
         return architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN35
-                || architecture == ModelArchitecture.NEMOTRON_H;
+                || architecture == ModelArchitecture.NEMOTRON_H
+                || architecture == ModelArchitecture.NANBEIGE
+                || architecture == ModelArchitecture.SPARK2_5
+                || architecture == ModelArchitecture.BAILINGMOE3
+                || isGlmHybridThinking();
     }
 
     public String formatUserMessage(String userMessage) {
@@ -51,8 +55,15 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
-                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
+                || architecture == ModelArchitecture.NANBEIGE) {
             return formatQwen(userMessage);
+        } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
+            return formatHunyuan(userMessage);
+        } else if (architecture == ModelArchitecture.BAILINGMOE3) {
+            return formatLing(null, userMessage);
+        } else if (architecture == ModelArchitecture.SPARK2_5) {
+            return formatSpark(null, userMessage);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {
             return formatErnie(userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
@@ -87,8 +98,15 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
-                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
+                || architecture == ModelArchitecture.NANBEIGE) {
             return formatQwenChat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
+            return formatHunyuanChat(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.BAILINGMOE3) {
+            return formatLing(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.SPARK2_5) {
+            return formatSpark(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {
             return formatErnieChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.GLM4) {
@@ -137,6 +155,113 @@ public class ChatTemplate {
         return "<|begin_of_sentence|>" + systemMessage + "\nUser: " + userMessage + "\nAssistant: ";
     }
 
+    // Hunyuan dense (Hy-MT2, Hunyuan-*-Instruct). The engine prepends BOS
+    // (<｜hy_begin▁of▁sentence｜>); a system prompt is closed by <｜hy_place▁holder▁no▁3｜> and an
+    // assistant turn by <｜hy_place▁holder▁no▁2｜> (the EOS).
+    private static final String HY_USER = "<\uFF5Chy_User\uFF5C>";
+    private static final String HY_ASSISTANT = "<\uFF5Chy_Assistant\uFF5C>";
+    private static final String HY_SYS_END = "<\uFF5Chy_place\u2581holder\u2581no\u25813\uFF5C>";
+    private static final String HY_TURN_END = "<\uFF5Chy_place\u2581holder\u2581no\u25812\uFF5C>";
+
+    private String formatHunyuan(String userMessage) {
+        return HY_USER + userMessage + HY_ASSISTANT;
+    }
+
+    private String formatHunyuanChat(String systemMessage, String userMessage) {
+        return systemMessage + HY_SYS_END + HY_USER + userMessage + HY_ASSISTANT;
+    }
+
+    private String formatHunyuanConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] msg : messages) {
+            if ("system".equals(msg[0])) {
+                sb.append(msg[1]).append(HY_SYS_END);
+            } else if ("user".equals(msg[0])) {
+                sb.append(HY_USER).append(msg[1]);
+            } else if ("assistant".equals(msg[0])) {
+                sb.append(HY_ASSISTANT).append(msg[1]).append(HY_TURN_END);
+            }
+        }
+        sb.append(HY_ASSISTANT);
+        return sb.toString();
+    }
+
+    // Ling 3.0 (BailingMoE3): <role>SYSTEM</role>...detailed thinking on|off<|role_end|>, then
+    // <role>HUMAN</role>...<|role_end|> and <role>ASSISTANT</role>; the generation prompt opens
+    // <think> when thinking is on and emits an empty <think></think> otherwise.
+    private String formatLing(String systemMessage, String userMessage) {
+        java.util.List<String[]> messages = new java.util.ArrayList<>();
+        if (systemMessage != null) messages.add(new String[] {"system", systemMessage});
+        messages.add(new String[] {"user", userMessage});
+        return formatLingConversation(messages);
+    }
+
+    private String formatLingConversation(List<String[]> messages) {
+        String thinking = "detailed thinking " + (thinkingEnabled ? "on" : "off");
+        StringBuilder sb = new StringBuilder("<role>SYSTEM</role>");
+        int start = 0;
+        if (!messages.isEmpty() && "system".equals(messages.get(0)[0])) {
+            String sys = messages.get(0)[1];
+            if (sys.contains("detailed thinking on") || sys.contains("detailed thinking off")) {
+                sb.append(sys);
+            } else {
+                sb.append(sys).append('\n').append(thinking);
+            }
+            start = 1;
+        } else {
+            sb.append(thinking);
+        }
+        sb.append("<|role_end|>");
+        for (int i = start; i < messages.size(); i++) {
+            String[] msg = messages.get(i);
+            if ("user".equals(msg[0])) {
+                sb.append("<role>HUMAN</role>").append(msg[1]).append("<|role_end|>");
+            } else if ("assistant".equals(msg[0])) {
+                sb.append("<role>ASSISTANT</role>\n<think></think>").append(msg[1]).append("<|role_end|>");
+            } else if ("system".equals(msg[0])) {
+                sb.append("<role>SYSTEM</role>").append(msg[1]).append("<|role_end|>");
+            }
+        }
+        sb.append("<role>ASSISTANT</role>").append(thinkingEnabled ? "\n<think>" : "\n<think></think>");
+        return sb.toString();
+    }
+
+    // Spark2.5: every turn is <｜start▁of▁sentence｜><|Role|>...<｜end▁of▁sentence｜>. The system
+    // block always starts with the default prompt, and a user system message is appended to it.
+    // The generation prompt opens <think> when thinking is on and closes it (</think>) otherwise.
+    private static final String SPARK_BOS = "<\uFF5Cstart\u2581of\u2581sentence\uFF5C>";
+    private static final String SPARK_EOS = "<\uFF5Cend\u2581of\u2581sentence\uFF5C>";
+
+    private String formatSpark(String systemMessage, String userMessage) {
+        java.util.List<String[]> messages = new java.util.ArrayList<>();
+        if (systemMessage != null) messages.add(new String[] {"system", systemMessage});
+        messages.add(new String[] {"user", userMessage});
+        return formatSparkConversation(messages);
+    }
+
+    private String formatSparkConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(SPARK_BOS).append("<|System|>\nyou are a helpful assistant.");
+        int start = 0;
+        if (!messages.isEmpty() && "system".equals(messages.get(0)[0])) {
+            sb.append("\n\n").append(messages.get(0)[1]);
+            start = 1;
+        }
+        sb.append(SPARK_EOS);
+        for (int i = start; i < messages.size(); i++) {
+            String[] msg = messages.get(i);
+            if ("system".equals(msg[0])) {
+                sb.append(SPARK_BOS).append("<|System|>\n").append(msg[1]).append(SPARK_EOS);
+            } else if ("user".equals(msg[0])) {
+                sb.append(SPARK_BOS).append("<|User|>").append(msg[1]).append(SPARK_EOS);
+            } else if ("assistant".equals(msg[0])) {
+                sb.append(SPARK_BOS).append("<|Bot|></think>").append(msg[1]).append(SPARK_EOS);
+            }
+        }
+        sb.append(SPARK_BOS).append("<|Bot|>").append(thinkingEnabled ? "<think>" : "</think>");
+        return sb.toString();
+    }
+
     /**
      * Returns the thinking suffix for Qwen-style models.
      * When thinking is disabled: "<think>\n\n</think>\n\n" (suppresses reasoning).
@@ -149,9 +274,17 @@ public class ChatTemplate {
         if (architecture == ModelArchitecture.QWEN35) {
             return thinkingEnabled ? "" : "<think>\n\n</think>\n\n";
         }
-        // Qwen3: thinking is natural, suppress only when explicitly disabled
+        // Qwen3: thinking is natural, suppress only when explicitly disabled. Instruct-only
+        // checkpoints (Qwen3-2507-Instruct, Qwen3-VL-Instruct) have no <think> in their template
+        // and get no suffix.
         if (architecture == ModelArchitecture.QWEN3) {
+            if (chatTemplate != null && !chatTemplate.isEmpty() && !chatTemplate.contains("<think>")) return "";
             return thinkingEnabled ? "" : "<think>\n\n</think>\n\n";
+        }
+        // Nanbeige 4.2: the template opens a <think> block itself when thinking is on, and emits an
+        // empty one when enable_thinking=false.
+        if (architecture == ModelArchitecture.NANBEIGE) {
+            return thinkingEnabled ? "<think>\n" : "<think>\n\n</think>\n\n";
         }
         return "";
     }
@@ -163,8 +296,14 @@ public class ChatTemplate {
             return "<|im_start|>system\n/think<|im_end|>\n" +
                    "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n";
         }
+        if (architecture == ModelArchitecture.NANBEIGE) {
+            return formatQwenChat(NANBEIGE_DEFAULT_SYSTEM, userMessage);
+        }
         return "<|im_start|>user\n" + userMessage + "<|im_end|>\n<|im_start|>assistant\n" + thinkingSuffix();
     }
+
+    // Nanbeige 4.2's template inserts this system turn when the conversation has none.
+    private static final String NANBEIGE_DEFAULT_SYSTEM = "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。";
 
     private String formatQwenChat(String systemMessage, String userMessage) {
         // SmolLM3 with thinking: prepend /think to system message
@@ -187,12 +326,32 @@ public class ChatTemplate {
 
     // GLM4 format
     private String formatGLM4(String userMessage) {
-        return "[gMASK]<sop><|user|>\n" + userMessage + "<|assistant|>\n";
+        return "[gMASK]<sop><|user|>\n" + glmUser(userMessage) + glmGenerationPrompt();
     }
 
     private String formatGLM4Chat(String systemMessage, String userMessage) {
         return "[gMASK]<sop><|system|>\n" + systemMessage +
-               "<|user|>\n" + userMessage + "<|assistant|>\n";
+               "<|user|>\n" + glmUser(userMessage) + glmGenerationPrompt();
+    }
+
+    /**
+     * GLM-4.5 and later hybrid-reasoning templates (GLM4-MoE): thinking is on unless
+     * enable_thinking=false, which appends "/nothink" to each user turn and an empty
+     * "\n<think></think>" to the generation prompt. Other GLM4 templates are left as they were.
+     */
+    private boolean isGlmHybridThinking() {
+        return architecture == ModelArchitecture.GLM4 && chatTemplate != null
+            && chatTemplate.contains("enable_thinking") && chatTemplate.contains("<think></think>");
+    }
+
+    private String glmUser(String content) {
+        if (isGlmHybridThinking() && !thinkingEnabled && !content.endsWith("/nothink")) return content + "/nothink";
+        return content;
+    }
+
+    private String glmGenerationPrompt() {
+        if (isGlmHybridThinking()) return thinkingEnabled ? "<|assistant|>" : "<|assistant|>\n<think></think>";
+        return "<|assistant|>\n";
     }
 
     // DeepSeek format (BOS is prepended by engine, not included here)
@@ -236,8 +395,15 @@ public class ChatTemplate {
         } else if (architecture == ModelArchitecture.QWEN2 || architecture == ModelArchitecture.QWEN3
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
-                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1) {
+                || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
+                || architecture == ModelArchitecture.NANBEIGE) {
             return formatQwenConversation(messages);
+        } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
+            return formatHunyuanConversation(messages);
+        } else if (architecture == ModelArchitecture.BAILINGMOE3) {
+            return formatLingConversation(messages);
+        } else if (architecture == ModelArchitecture.SPARK2_5) {
+            return formatSparkConversation(messages);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {
             return formatErnieConversation(messages);
         } else if (architecture == ModelArchitecture.GLM4) {
@@ -286,6 +452,10 @@ public class ChatTemplate {
                 sb.append("<|im_start|>system\n/think<|im_end|>\n");
             }
         }
+        if (architecture == ModelArchitecture.NANBEIGE
+                && (messages.isEmpty() || !"system".equals(messages.get(0)[0]))) {
+            sb.append("<|im_start|>system\n").append(NANBEIGE_DEFAULT_SYSTEM).append("<|im_end|>\n");
+        }
         for (String[] msg : messages) {
             sb.append("<|im_start|>").append(msg[0]).append("\n");
             // SmolLM3 with thinking: prepend /think to system message content
@@ -325,11 +495,21 @@ public class ChatTemplate {
 
     private String formatGLM4Conversation(List<String[]> messages) {
         StringBuilder sb = new StringBuilder("[gMASK]<sop>");
+        boolean hybrid = isGlmHybridThinking();
         for (String[] msg : messages) {
+            if (hybrid && "assistant".equals(msg[0])) {
+                // Past turns carry an empty think block and the visible answer only
+                String content = msg[1];
+                int end = content.indexOf("</think>");
+                if (end >= 0) content = content.substring(end + "</think>".length());
+                sb.append("<|assistant|>\n<think></think>");
+                if (!content.trim().isEmpty()) sb.append('\n').append(content.trim());
+                continue;
+            }
             sb.append("<|").append(msg[0]).append("|>\n");
-            sb.append(msg[1]);
+            sb.append("user".equals(msg[0]) ? glmUser(msg[1]) : msg[1]);
         }
-        sb.append("<|assistant|>\n");
+        sb.append(glmGenerationPrompt());
         return sb.toString();
     }
 

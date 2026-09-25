@@ -57,4 +57,25 @@ public final class LFM2LayerWeights {
     public FloatTensor ffnGate() { return ffnGate; }
     public FloatTensor ffnUp() { return ffnUp; }
     public FloatTensor ffnDown() { return ffnDown; }
+
+    // LFM2-MoE (LFM2.5-8B-A1B): layers >= leading_dense_block_count replace the dense SwiGLU with
+    // routed experts (ffnGate/ffnUp/ffnDown are then null). 3D expert tensors hold all experts
+    // back to back; expProbsBias is the selection-only bias of sigmoid routing.
+    private FloatTensor gateInp, gateExps, upExps, downExps, expProbsBias;
+
+    public void setMoE(FloatTensor gateInp, FloatTensor gateExps, FloatTensor upExps,
+                       FloatTensor downExps, FloatTensor expProbsBias) {
+        this.gateInp = gateInp;
+        this.gateExps = gateExps;
+        this.upExps = upExps;
+        this.downExps = downExps;
+        this.expProbsBias = expProbsBias;
+    }
+
+    public boolean isMoE() { return gateInp != null; }
+    public FloatTensor gateInp() { return gateInp; }
+    public FloatTensor gateExps() { return gateExps; }
+    public FloatTensor upExps() { return upExps; }
+    public FloatTensor downExps() { return downExps; }
+    public FloatTensor expProbsBias() { return expProbsBias; }
 }
