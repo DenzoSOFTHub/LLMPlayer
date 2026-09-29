@@ -1,6 +1,6 @@
 # LLMPlayer — What's New
 
-## Unreleased
+## v1.19.1 — Attention score stride fix for Falcon-H1 and Gemma 4 (2026-09-29)
 
 - **Falcon-H1 and Gemma 4 (including Gemma 3n) CPU attention on small states.** Both engines indexed
   the attention score buffer with the engine's context length instead of the state's own, the

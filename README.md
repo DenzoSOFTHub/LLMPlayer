@@ -1,6 +1,10 @@
-# LLMPlayer v1.19.0
+# LLMPlayer v1.19.1
 
 Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 30 architectures (plus the Qwen-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE and Qwen3-TTS variants), with **image input** for Qwen3-VL, Qwen3.5 and Qwen2.5-VL and **text-to-speech** with Qwen3-TTS, including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), **Falcon-H1** (parallel Mamba-2 + attention hybrid), and **MiniMax-M2**. 20 quantized formats (IQ1_M and IQ2_XXS included), every one with a dedicated CUDA kernel. Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Qwen3.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, the attention half of MoE models on the GPU with a hybrid GPU expert cache, batched GPU prefill through cuBLAS, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads), **lazy mmap for models larger than RAM** and **SSD streaming with a hot-expert RAM cache** (`--ssd-streaming`) for MoE models that exceed it, an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.19.1
+
+**A bug-fix release.** The Falcon-H1 and Gemma 4 (including Gemma 3n) CPU attention indexed its score buffer with the engine's context length instead of the state's own, so a state created shorter than the engine's context failed with an index out of bounds past position 0. v1.19.0 had fixed the same defect in the Qwen3.5 engine. Normal runs, where the state has the engine's context, were not affected.
 
 ### What's new in v1.19.0
 

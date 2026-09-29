@@ -8,7 +8,7 @@ When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CA
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine (v1.19.0) that runs GGUF models locally with **zero external dependencies** — only the JDK. It supports 30 architectures (plus aliased variants: Qwen2.5-VL, Qwen3-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE, the Qwen3-TTS talker) across nine inference engines and 20 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). Every one of those formats has a dedicated CUDA tensor class for GPU acceleration.
+LLMPlayer is a pure Java LLM inference engine (v1.19.1) that runs GGUF models locally with **zero external dependencies** — only the JDK. It supports 30 architectures (plus aliased variants: Qwen2.5-VL, Qwen3-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE, the Qwen3-TTS talker) across nine inference engines and 20 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). Every one of those formats has a dedicated CUDA tensor class for GPU acceleration.
 
 Beyond text generation it includes image input for Qwen3-VL, Qwen3.5 and Qwen2.5-VL (llama.cpp `mmproj` files), Qwen3-TTS text-to-speech, CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
 
