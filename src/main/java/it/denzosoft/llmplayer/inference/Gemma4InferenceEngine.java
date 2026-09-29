@@ -849,6 +849,9 @@ public class Gemma4InferenceEngine {
         // Parallel attention over heads
         final int kvMulLayer = layerKvMul;
         final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
+        // Row stride of the score buffer: the state's own capacity, which may be smaller than the
+        // engine's context (a state created with a smaller createState length)
+        final int attStride = state.att.length / headCount;
         it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMulLayer;
             int qOffset = h * hs;
@@ -856,30 +859,30 @@ public class Gemma4InferenceEngine {
             // Compute attention scores
             for (int t = startPos; t < seqLen; t++) {
                 float score = ops.dot(qBuf, qOffset, keyCache, t * kvCacheDim + kvHead * hs, hs);
-                state.att[h * maxSeqLen + t] = score * attnScale;
+                state.att[h * attStride + t] = score * attnScale;
             }
 
             // Softmax
             float maxVal = Float.NEGATIVE_INFINITY;
             for (int t = startPos; t < seqLen; t++) {
-                if (state.att[h * maxSeqLen + t] > maxVal) maxVal = state.att[h * maxSeqLen + t];
+                if (state.att[h * attStride + t] > maxVal) maxVal = state.att[h * attStride + t];
             }
             float sum = 0f;
             for (int t = startPos; t < seqLen; t++) {
-                float v = (float) Math.exp(state.att[h * maxSeqLen + t] - maxVal);
-                state.att[h * maxSeqLen + t] = v;
+                float v = (float) Math.exp(state.att[h * attStride + t] - maxVal);
+                state.att[h * attStride + t] = v;
                 sum += v;
             }
             float invSum = 1.0f / sum;
             for (int t = startPos; t < seqLen; t++) {
-                state.att[h * maxSeqLen + t] *= invSum;
+                state.att[h * attStride + t] *= invSum;
             }
 
             // Weighted V sum → xb2 (per element, still accumulated in position order)
             int outOffset = h * hs;
             Arrays.fill(xb2Buf, outOffset, outOffset + hs, 0f);
             for (int t = startPos; t < seqLen; t++) {
-                ops.saxpy(state.att[h * maxSeqLen + t], valueCache, t * kvCacheDim + kvHead * hs,
+                ops.saxpy(state.att[h * attStride + t], valueCache, t * kvCacheDim + kvHead * hs,
                         xb2Buf, outOffset, hs);
             }
         });
@@ -1334,31 +1337,34 @@ public class Gemma4InferenceEngine {
 
         final float attnScale = 1.0f;
         final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
+        // Row stride of the score buffer: the state's own capacity, which may be smaller than the
+        // engine's context (a state created with a smaller createState length)
+        final int attStride = state.att.length / headCount;
         it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOffset = h * hs;
             for (int t = startPos; t < seqLen; t++) {
                 float score = ops.dot(qBuf, qOffset, keyCache, t * kvCacheDim + kvHead * hs, hs);
-                state.att[h * maxSeqLen + t] = score * attnScale;
+                state.att[h * attStride + t] = score * attnScale;
             }
             // Softmax
             float maxVal = Float.NEGATIVE_INFINITY;
             for (int t = startPos; t < seqLen; t++) {
-                if (state.att[h * maxSeqLen + t] > maxVal) maxVal = state.att[h * maxSeqLen + t];
+                if (state.att[h * attStride + t] > maxVal) maxVal = state.att[h * attStride + t];
             }
             float sum = 0f;
             for (int t = startPos; t < seqLen; t++) {
-                float v = (float) Math.exp(state.att[h * maxSeqLen + t] - maxVal);
-                state.att[h * maxSeqLen + t] = v;
+                float v = (float) Math.exp(state.att[h * attStride + t] - maxVal);
+                state.att[h * attStride + t] = v;
                 sum += v;
             }
             float invSum = 1.0f / sum;
-            for (int t = startPos; t < seqLen; t++) state.att[h * maxSeqLen + t] *= invSum;
+            for (int t = startPos; t < seqLen; t++) state.att[h * attStride + t] *= invSum;
             // Weighted V sum (per element, still accumulated in position order)
             int outOffset = h * hs;
             Arrays.fill(xb2Buf, outOffset, outOffset + hs, 0f);
             for (int t = startPos; t < seqLen; t++) {
-                ops.saxpy(state.att[h * maxSeqLen + t], valueCache, t * kvCacheDim + kvHead * hs,
+                ops.saxpy(state.att[h * attStride + t], valueCache, t * kvCacheDim + kvHead * hs,
                         xb2Buf, outOffset, hs);
             }
         });

@@ -1,5 +1,14 @@
 # LLMPlayer — What's New
 
+## Unreleased
+
+- **Falcon-H1 and Gemma 4 (including Gemma 3n) CPU attention on small states.** Both engines indexed
+  the attention score buffer with the engine's context length instead of the state's own, the
+  defect v1.19.0 fixed in the Qwen3.5 engine: a state created shorter than the engine's context
+  failed with an index out of bounds at the first attention layer past position 0. The stride is now
+  the state's capacity. Decoding on a short state now matches a full-length one (argmax equal at
+  every position; logit differences of 1.5e-5 to 8e-4, the same as between two full-length states).
+
 ## v1.19.0 — GPU/CUDA overhaul, MoE models on the GPU, MiniMax-M2 and Qwen3.5-MoE (2026-09-29)
 
 An audit of the CUDA integration found correctness bugs (a cached conversation could attend over

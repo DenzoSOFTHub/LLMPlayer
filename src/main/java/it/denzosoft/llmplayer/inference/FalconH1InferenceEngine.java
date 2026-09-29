@@ -191,18 +191,21 @@ public class FalconH1InferenceEngine {
             ? config.attentionScale() : (1.0f / (float) Math.sqrt(headSize));
         final KVCache kv = state.kvCache;
         final int layerF = layer, posF = position, hsF = headSize;
+        // Row stride of the score buffer: the state's own capacity, which may be smaller than the
+        // engine's context (a state created with a smaller createState length)
+        final int attStride = state.att.length / headCount;
         it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOff = h * hsF;
             int kvHeadOff = kvHead * hsF;
             for (int t = 0; t <= posF; t++) {
-                state.att[h * maxSeqLen + t] = kv.dotK(layerF, t, kvHeadOff, hsF, state.q, qOff) * invSqrt;
+                state.att[h * attStride + t] = kv.dotK(layerF, t, kvHeadOff, hsF, state.q, qOff) * invSqrt;
             }
-            softmax(state.att, h * maxSeqLen, posF + 1);
+            softmax(state.att, h * attStride, posF + 1);
             int outOff = h * hsF;
             Arrays.fill(state.attBuf, outOff, outOff + hsF, 0);
             for (int t = 0; t <= posF; t++) {
-                kv.saxpyV(layerF, t, kvHeadOff, hsF, state.att[h * maxSeqLen + t], state.attBuf, outOff);
+                kv.saxpyV(layerF, t, kvHeadOff, hsF, state.att[h * attStride + t], state.attBuf, outOff);
             }
         });
 

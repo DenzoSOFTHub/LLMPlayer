@@ -1609,7 +1609,8 @@ in the plan, and each distorted either the output or a measurement:
 The placement calibrator also exposed a latent bug in the CPU attention of the Qwen3.5 engine,
 which indexed the score buffer with the engine's context length instead of the state's own: any
 state smaller than the engine's context (the calibrator's) failed with an index out of bounds at
-the first attention layer past position 0.
+the first attention layer past position 0. The Falcon-H1 and Gemma 4 engines had the same pattern
+and were fixed after the v1.19.0 release.
 
 ### 8.2 What was implemented, fix by fix
 
