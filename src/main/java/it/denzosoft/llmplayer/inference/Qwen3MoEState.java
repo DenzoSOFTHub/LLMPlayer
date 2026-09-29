@@ -46,6 +46,8 @@ public class Qwen3MoEState {
     int[] prefillGroupStart;  // [expertCount + 1] start of each expert's run in prefillGroupSlots
     int[] prefillGroupSlots;  // [chunk * topK] (token, slot) indices grouped by expert
     int[] prefillUsed;        // [expertCount] distinct experts of the current layer
+    int[] prefillCpuUsed;     // [expertCount] the ones the GPU expert cache does not compute
+    boolean[] prefillOnGpu;   // [expertCount] computed by the GPU expert cache in this layer
 
     public Qwen3MoEState(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();

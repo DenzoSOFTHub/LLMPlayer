@@ -81,6 +81,14 @@ public final class ModelConfig {
     public void setRopeDimCountSwa(int v) { this.ropeDimCountSwa = v; }
     public boolean[] slidingWindowPattern() { return slidingWindowPattern; }
 
+    // DeepSeek2 MLA with separate attn_k_b / attn_v_b tensors (GGUFs that carry key_length_mla,
+    // e.g. GLM-4.7-Flash): attention can run in the latent space, caching only the normalized
+    // latent and the rotated k_rope per token (kvLoraRank + ropeDim floats shared by every head)
+    // instead of decompressed per-head K and V.
+    private boolean mlaLatentCache;
+    /** Whether the MLA KV cache holds the shared latent (see {@code mlaLatentCache}). */
+    public boolean mlaLatentCache() { return mlaLatentCache; }
+
     // Nanbeige looped depth: the GGUF stores physicalBlockCount layers that are run numLoops times
     // with shared weights (llama.cpp nanbeige.cpp). blockCount() is the LOGICAL layer count
     // (physical × loops): every logical layer has its own KV-cache slot, and the model's output norm
@@ -419,7 +427,8 @@ public final class ModelConfig {
                 || arch == ModelArchitecture.LFM2 || arch == ModelArchitecture.FALCON_H1
                 || arch == ModelArchitecture.GEMMA2 || arch == ModelArchitecture.GEMMA3
                 || arch == ModelArchitecture.GEMMA3N || arch == ModelArchitecture.GEMMA4
-                || arch == ModelArchitecture.HUNYUAN_DENSE || arch == ModelArchitecture.SPARK2_5) {
+                || arch == ModelArchitecture.HUNYUAN_DENSE || arch == ModelArchitecture.SPARK2_5
+                || arch == ModelArchitecture.MINIMAX_M2) {
             ropeType = 2;  // ROPE_TYPE_NEOX
         } else if (arch == ModelArchitecture.QWEN35) {
             ropeType = 2;  // ROPE_TYPE_NEOX (IMROPE uses split-half pairing like NEOX)
@@ -442,10 +451,12 @@ public final class ModelConfig {
         // For DeepSeek2/GLM-4.7-Flash: key_length_mla / value_length_mla are the per-head MLA dims.
         // key_length=576 is the compressed KV dim, key_length_mla=256 is the actual per-head key dim.
         // When present, override keyLength/valueLength for MLA attention.
+        boolean mlaSeparateKvB = false;
         if (arch == ModelArchitecture.DEEPSEEK2) {
             int keyLengthMla = metadata.getInt(prefix + "attention.key_length_mla", 0);
             int valueLengthMla = metadata.getInt(prefix + "attention.value_length_mla", 0);
             if (keyLengthMla > 0) keyLength = keyLengthMla;
+            mlaSeparateKvB = keyLengthMla > 0 && kvLoraRank > 0;
             if (valueLengthMla > 0) valueLength = valueLengthMla;
         }
 
@@ -575,7 +586,7 @@ public final class ModelConfig {
             fullAttentionInterval, noRopeLayerInterval,
             qLoraRank, expertGatingFunc, expertWeightsScale);
 
-        if ("qwen3vl".equals(archName) || "qwen2vl".equals(archName) || "qwen35".equals(archName)
+        if ("qwen3vl".equals(archName) || "qwen2vl".equals(archName) || "qwen35".equals(archName) || "qwen35moe".equals(archName)
                 || "qwen3tts".equals(archName)) {
             int[] sections = metadata.getIntArray(prefix + "rope.dimension_sections");
             if (sections != null && sections.length >= 3) {
@@ -584,7 +595,10 @@ public final class ModelConfig {
             }
             config.nDeepstackLayers = metadata.getInt(prefix + "n_deepstack_layers", 0);
         }
-        config.expertWeightsNorm = metadata.getBoolean(prefix + "expert_weights_norm", false);
+        // MiniMax-M2 always renormalises the selected weights (llama.cpp minimax-m2.cpp passes
+        // norm_w = true) and its GGUFs carry no expert_weights_norm key.
+        config.expertWeightsNorm = metadata.getBoolean(prefix + "expert_weights_norm",
+            arch == ModelArchitecture.MINIMAX_M2);
         config.numLoops = numLoops;
         config.physicalBlockCount = physicalBlockCount;
         config.skipLoopFinalNorm = metadata.getBoolean(prefix + "skip_loop_final_norm", false);
@@ -594,6 +608,7 @@ public final class ModelConfig {
         if (perLayerFfnLength != null) config.perLayerFfnLength = perLayerFfnLength;
 
         if (expertSharedFfnLength > 0) config.setExpertSharedFeedForwardLength(expertSharedFfnLength);
+        config.mlaLatentCache = mlaSeparateKvB && !"false".equals(System.getProperty("mla.latent", "true"));
 
         // Set Granite scaling factors (must be mutable fields since constructor has too many params)
         if (embeddingScale != 0) config.setEmbeddingScale(embeddingScale);

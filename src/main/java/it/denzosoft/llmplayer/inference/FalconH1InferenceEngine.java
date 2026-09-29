@@ -38,9 +38,8 @@ public class FalconH1InferenceEngine {
     private final RoPE rope;
 
     // GPU-resident forward pass (reflection-loaded from java21; null on CPU/unsupported)
-    private AutoCloseable gpuForwardPass;
+    private LayerGpuForwardPass gpuForwardPass;
     private int gpuLayerCount;
-    private Method gpuUploadX, gpuForwardLayer, gpuForwardFinalLogits, gpuDownloadX;
 
     public FalconH1InferenceEngine(ModelConfig config, FalconH1Weights weights, int maxSeqLen, float[] ropeFreqFactors) {
         this.config = config;
@@ -85,12 +84,8 @@ public class FalconH1InferenceEngine {
             if (!(Boolean) isSup.invoke(null, config, weights)) return;
             Object fwd = cls.getConstructor(ModelConfig.class, FalconH1Weights.class,
                     bufferManager.getClass(), int.class).newInstance(config, weights, bufferManager, maxSeqLen);
-            gpuUploadX = cls.getMethod("uploadXAndUpdateParams", float[].class, int.class);
-            gpuForwardLayer = cls.getMethod("forwardLayer", int.class, int.class);
-            gpuForwardFinalLogits = cls.getMethod("forwardFinalLogits", float[].class);
-            gpuDownloadX = cls.getMethod("downloadX", float[].class);
             gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
-            gpuForwardPass = (AutoCloseable) fwd;
+            gpuForwardPass = (LayerGpuForwardPass) fwd;
             System.err.println("Falcon-H1 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
         } catch (Throwable e) {
             System.err.println("Falcon-H1 CUDA forward pass: unavailable — " + e.getMessage());
@@ -98,11 +93,23 @@ public class FalconH1InferenceEngine {
     }
 
     private float[] forwardGpu(FalconH1State state, int position, boolean computeLogits) throws Exception {
-        gpuUploadX.invoke(gpuForwardPass, state.x, position);
-        for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
+        gpuForwardPass.uploadXAndUpdateParams(state.x, position);
+        // Graph replay: all layers (+ output projection when logits are needed) in one launch
+        if (computeLogits) {
+            if (gpuForwardPass.forwardGraph(state.logits)) return state.logits;
+        } else if (gpuForwardPass.forwardGraphPrefill()) {
+            return null;
+        }
+        for (int i = 0; i < gpuLayerCount; i++) gpuForwardPass.forwardLayer(i, position);
         if (!computeLogits) return null;
-        gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
+        gpuForwardPass.forwardFinalLogits(state.logits);
         return state.logits;
+    }
+
+
+    /** True when a GPU-resident forward pass (which owns the device-side state) is active. */
+    public boolean hasGpuForwardPass() {
+        return gpuForwardPass != null;
     }
 
     public FalconH1State createState(int maxSeqLen) { return new FalconH1State(config, maxSeqLen); }
@@ -127,8 +134,15 @@ public class FalconH1InferenceEngine {
             try {
                 return forwardGpu(state, position, computeLogits);
             } catch (Exception e) {
-                System.err.println("Falcon-H1 GPU forward failed: " + e.getMessage());
+                System.err.println("Falcon-H1 GPU forward failed: " + GpuFailureException.describe(e));
+                // The pass owned the device KV cache / recurrent state for every earlier position:
+                // the CPU can take over only at position 0 (see InferenceEngine.forwardGpu).
+                AutoCloseable failed = gpuForwardPass;
                 gpuForwardPass = null;
+                try { failed.close(); } catch (Exception ignored) { }
+                if (position > 0) {
+                    throw new GpuFailureException("GPU forward pass failed at position " + position, e);
+                }
             }
         }
 

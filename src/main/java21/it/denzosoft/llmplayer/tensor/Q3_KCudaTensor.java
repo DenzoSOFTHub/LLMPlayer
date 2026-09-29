@@ -70,7 +70,7 @@ public class Q3_KCudaTensor extends CudaFloatTensor {
     }
 
     @Override
-    public float dot(long thisOffset, float[] other, int otherOffset, int length) {
+    protected float dotScalar(long thisOffset, float[] other, int otherOffset, int length) {
         float result = 0f;
         int numBlocks = length / BLOCK_SIZE;
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;

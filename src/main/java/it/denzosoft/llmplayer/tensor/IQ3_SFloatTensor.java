@@ -73,7 +73,7 @@ public class IQ3_SFloatTensor extends FloatTensor {
         int qsIdx = (j / 32) * 8 + 2 * l + gridQuad;
         int qsLow = Byte.toUnsignedInt(data.getByte(bo + OFF_QS + qsIdx));
 
-        int qhByte = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4 + qhOffset));
+        int qhByte = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 + qhOffset));
         // High bit extraction: same as llama.cpp (qh[x] << (8-2*l)) & 256 or (qh[x] << (7-2*l)) & 256
         int highBit;
         if (gridQuad == 0) {
@@ -117,7 +117,7 @@ public class IQ3_SFloatTensor extends FloatTensor {
                 float db2 = d * (1 + 2 * ((scaleByte >> 4) & 0x0F));
 
                 // First 32 weights of pair
-                int qhByte0 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4));
+                int qhByte0 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32));
                 int qsBase1 = ib32 * 8;
                 int signBase1 = ib32 * 4;
 
@@ -141,7 +141,7 @@ public class IQ3_SFloatTensor extends FloatTensor {
                 }
 
                 // Second 32 weights of pair
-                int qhByte1 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4 + 1));
+                int qhByte1 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 + 1));
                 int qsBase2 = (ib32 + 1) * 8;
                 int signBase2 = (ib32 + 1) * 4;
 

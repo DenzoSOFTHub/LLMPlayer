@@ -66,7 +66,7 @@ public class SimdIQ3_SFloatTensor extends IQ3_SFloatTensor {
                 float db2 = d * (1 + 2 * ((scaleByte >> 4) & 0x0F));
 
                 // First 32 weights of pair
-                int qhByte0 = Byte.toUnsignedInt(qhBytes[ib32 / 2]);
+                int qhByte0 = Byte.toUnsignedInt(qhBytes[ib32]);
                 int qsBase1 = ib32 * 8;
                 int signBase1 = ib32 * 4;
 
@@ -103,7 +103,7 @@ public class SimdIQ3_SFloatTensor extends IQ3_SFloatTensor {
                 outIdx += 32;
 
                 // Second 32 weights of pair
-                int qhByte1 = Byte.toUnsignedInt(qhBytes[ib32 / 2 + 1]);
+                int qhByte1 = Byte.toUnsignedInt(qhBytes[ib32 + 1]);
                 int qsBase2 = (ib32 + 1) * 8;
                 int signBase2 = (ib32 + 1) * 4;
 

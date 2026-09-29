@@ -101,7 +101,14 @@ public class MLAAttention {
         normLatent(state.kvCompressed, state.kvLatentNormed, layer);
 
         // 5. KV decompression → K_nope and V per head
-        if (weights.hasSeparateKVB()) {
+        if (config.mlaLatentCache() && weights.hasSeparateKVB()) {
+            // Latent attention: no per-head K/V at all
+            System.arraycopy(state.kvLatentNormed, 0, state.kvCompressed, 0, kvLoraRank);
+            attentionLatent(state, weights, layer, position);
+            Arrays.fill(state.xb, 0);
+            weights.wo().matmulParallel(state.xb2, state.xb, dim, totalValDim);
+            return;
+        } else if (weights.hasSeparateKVB()) {
             // Separate K_B (transposed) and V_B (standard) per head
             decompressKVSeparate(state, weights, headCount, keyNope, valueLength, kvLoraRank);
         } else {
@@ -181,8 +188,9 @@ public class MLAAttention {
         }
 
         // 7. Store K and V in cache (transparently quantized if -Dkv.q8=true)
-        state.kvCache.storeK(layer, position, state.k, totalKeyDim);
-        state.kvCache.storeV(layer, position, state.v, totalValDim);
+        KVCache kvStore = state.kvCache();
+        kvStore.storeK(layer, position, state.k, totalKeyDim);
+        kvStore.storeV(layer, position, state.v, totalValDim);
 
         // 8. Attention computation - parallel over heads
         float mscale = rope.getMscale();
@@ -190,7 +198,7 @@ public class MLAAttention {
 
         Arrays.fill(state.xb2, 0, totalValDim, 0f);
 
-        final KVCache kv = state.kvCache;
+        final KVCache kv = kvStore;
         final int layerFinal = layer;
         final int positionFinal = position;
         final int keyLengthFinal = keyLength;
@@ -216,6 +224,72 @@ public class MLAAttention {
             for (int t = 0; t <= positionFinal; t++) {
                 float a = state.att[attOffset + t];
                 kv.saxpyV(layerFinal, t, vHeadOff, valueLengthFinal, a, state.xb2, outOffset);
+            }
+        });
+    }
+
+    /**
+     * MLA in the latent space (weight absorption, as llama.cpp does for GGUFs with separate
+     * attn_k_b / attn_v_b). The cache holds, per token, the normalized latent and the rotated k_rope
+     * ({@code kvLoraRank + ropeDim} floats shared by every head) instead of decompressed per-head K
+     * and V. Per head: {@code q_lat = W_kb[h] · q_nope[h]}, score = {@code scale * ([q_lat, q_rope] ·
+     * cache[t])}, softmax, {@code o_lat = sum_t p_t * latent[t]}, and {@code out[h] = W_vb[h] · o_lat}.
+     * Same result as decompressing K = W_kb^T latent and V = W_vb latent, up to summation order.
+     *
+     * <p>Expects {@code state.kvCompressed = [normalized latent | raw k_rope]} and {@code state.q};
+     * writes the attention output, before Wo, to {@code state.xb2}.
+     */
+    private void attentionLatent(DeepSeek2State state, DeepSeek2LayerWeights weights, int layer, int position) {
+        final int headCount = config.headCount();
+        final int keyLength = config.keyLength();
+        final int valueLength = config.valueLength();
+        final int kvLoraRank = config.kvLoraRank();
+        final int ropeDim = config.ropeDimensionCount();
+        final int keyNope = keyLength - ropeDim;
+        final int entry = kvLoraRank + ropeDim;
+
+        // Cache entry: [latent | rotated k_rope]
+        rope.apply(state.kvCompressed, kvLoraRank, position);
+        float[] cache = state.mlaLatentLayer(layer, entry);
+        System.arraycopy(state.kvCompressed, 0, cache, position * entry, entry);
+
+        for (int h = 0; h < headCount; h++) rope.apply(state.q, h * keyLength + keyNope, position);
+
+        float mscale = rope.getMscale();
+        final float scale = mscale * mscale / (float) Math.sqrt(keyLength);
+        final float[] qLat = state.mlaQLatent(headCount * entry);
+        final float[] oLat = state.mlaOLatent(headCount * kvLoraRank);
+        final FloatTensor wkB = weights.wkB();
+        final FloatTensor wvB = weights.wvB();
+        final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
+        final int seq = position + 1;
+
+        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
+            int qOff = h * entry;
+            // q_lat = W_kb[h] · q_nope (W_kb[h]: kvLoraRank rows of keyNope), then the rope part
+            long kbBase = (long) h * kvLoraRank * keyNope;
+            for (int r = 0; r < kvLoraRank; r++) {
+                qLat[qOff + r] = wkB.dot(kbBase + (long) r * keyNope, state.q, h * keyLength, keyNope);
+            }
+            System.arraycopy(state.q, h * keyLength + keyNope, qLat, qOff + kvLoraRank, ropeDim);
+
+            int attOff = h * seq;
+            for (int t = 0; t < seq; t++) {
+                state.att[attOff + t] = scale * ops.dot(qLat, qOff, cache, t * entry, entry);
+            }
+            ops.softmax(state.att, attOff, seq);
+
+            int oOff = h * kvLoraRank;
+            Arrays.fill(oLat, oOff, oOff + kvLoraRank, 0f);
+            for (int t = 0; t < seq; t++) {
+                ops.saxpy(state.att[attOff + t], cache, t * entry, oLat, oOff, kvLoraRank);
+            }
+
+            // out[h] = W_vb[h] · o_lat (W_vb[h]: valueLength rows of kvLoraRank)
+            long vbBase = (long) h * valueLength * kvLoraRank;
+            int outOff = h * valueLength;
+            for (int r = 0; r < valueLength; r++) {
+                state.xb2[outOff + r] = wvB.dot(vbBase + (long) r * kvLoraRank, oLat, oOff, kvLoraRank);
             }
         });
     }
@@ -277,6 +351,12 @@ public class MLAAttention {
             System.arraycopy(b[M_KVC][t], 0, state.kvCompressed, 0, kvCompressedDim);
             if (combined) {
                 splitKV(b[M_KVD][t], state);
+            } else if (config.mlaLatentCache()) {
+                System.arraycopy(b[M_LAT][t], 0, state.kvCompressed, 0, kvLoraRank);
+                attentionLatent(state, weights, layer, basePos + t);
+                System.arraycopy(state.xb2, 0, b[M_ATT][t], 0, totalValDim);
+                Arrays.fill(out[t], 0, dim, 0f);
+                continue;
             } else {
                 System.arraycopy(b[M_LAT][t], 0, state.kvLatentNormed, 0, kvLoraRank);
                 decompressKVSeparate(state, weights, headCount, keyNope, valueLength, kvLoraRank);
@@ -340,21 +420,34 @@ public class MLAAttention {
      * For transposed matmul: output[col] = sum_row(input[row] * wkB[h][row][col])
      * This is a column-wise dot product — we iterate over rows (kvLoraRank) for each output col (keyNope).
      */
+    private final java.util.Map<DeepSeek2LayerWeights, float[]> kbTransposed = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private float[] transposedKb(DeepSeek2LayerWeights weights, int headCount, int keyNope, int kvLoraRank) {
+        return kbTransposed.computeIfAbsent(weights, w -> {
+            float[] t = new float[headCount * keyNope * kvLoraRank];
+            float[] row = new float[keyNope];
+            for (int h = 0; h < headCount; h++) {
+                for (int r = 0; r < kvLoraRank; r++) {
+                    w.wkB().dequantize(row, 0, ((long) h * kvLoraRank + r) * keyNope, keyNope);
+                    for (int c = 0; c < keyNope; c++) t[(h * keyNope + c) * kvLoraRank + r] = row[c];
+                }
+            }
+            return t;
+        });
+    }
+
     private void decompressKVSeparate(DeepSeek2State state, DeepSeek2LayerWeights weights,
                                        int headCount, int keyNope, int valueLength, int kvLoraRank) {
-        // K decompression: transposed matmul per head
-        // wkB 3D: [keyNope, kvLoraRank, headCount] — ne0=keyNope, ne1=kvLoraRank
+        // K decompression: transposed matmul per head. wkB 3D: [keyNope, kvLoraRank, headCount].
+        // The transpose is dequantized once per layer into a row-major float matrix
+        // [heads*keyNope][kvLoraRank]; each K element is then one SIMD dot product. (It used to be
+        // kvLoraRank getFloat calls per element: about two million per layer per token.)
+        final float[] kt = transposedKb(weights, headCount, keyNope, kvLoraRank);
+        final it.denzosoft.llmplayer.tensor.VectorOps ops = VectorOpsFactory.get();
         it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
-            long headOffset = (long) h * kvLoraRank * keyNope;
             int kDst = h * (keyNope + config.ropeDimensionCount()); // offset in state.k (keyLength per head)
-
-            // Transposed matmul: output[col] = sum_row(input[row] * weight[row * ne0 + col])
             for (int col = 0; col < keyNope; col++) {
-                float sum = 0f;
-                for (int row = 0; row < kvLoraRank; row++) {
-                    sum += state.kvLatentNormed[row] * weights.wkB().getFloat(headOffset + (long) row * keyNope + col);
-                }
-                state.k[kDst + col] = sum;
+                state.k[kDst + col] = ops.dot(kt, (h * keyNope + col) * kvLoraRank, state.kvLatentNormed, 0, kvLoraRank);
             }
         });
 

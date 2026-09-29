@@ -53,10 +53,8 @@ public class NemotronHInferenceEngine {
     private final float[][] ffnNormPerLayer;    // [blockCount][dim] (FFN layers only)
 
     // GPU forward pass (reflection-loaded)
-    private AutoCloseable gpuForwardPass;
+    private LayerGpuForwardPass gpuForwardPass;
     private int gpuLayerCount;
-    private Method gpuUploadXAndUpdateParams, gpuForwardLayer, gpuForwardGraph;
-    private Method gpuForwardFinalLogits, gpuDownloadX;
 
     // RoPE
     private final RoPE rope;
@@ -110,21 +108,15 @@ public class NemotronHInferenceEngine {
     }
 
     // Granite Hybrid MoE: GPU expert helper (reflection-loaded; null on CPU/dense)
-    private Object gpuMoeHelper;
-    private Method gpuMoeCompute;
+    private GpuMoeExperts gpuMoeHelper;
 
     /** Granite Hybrid MoE: route expert FFN through the GPU (dense attn/mamba run on the CPU engine
      *  with per-tensor GPU matmul). The dedicated dense GPU pass is skipped for MoE (isSupported=false). */
     private void tryInitGpuMoE(Object bufferManager) {
         try {
             Class<?> cls = Class.forName("it.denzosoft.llmplayer.gpu.GraniteExpertGpu");
-            gpuMoeHelper = cls.getConstructor(ModelConfig.class, bufferManager.getClass())
+            gpuMoeHelper = (GpuMoeExperts) cls.getConstructor(ModelConfig.class, bufferManager.getClass())
                 .newInstance(config, bufferManager);
-            gpuMoeCompute = cls.getMethod("computeMoE",
-                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
-                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
-                it.denzosoft.llmplayer.tensor.FloatTensor.class, it.denzosoft.llmplayer.tensor.FloatTensor.class,
-                float[].class, int[].class, float[].class, int.class, float[].class);
             System.err.println("Granite MoE GPU experts: enabled");
         } catch (Throwable e) {
             System.err.println("Granite MoE GPU experts: unavailable — " + e.getMessage());
@@ -133,24 +125,28 @@ public class NemotronHInferenceEngine {
     }
 
     public void tryInitGpuForwardPass(Object bufferManager) {
-        if (config.expertCount() > 0) { tryInitGpuMoE(bufferManager); return; }
+        // Granite Hybrid MoE: the GPU-resident pass handles it when the experts are on the GPU;
+        // otherwise only the experts use the GPU (GraniteExpertGpu) — see the end of this method.
         try {
             Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.NemotronHCudaForwardPass");
             Method isSup = cls.getMethod("isSupported", ModelConfig.class, NemotronHWeights.class);
-            if (!(Boolean) isSup.invoke(null, config, weights)) return;
-            Object fwd = cls.getConstructor(ModelConfig.class, NemotronHWeights.class,
-                    bufferManager.getClass(), int.class).newInstance(config, weights, bufferManager, maxSeqLen);
-            gpuUploadXAndUpdateParams = cls.getMethod("uploadXAndUpdateParams", float[].class, int.class);
-            gpuForwardLayer = cls.getMethod("forwardLayer", int.class, int.class);
-            gpuForwardGraph = cls.getMethod("forwardGraph", float[].class);
-            gpuForwardFinalLogits = cls.getMethod("forwardFinalLogits", float[].class);
-            gpuDownloadX = cls.getMethod("downloadX", float[].class);
-            gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
-            gpuForwardPass = (AutoCloseable) fwd;
-            System.err.println("NemotronH CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
+            if ((Boolean) isSup.invoke(null, config, weights)) {
+                Object fwd = cls.getConstructor(ModelConfig.class, NemotronHWeights.class,
+                        bufferManager.getClass(), int.class).newInstance(config, weights, bufferManager, maxSeqLen);
+                gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
+                gpuForwardPass = (LayerGpuForwardPass) fwd;
+                System.err.println("NemotronH CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
+            }
         } catch (Throwable e) {
-            System.err.println("NemotronH CUDA forward pass: unavailable — " + e.getMessage());
+            System.err.println("NemotronH CUDA forward pass: unavailable — " + GpuFailureException.describe(e));
         }
+        if (gpuForwardPass == null && config.expertCount() > 0) tryInitGpuMoE(bufferManager);
+    }
+
+
+    /** True when a GPU-resident forward pass (which owns the device-side state) is active. */
+    public boolean hasGpuForwardPass() {
+        return gpuForwardPass != null;
     }
 
     public NemotronHState createState(int maxSeqLen) {
@@ -180,8 +176,15 @@ public class NemotronHInferenceEngine {
             try {
                 return forwardGpu(state, position, computeLogits);
             } catch (Exception e) {
-                System.err.println("NemotronH GPU forward failed: " + e.getMessage());
+                System.err.println("NemotronH GPU forward failed: " + GpuFailureException.describe(e));
+                // The pass owned the device KV cache / recurrent state for every earlier position:
+                // the CPU can take over only at position 0 (see InferenceEngine.forwardGpu).
+                AutoCloseable failed = gpuForwardPass;
                 gpuForwardPass = null;
+                try { failed.close(); } catch (Exception ignored) { }
+                if (position > 0) {
+                    throw new GpuFailureException("GPU forward pass failed at position " + position, e);
+                }
             }
         }
 
@@ -215,6 +218,13 @@ public class NemotronHInferenceEngine {
             for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
         }
         if (cpuProfile) {
+            if (profPromptOpen) {
+                // The first projection closes the prompt (prefilled token by token): drop its
+                // layer time so the averages are per decoded token.
+                profPromptOpen = false;
+                profMambaNs = profAttnNs = profFfnNs = 0;
+                return state.logits;
+            }
             profOutputNs += System.nanoTime() - t0;
             profTokenCount++;
             if (profTokenCount % 10 == 0) printProfile();
@@ -225,6 +235,14 @@ public class NemotronHInferenceEngine {
     private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
     private long profMambaNs, profAttnNs, profFfnNs, profOutputNs;
     private int profTokenCount;
+    private boolean profPromptOpen = true;
+
+    /** Reset the profile counters: call before each generation's prefill. */
+    public void resetProfile() {
+        profMambaNs = profAttnNs = profFfnNs = profOutputNs = 0;
+        profTokenCount = 0;
+        profPromptOpen = true;
+    }
 
     private void printProfile() {
         int n = profTokenCount;
@@ -235,21 +253,16 @@ public class NemotronHInferenceEngine {
     }
 
     private float[] forwardGpu(NemotronHState state, int position, boolean computeLogits) throws Exception {
-        gpuUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
+        gpuForwardPass.uploadXAndUpdateParams(state.x, position);
         if (computeLogits && gpuLayerCount == blockCount) {
-            Boolean ok = (Boolean) gpuForwardGraph.invoke(gpuForwardPass, state.logits);
-            if (ok) {
-                // Granite Hybrid: logit scaling after GPU computation
-                if (logitScale > 0f) {
-                    float scale = 1.0f / logitScale;
-                    for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
-                }
-                return state.logits;
-            }
+            Boolean ok = (Boolean) gpuForwardPass.forwardGraph(state.logits);
+            // Granite Hybrid logit scaling is already applied on the GPU (scale_inplace after the
+            // output projection); scaling again here divided the logits by logitScale twice.
+            if (ok) return state.logits;
         }
-        for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
+        for (int i = 0; i < gpuLayerCount; i++) gpuForwardPass.forwardLayer(i, position);
         if (gpuLayerCount < blockCount) {
-            gpuDownloadX.invoke(gpuForwardPass, state.x);
+            gpuForwardPass.downloadX(state.x);
             for (int i = gpuLayerCount; i < blockCount; i++) {
                 NemotronHLayerWeights lw = weights.layers()[i];
                 if (lw.isMamba()) forwardMamba2(state, lw, i);
@@ -259,15 +272,9 @@ public class NemotronHInferenceEngine {
         }
         if (!computeLogits) return null;
         if (gpuLayerCount == blockCount) {
-            Boolean ok = (Boolean) gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
-            if (ok) {
-                if (logitScale > 0f) {
-                    float scale = 1.0f / logitScale;
-                    for (int i = 0; i < vocabSize; i++) state.logits[i] *= scale;
-                }
-                return state.logits;
-            }
-            gpuDownloadX.invoke(gpuForwardPass, state.x);
+            Boolean ok = (Boolean) gpuForwardPass.forwardFinalLogits(state.logits);
+            if (ok) return state.logits; // logit scale applied on the GPU
+            gpuForwardPass.downloadX(state.x);
         }
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
         Arrays.fill(state.logits, 0);
@@ -576,13 +583,13 @@ public class NemotronHInferenceEngine {
         // on CPU above. Writes the full MoE output to state.xb; falls back to CPU on any failure.
         if (gpuMoeHelper != null) {
             try {
-                gpuMoeCompute.invoke(gpuMoeHelper, lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps(),
+                gpuMoeHelper.computeMoE(lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps(),
                     lw.ffnGateShexp(), lw.ffnUpShexp(), lw.ffnDownShexp(),
                     state.xb2, state.selectedExperts, state.selectedWeights, expertUsed, state.xb);
                 applyResidual(state);
                 return;
             } catch (Exception e) {
-                System.err.println("Granite MoE GPU failed: " + e.getMessage());
+                System.err.println("Granite MoE GPU failed: " + GpuFailureException.describe(e));
                 gpuMoeHelper = null;
             }
         }

@@ -77,6 +77,7 @@ public final class ArchitectureRegistry {
     public static String ffnGateShexp(int layer) { return "blk." + layer + ".ffn_gate_shexp.weight"; }
     public static String ffnUpShexp(int layer) { return "blk." + layer + ".ffn_up_shexp.weight"; }
     public static String ffnDownShexp(int layer) { return "blk." + layer + ".ffn_down_shexp.weight"; }
+    public static String ffnGateInpShexp(int layer) { return "blk." + layer + ".ffn_gate_inp_shexp.weight"; }
 
     // MoE expert biases (GPT-OSS)
     public static String ffnGateExpsBias(int layer) { return "blk." + layer + ".ffn_gate_exps.bias"; }

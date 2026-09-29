@@ -35,7 +35,7 @@ public class F32CudaTensor extends CudaFloatTensor {
     }
 
     @Override
-    public float dot(long thisOffset, float[] other, int otherOffset, int length) {
+    protected float dotScalar(long thisOffset, float[] other, int otherOffset, int length) {
         float[] buf = DOT_BUFFER.get();
         if (buf.length < length) {
             buf = new float[length];

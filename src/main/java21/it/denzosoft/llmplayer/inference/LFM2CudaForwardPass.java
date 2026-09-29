@@ -18,15 +18,15 @@ import java.lang.foreign.ValueLayout;
  * Keeps activations on the GPU across a whole layer (no per-matmul CPU round-trips like the
  * per-tensor path), running every op — conv, attention, RoPE, QK-norm, SwiGLU — as a CUDA kernel.
  *
- * Reuses the standard kernels (rmsnorm, rmsnorm_per_head, rope, attention, conv1d_short,
- * silu_mul, elementwise_mul, accumulate) and each weight tensor's own FP32 matmul kernel.
- * No CUDA-graph capture and no dp4a in this first version (a future optimization); the win is
- * eliminating the per-matmul host↔device transfers of the per-tensor fallback.
+ * Reuses the standard kernels (rmsnorm, rmsnorm_per_head, rope, flash attention, conv1d_short,
+ * silu_mul, elementwise_mul, accumulate). Matmuls take the dp4a int8 path (default on, one Q8_1
+ * quantization per input buffer) with each tensor's FP32 kernel as the fallback, and from the
+ * second token the whole pass replays as a CUDA graph.
  *
  * Gated by {@link #isSupported}: if any matmul weight is not GPU-resident the engine falls back
  * to the per-tensor path, so this can never regress correctness.
  */
-public class LFM2CudaForwardPass implements AutoCloseable {
+public class LFM2CudaForwardPass implements LayerGpuForwardPass {
 
     private final CudaContext cudaContext;
     private final CudaBufferManager bufferManager;
@@ -52,7 +52,11 @@ public class LFM2CudaForwardPass implements AutoCloseable {
     private final long[] gpuConvW, gpuConvState;                        // conv layers
     private final long[] gpuKeyCache, gpuValueCache;                    // attention layers
 
-    private final MemorySegment rmsnormFunc, perHeadNormFunc, ropeFunc, kvUpdateFunc, attnFunc;
+    private final MemorySegment rmsnormFunc, perHeadNormFunc, ropeFunc, kvUpdateFunc;
+    // FP16 KV cache (-Dcuda.kv.fp16, also set by the KV-aware VRAM budget); inline-init so the
+    // constructor body sees it when sizing the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+    private FlashAttention flashAttn;
     private final MemorySegment convFunc, siluMulFunc, elemMulFunc, accumFunc;
 
     // dp4a (int8) matmul path: quantize FP32 input -> Q8_1, then per-type dp4a kernel. Default on
@@ -78,7 +82,7 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         void setFloat(int i, float v) { args.set(ValueLayout.JAVA_FLOAT, i * 8L, v); }
     }
 
-    private final PB matmulPB, normPB, perHeadPB, ropePB, kvPB, attnPB, convPB, siluMulPB, elemMulPB, accumPB;
+    private final PB matmulPB, normPB, perHeadPB, ropePB, kvPB, convPB, siluMulPB, elemMulPB, accumPB;
 
     public LFM2CudaForwardPass(ModelConfig config, LFM2Weights weights,
                                CudaBufferManager bufferManager, int maxSeqLen) {
@@ -118,8 +122,9 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         rmsnormFunc     = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         perHeadNormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm_per_head.cu", "rmsnorm_per_head");
         ropeFunc        = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvUpdateFunc    = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attnFunc        = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        kvUpdateFunc    = useFp16Kv
+            ? cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16")
+            : cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         convFunc        = cudaContext.compileKernel("kernels/cuda/conv1d_short.cu", "conv1d_short");
         siluMulFunc     = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         elemMulFunc     = cudaContext.compileKernel("kernels/cuda/elementwise_mul.cu", "elementwise_mul");
@@ -172,7 +177,7 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         gpuConvState = new long[blockCount];
         gpuKeyCache = new long[blockCount];
         gpuValueCache = new long[blockCount];
-        long kvBytes = (long) maxSeqLen * kvDim * fb;
+        long kvBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
         long convBytes = (long) histSize * dim * fb;
         for (int i = 0; i < blockCount; i++) {
             LFM2LayerWeights lw = weights.layers()[i];
@@ -196,6 +201,37 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         hostLogits = arena.allocate(ValueLayout.JAVA_FLOAT, vocabSize);
         long outNorm = uploadNormWeights(weights.outputNorm(), dim);
 
+        // LFM2-MoE: routed experts on the GPU (every expert tensor GPU-resident). The router runs
+        // on the GPU; its `experts` logits are downloaded for the top-K selection, which stays on
+        // the CPU exactly as LFM2InferenceEngine.moe does it.
+        this.config = config;
+        this.hasMoE = config.expertCount() > 0;
+        if (hasMoE) {
+            experts = config.expertCount();
+            efd = config.expertFfnLength();
+            gpuRouter = bufferManager.createBuffer((long) experts * fb);
+            hostRouter = arena.allocate((long) experts * fb, 16);
+            gpuExpGate = bufferManager.createBuffer((long) efd * fb);
+            gpuExpUp = bufferManager.createBuffer((long) efd * fb);
+            gpuExpOut = bufferManager.createBuffer((long) dim * fb);
+            moeInMm = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, dim);
+            moeDownMm = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, efd);
+            axpyFunc = cudaContext.compileKernel("kernels/cuda/batch_ops.cu", "axpy");
+            axpyPB = new PB(arena, 4);
+            moeSiluPB = new PB(arena, 3);
+            probs = new float[experts];
+            routerIn = new float[dim];
+            sel = new float[experts];
+            expBias = new float[blockCount][];
+            for (int i = 0; i < blockCount; i++) {
+                LFM2LayerWeights lw = weights.layers()[i];
+                if (lw.isMoE() && lw.expProbsBias() != null) {
+                    expBias[i] = new float[experts];
+                    for (int e = 0; e < experts; e++) expBias[i][e] = lw.expProbsBias().getFloat(e);
+                }
+            }
+        }
+
         // Param buffers
         matmulPB = new PB(arena, 6);
         quantPB = new PB(arena, 3);
@@ -215,11 +251,8 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         kvPB = new PB(arena, 6);
         kvPB.setLong(2, gpuK); kvPB.setLong(3, gpuV); kvPB.setInt(4, kvDim); kvPB.setLong(5, gpuTokenParams);
 
-        attnPB = new PB(arena, 10);
-        attnPB.setLong(0, gpuAttnOut); attnPB.setLong(1, gpuQ);
-        attnPB.setInt(4, headCount); attnPB.setInt(5, headCountKV);
-        attnPB.setInt(6, headSize); attnPB.setInt(7, kvDim); attnPB.setLong(8, gpuTokenParams);
-        attnPB.setInt(9, 0);
+        flashAttn = new FlashAttention(cudaContext, bufferManager, arena, headCount, headSize, maxSeqLen,
+            useFp16Kv, gpuTokenParams);
 
         convPB = new PB(arena, 6);
         convPB.setLong(0, gpuBcx); convPB.setInt(3, dim); convPB.setInt(4, lCache); convPB.setLong(5, gpuTokenParams);
@@ -246,16 +279,45 @@ public class LFM2CudaForwardPass implements AutoCloseable {
 
     private final long gpuOutputNorm;
 
+    // LFM2-MoE (null / 0 for dense LFM2)
+    private ModelConfig config;
+    private boolean hasMoE;
+    private int experts, efd;
+    private long gpuRouter, gpuExpGate, gpuExpUp, gpuExpOut;
+    private MemorySegment hostRouter, axpyFunc;
+    private it.denzosoft.llmplayer.gpu.Dp4aMatmul moeInMm, moeDownMm;
+    private PB axpyPB, moeSiluPB;
+    private float[] probs, sel, routerIn;
+    private float[][] expBias;
+    private final int[] moeIds = new int[64];
+    private final float[] moeW = new float[64];
+
     public static boolean isSupported(ModelConfig config, LFM2Weights weights) {
         if (weights.layers().length == 0) return false;
-        // LFM2-MoE: the routed-expert FFN only exists on the CPU path
-        if (config.expertCount() > 0) return false;
-        if (!(weights.output() instanceof CudaFloatTensor)) return false;
+        if (!(weights.output() instanceof CudaFloatTensor)) {
+            if (Boolean.getBoolean("cuda.debug")) System.err.println("LFM2 CUDA pass: output weight not on the GPU");
+            return false;
+        }
         for (LFM2LayerWeights lw : weights.layers()) {
-            FloatTensor[] mm = lw.isAttention()
-                ? new FloatTensor[]{lw.wq(), lw.wk(), lw.wv(), lw.wo(), lw.ffnGate(), lw.ffnUp(), lw.ffnDown()}
-                : new FloatTensor[]{lw.convInProj(), lw.convOutProj(), lw.ffnGate(), lw.ffnUp(), lw.ffnDown()};
-            for (FloatTensor t : mm) if (!(t instanceof CudaFloatTensor)) return false;
+            java.util.List<FloatTensor> mm = new java.util.ArrayList<>();
+            if (lw.isAttention()) { mm.add(lw.wq()); mm.add(lw.wk()); mm.add(lw.wv()); mm.add(lw.wo()); }
+            else { mm.add(lw.convInProj()); mm.add(lw.convOutProj()); }
+            if (lw.isMoE()) {
+                // LFM2-MoE runs here only with every expert GPU-resident (the model fits in VRAM)
+                // (the router may stay on the CPU: it is a tiny F32 matrix)
+                mm.add(lw.gateExps()); mm.add(lw.upExps()); mm.add(lw.downExps());
+            } else {
+                mm.add(lw.ffnGate()); mm.add(lw.ffnUp()); mm.add(lw.ffnDown());
+            }
+            for (FloatTensor t : mm) {
+                if (!(t instanceof CudaFloatTensor)) {
+                    if (Boolean.getBoolean("cuda.debug")) {
+                        System.err.println("LFM2 CUDA pass: not supported, a " + (t == null ? "missing" : t.getClass().getSimpleName())
+                            + " weight in a " + (lw.isAttention() ? "attention" : "conv") + (lw.isMoE() ? "/MoE" : "") + " layer");
+                    }
+                    return false;
+                }
+            }
         }
         return true;
     }
@@ -276,6 +338,7 @@ public class LFM2CudaForwardPass implements AutoCloseable {
     }
 
     public void forwardLayer(int li, int position) {
+        if (li == blockCount - 1 && position >= 0) warmedUp = true;
         LFM2LayerWeights lw = weights.layers()[li];
         long fb = Float.BYTES;
 
@@ -300,9 +363,9 @@ public class LFM2CudaForwardPass implements AutoCloseable {
             // KV cache update + attention
             kvPB.setLong(0, gpuKeyCache[li]); kvPB.setLong(1, gpuValueCache[li]);
             launch(kvUpdateFunc, kvGrid, (int) blockSize, 0, kvPB);
-            attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
-            int attnSM = (position + 1 + 32) * Float.BYTES;
-            launch(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB);
+            flashAttn.launch(defaultStream, gpuAttnOut, gpuQ, gpuKeyCache[li], gpuValueCache[li],
+                headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, position);
+            q8CachedIn = 0; // attention rewrote gpuAttnOut, a matmul input
             // wo: gpuAttnOut -> gpuBx
             matmul((CudaFloatTensor) lw.wo(), gpuAttnOut, gpuBx, dim, qDim);
         } else {
@@ -323,9 +386,14 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         // residual: gpuX += gpuBx
         launch(accumFunc, accumGrid, (int) blockSize, 0, accumPB);
 
-        // FFN: ffn_norm -> SwiGLU -> residual
+        // FFN: ffn_norm -> SwiGLU (or routed experts) -> residual
         normPB.setLong(2, gpuFfnNorm[li]);
         launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
+        if (lw.isMoE()) {
+            moeFfn(li, lw);
+            launch(accumFunc, accumGrid, (int) blockSize, 0, accumPB);
+            return;
+        }
         matmul((CudaFloatTensor) lw.ffnGate(), gpuNorm, gpuGate, ffnDim, dim);
         matmul((CudaFloatTensor) lw.ffnUp(), gpuNorm, gpuUp, ffnDim, dim);
         launch(siluMulFunc, (int) ((ffnDim + blockSize - 1) / blockSize), (int) blockSize, 0, siluMulPB); // gpuGate=silu(gpuGate)*gpuUp
@@ -333,30 +401,177 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         launch(accumFunc, accumGrid, (int) blockSize, 0, accumPB);
     }
 
+    /**
+     * Routed-expert FFN of one LFM2-MoE layer into gpuBx: router on the GPU, top-K on the CPU (the
+     * same selection, normalisation and scale as LFM2InferenceEngine.moe), then per selected expert
+     * gate/up (dp4a, the layer input quantized once), SiLU·up, down, and gpuBx += w · out.
+     */
+    private void moeFfn(int li, LFM2LayerWeights lw) {
+        long fb = Float.BYTES;
+        if (lw.gateInp() instanceof CudaFloatTensor) {
+            matmul((CudaFloatTensor) lw.gateInp(), gpuNorm, gpuRouter, experts, dim);
+            cudaContext.readBuffer(gpuRouter, hostRouter, (long) experts * fb); // waits for the router
+            MemorySegment.copy(hostRouter, ValueLayout.JAVA_FLOAT, 0, probs, 0, experts);
+        } else {
+            // CPU router: download the normed input (dim floats) and project it on the host
+            cudaContext.readBuffer(gpuNorm, hostX, (long) dim * fb);
+            MemorySegment.copy(hostX, ValueLayout.JAVA_FLOAT, 0, routerIn, 0, dim);
+            java.util.Arrays.fill(probs, 0f);
+            lw.gateInp().matmul(routerIn, probs, experts, dim);
+        }
+        if (config.expertGatingFunc() == 2) {
+            for (int e = 0; e < experts; e++) probs[e] = 1.0f / (1.0f + (float) Math.exp(-probs[e]));
+        } else {
+            float max = Float.NEGATIVE_INFINITY;
+            for (int e = 0; e < experts; e++) max = Math.max(max, probs[e]);
+            float sum = 0f;
+            for (int e = 0; e < experts; e++) { probs[e] = (float) Math.exp(probs[e] - max); sum += probs[e]; }
+            for (int e = 0; e < experts; e++) probs[e] /= sum;
+        }
+        float[] bias = expBias[li];
+        for (int e = 0; e < experts; e++) sel[e] = probs[e] + (bias != null ? bias[e] : 0f);
+        int k = MoERouting.effectiveTopK(config.expertUsedCount());
+        for (int j = 0; j < k; j++) {
+            int best = -1;
+            for (int e = 0; e < experts; e++) {
+                boolean taken = false;
+                for (int q = 0; q < j; q++) if (moeIds[q] == e) { taken = true; break; }
+                if (!taken && (best < 0 || sel[e] > sel[best])) best = e;
+            }
+            moeIds[j] = best;
+            moeW[j] = probs[best];
+        }
+        float sum = 0f;
+        for (int j = 0; j < k; j++) sum += moeW[j];
+        sum = Math.max(sum, 6.103515625e-5f);
+        float scale = config.expertWeightsScale();
+        float mul = (scale != 0f && scale != 1f) ? scale / sum : 1f / sum;
+
+        CudaFloatTensor g = (CudaFloatTensor) lw.gateExps(), u = (CudaFloatTensor) lw.upExps(),
+                        d = (CudaFloatTensor) lw.downExps();
+        long gB = g.getWeightsBytes() / experts, uB = u.getWeightsBytes() / experts, dB = d.getWeightsBytes() / experts;
+        cudaContext.fillBufferZero(gpuBx, (long) dim * fb);
+        moeInMm.invalidate(); // new layer input in gpuNorm
+        for (int j = 0; j < k; j++) {
+            int e = moeIds[j];
+            moeInMm.matmul(g, (long) e * gB, gpuNorm, gpuExpGate, efd, dim, false);
+            moeInMm.matmul(u, (long) e * uB, gpuNorm, gpuExpUp, efd, dim, false);
+            moeSiluPB.setLong(0, gpuExpGate); moeSiluPB.setLong(1, gpuExpUp); moeSiluPB.setInt(2, efd);
+            launch(siluMulFunc, (int) ((efd + blockSize - 1) / blockSize), (int) blockSize, 0, moeSiluPB);
+            moeDownMm.invalidate();
+            moeDownMm.matmul(d, (long) e * dB, gpuExpGate, gpuExpOut, dim, efd, false);
+            axpyPB.setLong(0, gpuBx); axpyPB.setLong(1, gpuExpOut); axpyPB.setFloat(2, moeW[j] * mul); axpyPB.setInt(3, dim);
+            launch(axpyFunc, accumGrid, (int) blockSize, 0, axpyPB);
+        }
+    }
+
     public boolean forwardFinalLogits(float[] logits) {
-        normPB.setLong(2, gpuOutputNorm);
-        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
-        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+        launchFinal();
+        outputWarm = true;
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
         return true;
     }
 
+    private void launchFinal() {
+        normPB.setLong(2, gpuOutputNorm);
+        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
+        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+    }
+
+    // --- CUDA graph: every kernel reads the position from gpuTokenParams, so one capture replays
+    // for every token. Two executables: all layers + output projection (decode), layers only
+    // (prefill tokens whose logits are discarded). A failed capture is not retried.
+    private MemorySegment graphExec, graphExecLayers;
+    private boolean graphAvailable;
+    private boolean graphInit;
+    // Weights upload to the GPU and kernels compile lazily on first use, and neither cuMemAlloc
+    // nor module loading may happen inside a capture: the first token runs per-layer.
+    private boolean warmedUp;     // every layer ran once outside a capture
+    private boolean outputWarm;   // the output projection ran once outside a capture
+
+    private boolean ensureGraph(boolean withOutput) {
+        if (!graphInit) {
+            graphInit = true;
+            graphAvailable = !Boolean.getBoolean("cuda.nograph") && cudaContext.isGraphApiAvailable()
+                && flashAttn.graphCompatible()
+                && !hasMoE; // the MoE router decides on the host every layer
+        }
+        if (!graphAvailable || !warmedUp || (withOutput && !outputWarm)) return false;
+        if ((withOutput ? graphExec : graphExecLayers) != null) return true;
+        boolean capturing = false;
+        try {
+            cudaContext.beginCapture();
+            capturing = true;
+            for (int li = 0; li < blockCount; li++) forwardLayer(li, -1);
+            if (withOutput) launchFinal();
+            MemorySegment graph = cudaContext.endCapture();
+            capturing = false;
+            try {
+                MemorySegment exec = cudaContext.instantiateGraph(graph);
+                if (withOutput) graphExec = exec; else graphExecLayers = exec;
+            } finally {
+                cudaContext.destroyGraph(graph);
+            }
+            System.err.println("LFM2 CUDA graph: captured " + blockCount + " layers"
+                + (withOutput ? " + output projection" : " (prefill)"));
+            return true;
+        } catch (Exception e) {
+            if (capturing) {
+                try {
+                    MemorySegment partial = cudaContext.endCapture();
+                    if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial);
+                } catch (Exception ignored) {}
+            }
+            graphAvailable = false;
+            System.err.println("LFM2 CUDA graph: capture failed — " + e.getMessage() + ", using per-layer mode");
+            return false;
+        }
+    }
+
+    @Override
+    public boolean forwardGraph(float[] logits) {
+        if (!ensureGraph(true)) return false;
+        cudaContext.launchGraph(graphExec);
+        cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
+        MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
+        return true;
+    }
+
+    @Override
+    public boolean forwardGraphPrefill() {
+        if (!ensureGraph(false)) return false;
+        cudaContext.launchGraph(graphExecLayers);
+        return true;
+    }
+
+    // Q8_1 quantization cache: consecutive dp4a matmuls on the same input (Q/K/V, gate/up) reuse
+    // one quantization. Any other kernel launch invalidates it (see launch()), as does a matmul
+    // that writes the quantized buffer itself.
+    private long q8CachedIn;
+    private int q8CachedCols;
+
     private void matmul(CudaFloatTensor t, long in, long out, int rows, int cols) {
         MemorySegment dp4a = useDp4a ? dp4aFunc(t) : null;
         if (dp4a != null) {
-            // quantize FP32 input[cols] -> Q8_1, then int8 dp4a matmul
-            quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
-            launch(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+            // quantize FP32 input[cols] -> Q8_1 (skipped when already quantized), then int8 dp4a matmul
+            if (q8CachedIn != in || q8CachedCols != cols) {
+                quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
+                launchRaw(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+                q8CachedIn = in;
+                q8CachedCols = cols;
+            }
             dp4aPB.setLong(0, t.getGpuWeights()); dp4aPB.setLong(1, gpuQ8In); dp4aPB.setLong(2, out);
             dp4aPB.setInt(3, rows); dp4aPB.setInt(4, cols); dp4aPB.setInt(5, 0);
-            launch(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            launchRaw(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            if (out == q8CachedIn) q8CachedIn = 0;
             return;
         }
         matmulPB.setLong(0, t.getGpuWeights()); matmulPB.setLong(1, in); matmulPB.setLong(2, out);
         matmulPB.setInt(3, rows); matmulPB.setInt(4, cols); matmulPB.setInt(5, 0); // write mode
-        launch(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols),
+        launchRaw(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols),
                t.getMatmulSharedMem(cols), matmulPB);
+        if (out == q8CachedIn) q8CachedIn = 0;
     }
 
     /** dp4a kernel for the tensor's quant type, or null if not dp4a-eligible (FP32 fallback). */
@@ -373,7 +588,13 @@ public class LFM2CudaForwardPass implements AutoCloseable {
         }
     }
 
+    /** Launch a non-matmul kernel; it may overwrite a matmul input, so the Q8_1 cache is dropped. */
     private void launch(MemorySegment fn, int grid, int block, int sm, PB params) {
+        q8CachedIn = 0;
+        launchRaw(fn, grid, block, sm, params);
+    }
+
+    private void launchRaw(MemorySegment fn, int grid, int block, int sm, PB params) {
         int err = CudaBindings.launchKernel(fn, grid, 1, 1, block, 1, 1, sm, defaultStream, params.ptrs, MemorySegment.NULL);
         if (err != CudaBindings.CUDA_SUCCESS) throw new RuntimeException("LFM2 CUDA error: " + err);
     }
@@ -400,5 +621,9 @@ public class LFM2CudaForwardPass implements AutoCloseable {
     }
 
     @Override
-    public void close() { arena.close(); }
+    public void close() {
+        if (graphExec != null) try { cudaContext.destroyGraphExec(graphExec); } catch (Exception ignored) {}
+        if (graphExecLayers != null) try { cudaContext.destroyGraphExec(graphExecLayers); } catch (Exception ignored) {}
+        arena.close();
+    }
 }

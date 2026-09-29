@@ -17,6 +17,7 @@ public enum ModelArchitecture {
     LLAMA4("llama4"),
     GPT_OSS("gpt-oss"),
     QWEN35("qwen35"),
+    MINIMAX_M2("minimax-m2"),
     SMOLLM3("smollm3"),
     NEMOTRON_H("nemotron_h"),
     GRANITE("granite"),
@@ -82,6 +83,12 @@ public enum ModelArchitecture {
         // Qwen3MoEInferenceEngine (the GLM4 + expertCount > 0 branch); RoPE is NEOX, unlike glm4.
         if ("glm4moe".equals(name)) {
             return GLM4;
+        }
+        // Qwen3.5 MoE (Qwen3.5-35B-A3B): the Qwen3.5 DeltaNet/attention hybrid with a routed-expert
+        // FFN (softmax top-k, renormalised) plus a sigmoid-gated shared expert on every layer
+        // (llama.cpp qwen35moe.cpp). Runs on Qwen35InferenceEngine.
+        if ("qwen35moe".equals(name)) {
+            return QWEN35;
         }
         if ("granite".equals(name)) {
             return GRANITE; // Standard transformer, own chat template + NEOX RoPE

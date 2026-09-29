@@ -24,7 +24,7 @@ import java.util.Arrays;
  * Supports: Llama, Qwen2, Qwen3, Mistral3, Phi-4-mini (pre-norm, separate Q/K/V, SiLU activation).
  * Falls back to CPU path for: post-norm, parallel FFN, merged QKV, GeGLU, packed FFN, MoE.
  */
-public class GpuForwardPass implements AutoCloseable {
+public class GpuForwardPass implements DenseGpuForwardPass, GpuKvOwner {
 
     private final OpenCLContext clContext;
     private final GpuBufferManager bufferManager;
@@ -179,6 +179,18 @@ public class GpuForwardPass implements AutoCloseable {
         if (!(firstLayer.wDown() instanceof GpuFloatTensor)) return false;
 
         return true;
+    }
+
+    /** Attention runs on the CPU against the InferenceState's own KV cache. */
+    @Override
+    public boolean ownsKvCache() {
+        return false;
+    }
+
+    /** The OpenCL pass requires full offload (see {@link #isSupported}). */
+    @Override
+    public int getGpuLayerCount() {
+        return config.blockCount();
     }
 
     /**

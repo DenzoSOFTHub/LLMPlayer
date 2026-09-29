@@ -13,13 +13,15 @@ import java.lang.foreign.ValueLayout;
  *
  * The router top-K runs on the CPU engine; this helper computes the routed-expert + shared-expert
  * SwiGLU on the GPU. Each routed expert's 2D weight slice inside the 3D {@code ffn_*_exps} tensor is
- * addressed by an OFFSET into the tensor's GPU buffer (no new kernel — reuses each tensor's own FP32
- * matmul kernel via its public accessors), so Q4_K/Q6_K experts work unchanged.
+ * addressed by an OFFSET into the tensor's GPU buffer, through the shared {@link Dp4aMatmul}
+ * dispatcher: dp4a for every quant type that has an int8 kernel, the tensor's FP32 kernel otherwise.
+ * The layer input is quantized to Q8_1 once for all gate/up matmuls of the layer (routed and shared
+ * experts), and each expert's SwiGLU output once for its down projection.
  *
  * Contained: does NOT touch {@code NemotronHCudaForwardPass}; the dense Nemotron-H / Granite-dense
  * GPU forward pass is unaffected. If anything fails the caller falls back to the CPU expert path.
  */
-public final class GraniteExpertGpu implements AutoCloseable {
+public final class GraniteExpertGpu implements it.denzosoft.llmplayer.inference.GpuMoeExperts {
 
     private final CudaContext ctx;
     private final CudaBufferManager bm;
@@ -33,11 +35,9 @@ public final class GraniteExpertGpu implements AutoCloseable {
     private final MemorySegment siluMulFunc, saxpyFunc, accumFunc, fillZeroFunc;
     private final long blockSize;
 
-    // dp4a for expert matmuls (Q4_K gate/up are the bottleneck; Q6_K down -> FP32 fallback).
-    private final boolean useDp4a = !"false".equals(System.getProperty("cuda.dp4a", "true"));
-    private final MemorySegment quantizeFunc, dp4aQ4kFunc, dp4aQ5kFunc;
-    private final long gpuQ8In;
-    private final PB quantPB, dp4aPB;
+    // Two dispatchers, each with its own Q8_1 scratch: gate/up read gpuIn (quantized once per
+    // layer), down reads gpuGate (quantized once per expert).
+    private final Dp4aMatmul gateUpMm, downMm;
 
     private static final class PB {
         final MemorySegment args, ptrs;
@@ -50,7 +50,7 @@ public final class GraniteExpertGpu implements AutoCloseable {
         void setInt(int i, int v) { args.set(ValueLayout.JAVA_INT, i * 8L, v); }
         void setFloat(int i, float v) { args.set(ValueLayout.JAVA_FLOAT, i * 8L, v); }
     }
-    private final PB matmulPB, siluMulPB, saxpyPB, accumPB, fillPB;
+    private final PB siluMulPB, saxpyPB, accumPB, fillPB;
 
     public GraniteExpertGpu(ModelConfig config, CudaBufferManager bufferManager) {
         this.bm = bufferManager;
@@ -74,21 +74,13 @@ public final class GraniteExpertGpu implements AutoCloseable {
         hostIn = arena.allocate(ValueLayout.JAVA_FLOAT, dim);
         hostOut = arena.allocate(ValueLayout.JAVA_FLOAT, dim);
 
-        int maxIn = Math.max(dim, Math.max(eFfn, shFfn));
-        gpuQ8In = useDp4a ? bm.createBuffer((long) ((maxIn + 31) / 32) * 40) : 0;
-        if (useDp4a) {
-            quantizeFunc = ctx.compileKernel("kernels/cuda/quantize_q8.cu", "quantize_q8");
-            dp4aQ4kFunc  = ctx.compileKernel("kernels/cuda/matmul_q4_k_dp4a.cu", "matmul_q4_k_dp4a");
-            dp4aQ5kFunc  = ctx.compileKernel("kernels/cuda/matmul_q5_k_dp4a.cu", "matmul_q5_k_dp4a");
-        } else { quantizeFunc = dp4aQ4kFunc = dp4aQ5kFunc = null; }
+        gateUpMm = new Dp4aMatmul(ctx, bm, arena, dim);
+        downMm = new Dp4aMatmul(ctx, bm, arena, maxFfn);
         siluMulFunc  = ctx.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         saxpyFunc    = ctx.compileKernel("kernels/cuda/saxpy.cu", "saxpy");
         accumFunc    = ctx.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         fillZeroFunc = ctx.compileKernel("kernels/cuda/fill_zero.cu", "fill_zero");
 
-        matmulPB  = new PB(arena, 6);
-        quantPB   = new PB(arena, 3);
-        dp4aPB    = new PB(arena, 6);
         siluMulPB = new PB(arena, 3);
         saxpyPB   = new PB(arena, 4);
         accumPB   = new PB(arena, 3);
@@ -108,6 +100,7 @@ public final class GraniteExpertGpu implements AutoCloseable {
                            float[] input, int[] sel, float[] weights, int used, float[] out) {
         MemorySegment.copy(input, 0, hostIn, ValueLayout.JAVA_FLOAT, 0, dim);
         ctx.writeBuffer(gpuIn, hostIn, (long) dim * Float.BYTES);
+        gateUpMm.invalidate(); // new layer input
 
         // gpuOut = 0
         fillPB.setLong(0, gpuOut); fillPB.setInt(1, dim);
@@ -119,48 +112,25 @@ public final class GraniteExpertGpu implements AutoCloseable {
 
         for (int k = 0; k < used; k++) {
             int e = sel[k];
-            matmul(gateExps, gpuIn, gpuGate, eFfn, dim, (long) e * gateBpe);
-            matmul(upExps,   gpuIn, gpuUp,   eFfn, dim, (long) e * upBpe);
+            gateUpMm.matmul((CudaFloatTensor) gateExps, (long) e * gateBpe, gpuIn, gpuGate, eFfn, dim, false);
+            gateUpMm.matmul((CudaFloatTensor) upExps, (long) e * upBpe, gpuIn, gpuUp, eFfn, dim, false);
             siluMul(gpuGate, gpuUp, eFfn);                 // gpuGate = silu(gpuGate) * gpuUp
-            matmul(downExps, gpuGate, gpuExpertOut, dim, eFfn, (long) e * downBpe);
+            downMm.invalidate();
+            downMm.matmul((CudaFloatTensor) downExps, (long) e * downBpe, gpuGate, gpuExpertOut, dim, eFfn, false);
             saxpy(gpuOut, gpuExpertOut, weights[k], dim);  // gpuOut += w_k * expertOut
         }
 
         if (gateShexp != null) {
-            matmul(gateShexp, gpuIn, gpuGate, shFfn, dim, 0);
-            matmul(upShexp,   gpuIn, gpuUp,   shFfn, dim, 0);
+            gateUpMm.matmul((CudaFloatTensor) gateShexp, 0, gpuIn, gpuGate, shFfn, dim, false);
+            gateUpMm.matmul((CudaFloatTensor) upShexp, 0, gpuIn, gpuUp, shFfn, dim, false);
             siluMul(gpuGate, gpuUp, shFfn);
-            matmul(downShexp, gpuGate, gpuExpertOut, dim, shFfn, 0);
+            downMm.invalidate();
+            downMm.matmul((CudaFloatTensor) downShexp, 0, gpuGate, gpuExpertOut, dim, shFfn, false);
             accum(gpuOut, gpuExpertOut, dim);
         }
 
         ctx.readBuffer(gpuOut, hostOut, (long) dim * Float.BYTES);
         MemorySegment.copy(hostOut, ValueLayout.JAVA_FLOAT, 0, out, 0, dim);
-    }
-
-    private void matmul(FloatTensor t, long in, long out, int rows, int cols, long woff) {
-        CudaFloatTensor ct = (CudaFloatTensor) t;
-        MemorySegment dp4a = useDp4a ? dp4aFunc(ct) : null;
-        if (dp4a != null) {
-            quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
-            launch(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
-            dp4aPB.setLong(0, ct.getGpuWeights() + woff); dp4aPB.setLong(1, gpuQ8In); dp4aPB.setLong(2, out);
-            dp4aPB.setInt(3, rows); dp4aPB.setInt(4, cols); dp4aPB.setInt(5, 0);
-            launch(dp4a, ct.getMatmulGridDim(rows, cols), ct.getMatmulBlockDim(cols), 0, dp4aPB);
-            return;
-        }
-        matmulPB.setLong(0, ct.getGpuWeights() + woff); matmulPB.setLong(1, in); matmulPB.setLong(2, out);
-        matmulPB.setInt(3, rows); matmulPB.setInt(4, cols); matmulPB.setInt(5, 0);
-        launch(ct.getCudaFunction(), ct.getMatmulGridDim(rows, cols), ct.getMatmulBlockDim(cols),
-               ct.getMatmulSharedMem(cols), matmulPB);
-    }
-
-    private MemorySegment dp4aFunc(CudaFloatTensor t) {
-        switch (t.type()) {
-            case Q4_K: return dp4aQ4kFunc;
-            case Q5_K: return dp4aQ5kFunc;
-            default:   return null;   // Q6_K (down) / others -> FP32
-        }
     }
 
     private void siluMul(long a, long b, int n) {

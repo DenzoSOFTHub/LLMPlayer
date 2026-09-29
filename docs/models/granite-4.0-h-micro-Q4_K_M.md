@@ -44,3 +44,11 @@ Hardware: NVIDIA RTX 4050 Laptop GPU (6140 MB VRAM).
 |---------|--------|
 | v1.9.0 | Initial Granite Hybrid support |
 | v1.10.2 | Force CPU fallback on GPU (scaling factors not in CUDA path) — fixes PPL 0.20 → 1.00 |
+
+## Logit scaling fix (v1.19.0)
+
+On the GPU path the logits were divided by `logitScale` twice: once by `scale_inplace` on the device
+and once more by `NemotronHInferenceEngine` after the download. Greedy decoding was unaffected (the
+argmax does not change), but the distribution was flattened by a further factor of eight, which
+distorts sampling at a non-zero temperature and made the evaluator report a perplexity of about 2600.
+With the scaling applied once the same 40-token run reports PPL 1.17.

@@ -22,11 +22,26 @@ import java.lang.foreign.*;
  *
  * ZERO-ALLOCATION hot path: all kernel param buffers are pre-allocated in the constructor.
  */
-public class Qwen35CudaForwardPass implements AutoCloseable {
+public class Qwen35CudaForwardPass implements LayerGpuForwardPass {
 
     private final CudaContext cudaContext;
     private final CudaBufferManager bufferManager;
     private final Arena arena;
+
+    // Qwen3.5-MoE layers: norm and the gated shared expert on the GPU, routed experts through the
+    // engine's MoeFfn callback (CPU experts, GPU hot-expert cache) — one sync per layer.
+    private final boolean[] moeLayer;
+    private final boolean hasMoe;
+    private final boolean[] sharedOnGpu;
+    private final int sharedFfn;
+    private LayerGpuForwardPass.MoeFfn moeFfn;
+    private final Qwen35Weights weights;
+    private long gpuShG, gpuShU, gpuShOut, gpuShLogit, gpuRouted;
+    private MemorySegment hostMoe;                 // pinned [xn | routed]
+    private float[] moeXn, moeOut;
+    private it.denzosoft.llmplayer.gpu.Dp4aMatmul mmShIn, mmShDown;
+    private MemorySegment shSiluFunc, gateAxpyFunc;
+    private it.denzosoft.llmplayer.gpu.KernelParams shSiluPB, shAxpyPB, routedAxpyPB;
 
     // GPU activation buffers
     private final long gpuX;           // [dim] main activation
@@ -91,6 +106,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     private final MemorySegment dp4aQ3kFunc;  // Q3_K dp4a kernel
     private final MemorySegment dp4aQ5kFunc;  // Q5_K dp4a kernel
     private final MemorySegment dp4aQ6kFunc;  // Q6_K dp4a kernel
+    private static final boolean DP4A_Q6 = "true".equals(System.getProperty("cuda.dp4a.q6", "false"));
     // Extended dp4a kernels for non-K-quant types (mirroring CudaForwardPass extension)
     private final MemorySegment dp4aQ50Func;
     private final MemorySegment dp4aQ80Func;
@@ -140,7 +156,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     private final MemorySegment siluMulFunc;
     private final MemorySegment ropeFunc;
     private final MemorySegment kvCacheUpdateFunc;
-    private final MemorySegment attentionFullFunc;
+    // Single-token attention (flash-decoding, legacy attention_full as opt-out)
+    private FlashAttention flashAttn;
+    // FP16 KV cache (-Dcuda.kv.fp16, also set by the KV-aware VRAM budget)
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
     private final MemorySegment accumulateFunc;
     private final MemorySegment elementwiseMulFunc;
     private final MemorySegment perHeadNormFunc;
@@ -256,7 +275,6 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     private final ParamBuffer normPB;         // 5 args: out, in, weights, size, eps
     private final ParamBuffer ropePB;         // 8 args
     private final ParamBuffer kvPB;           // 6 args
-    private final ParamBuffer attnPB;         // 9 args
     private final ParamBuffer siluPB;         // 2 args: x, size
     private final ParamBuffer siluMulPB;      // 3 args: a, b, size
     private final ParamBuffer conv1dPB;       // 6 args: qkv, convState, convWeights, channels, kernelSize, tokenParams
@@ -301,16 +319,35 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     // CUDA graph state
     private MemorySegment graphExec;        // generation graph (layers + output)
     private MemorySegment prefillGraphExec; // prefill graph (layers only, no output)
-    private final boolean graphAvailable;
-    private final int graphAttnSharedMem;
+    private boolean graphAvailable; // cleared after a failed capture (no retry per token)
+    private final MemorySegment[] layerGraphExec;
+    private final boolean[] layerRan;
+    private boolean layerGraphsBroken;
+    private boolean moeDeviceOnly; // forwardMoeFFN stops before its host part (graph capture)
 
     private final int gpuLayerCount;
+
+    // Batched prefill (F6 step 5.2): per chunk and layer, every projection is one cuBLAS FP16 GEMM
+    // (weights read once per chunk instead of once per token); the DeltaNet conv and recurrence run
+    // token by token on the chunk's rows (the recurrence is sequential); attention layers use the
+    // batch kernels and one flash launch. Full offload with libcublas only; -Dprefill.gpu.gemm=false
+    // or -Dprefill.gpu.batched=false keeps the per-token prefill.
+    private static final int PREFILL_BATCH = Integer.getInteger("prefill.batch", 64);
+    private int maxBatch;
+    private GemmF16 gemm;
+    private long bX, bXn, bQkv, bAlpha, bBeta, bGate, bOut, bQ, bQc, bAg, bK, bV, bAtt, bHb, bHb2, bRouted, bTP;
+    private MemorySegment bHost;                  // pinned: [maxBatch][dim] x | [maxBatch][dim] moe | tokenParams
+    private MemorySegment rmsBatchFunc, ropeBatchFunc, kvBatchFunc;
+    private it.denzosoft.llmplayer.gpu.KernelParams bNormPB, bRopePB, bKvPB;
+    private LayerGpuForwardPass.MoeFfnBatch moeFfnBatch;
+    private float[][] bMoeIn, bMoeOut;
 
     public Qwen35CudaForwardPass(ModelConfig config, Qwen35Weights weights,
                                   CudaBufferManager bufferManager, int maxSeqLen) {
         this.bufferManager = bufferManager;
         this.cudaContext = bufferManager.getCudaContext();
         this.arena = Arena.ofShared();
+        this.weights = weights;
         this.maxSeqLen = maxSeqLen;
         this.defaultStream = cudaContext.getStream();
 
@@ -367,6 +404,44 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         gpuHb = bufferManager.createBuffer(ffnDim * fb);
         gpuHb2 = bufferManager.createBuffer(ffnDim * fb);
 
+        moeLayer = new boolean[blockCount];
+        sharedOnGpu = new boolean[blockCount];
+        boolean anyMoe = false, anySharedGpu = false;
+        for (int i = 0; i < gpuLayerCount; i++) {
+            Qwen35LayerWeights lw = weights.layers()[i];
+            moeLayer[i] = lw.isMoe();
+            anyMoe |= moeLayer[i];
+            sharedOnGpu[i] = moeLayer[i] && lw.ffnGateShexp() instanceof CudaFloatTensor
+                && lw.ffnUpShexp() instanceof CudaFloatTensor && lw.ffnDownShexp() instanceof CudaFloatTensor
+                && (lw.ffnGateInpShexp() == null || lw.ffnGateInpShexp() instanceof CudaFloatTensor);
+            anySharedGpu |= sharedOnGpu[i];
+        }
+        hasMoe = anyMoe;
+        sharedFfn = config.expertSharedFeedForwardLength();
+        if (hasMoe) {
+            gpuRouted = bufferManager.createBuffer(dim * fb);
+            hostMoe = cudaContext.allocPinnedHost(2L * dim * fb);
+            moeXn = new float[dim];
+            moeOut = new float[dim];
+            gateAxpyFunc = cudaContext.compileKernel("kernels/cuda/batch_ops.cu", "axpy_sigmoid_gate");
+            routedAxpyPB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 4);
+            routedAxpyPB.setLong(0, gpuX).setLong(1, gpuRouted).setLong(2, 0L).setInt(3, dim);
+            if (anySharedGpu) {
+                gpuShG = bufferManager.createBuffer((long) sharedFfn * fb);
+                gpuShU = bufferManager.createBuffer((long) sharedFfn * fb);
+                gpuShOut = bufferManager.createBuffer(dim * fb);
+                gpuShLogit = bufferManager.createBuffer(fb);
+                mmShIn = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, dim);
+                mmShDown = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, Math.max(32, sharedFfn));
+                shSiluFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
+                shSiluPB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 3);
+                shSiluPB.setLong(0, gpuShG).setLong(1, gpuShU).setInt(2, sharedFfn);
+                shAxpyPB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 4);
+                shAxpyPB.setLong(0, gpuX).setLong(1, gpuShOut).setInt(3, dim);
+            }
+        }
+
+
         // DeltaNet buffers
         gpuQkv = bufferManager.createBuffer(deltaQkvDim * fb);
         gpuAlpha = bufferManager.createBuffer(timeStepRank * fb);
@@ -401,7 +476,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 gpuConvState[i] = bufferManager.createBuffer(convBytes);
                 cudaContext.fillBufferZero(gpuConvState[i], convBytes);
             } else {
-                long kvLayerBytes = (long) maxSeqLen * kvDim * fb;
+                long kvLayerBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
                 gpuKeyCache[i] = bufferManager.createBuffer(kvLayerBytes);
                 gpuValueCache[i] = bufferManager.createBuffer(kvLayerBytes);
                 cudaContext.fillBufferZero(gpuKeyCache[i], kvLayerBytes);
@@ -414,8 +489,9 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         siluFunc = cudaContext.compileKernel("kernels/cuda/silu.cu", "silu");
         siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         ropeFunc = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvCacheUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attentionFullFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        kvCacheUpdateFunc = useFp16Kv
+            ? cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16")
+            : cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         elementwiseMulFunc = cudaContext.compileKernel("kernels/cuda/elementwise_mul.cu", "elementwise_mul");
         perHeadNormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm_per_head.cu", "rmsnorm_per_head");
@@ -500,7 +576,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
             String dp4aTypes = "Q4_K";
             if (dp4aQ3kFunc != null) dp4aTypes += "+Q3_K";
             if (dp4aQ5kFunc != null) dp4aTypes += "+Q5_K";
-            if (dp4aQ6kFunc != null) dp4aTypes += "+Q6_K";
+            if (dp4aQ6kFunc != null && DP4A_Q6) dp4aTypes += "+Q6_K";
             System.err.println("Qwen35 CUDA: dp4a enabled (" + dp4aTypes + " × Q8_1)");
         } else {
             q8BufferSize = 0;
@@ -685,18 +761,9 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         kvPB.setInt(4, kvDim);
         kvPB.setLong(5, gpuTokenParams);
 
-        // attention_full takes 10 args: arg9 = slidingWindow (0 = full attention).
-        // Qwen3.5 full-attention layers use full attention; arg9 must still be present
-        // since attention.cu reads 10 params (regression fix: was 9, crashed cuLaunchKernel).
-        attnPB = new ParamBuffer(arena, 10);
-        attnPB.setLong(0, gpuXb2);
-        attnPB.setLong(1, gpuQCompact);
-        attnPB.setInt(4, headCount);
-        attnPB.setInt(5, headCountKV);
-        attnPB.setInt(6, headSize);
-        attnPB.setInt(7, kvDim);
-        attnPB.setLong(8, gpuTokenParams);
-        attnPB.setInt(9, 0);
+        maxBatch = initBatchedPrefill(weights);
+        flashAttn = new FlashAttention(cudaContext, bufferManager, arena, headCount, headSize, maxSeqLen,
+            useFp16Kv, gpuTokenParams, Math.max(1, maxBatch));
 
         siluPB = new ParamBuffer(arena, 2);
         siluMulPB = new ParamBuffer(arena, 3);
@@ -815,18 +882,28 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 layerMatmuls[i][2] = new MatmulLaunch((CudaFloatTensor) lw.wv(), gpuXb, gpuV, kvDim, dim, 0);
                 layerMatmuls[i][3] = new MatmulLaunch((CudaFloatTensor) lw.wo(), gpuXb2, gpuX, dim, qDim, 1); // accumulate
             }
-            // FFN (shared by both layer types)
-            layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) lw.ffnGate(), gpuXb, gpuHb, ffnDim, dim, 0);
-            layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) lw.ffnUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
-            layerMatmuls[i][7] = new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, gpuX, dim, ffnDim, 1); // accumulate
+            // FFN (shared by both layer types; MoE layers go through forwardMoeFFN)
+            if (!moeLayer[i]) {
+                layerMatmuls[i][5] = new MatmulLaunch((CudaFloatTensor) lw.ffnGate(), gpuXb, gpuHb, ffnDim, dim, 0);
+                layerMatmuls[i][6] = new MatmulLaunch((CudaFloatTensor) lw.ffnUp(), gpuXb, gpuHb2, ffnDim, dim, 0);
+                layerMatmuls[i][7] = new MatmulLaunch((CudaFloatTensor) lw.ffnDown(), gpuHb, gpuX, dim, ffnDim, 1); // accumulate
+            }
         }
 
         // CUDA graph availability
-        this.graphAttnSharedMem = (maxSeqLen + 32) * Float.BYTES;
-        this.graphAvailable = !Boolean.getBoolean("cuda.nograph")
+        this.graphAvailable = !hasMoe // the routed experts are a host callback inside every layer
+                && !Boolean.getBoolean("cuda.nograph")
                 && cudaContext.isGraphApiAvailable()
                 && outputMatmul != null
-                && graphAttnSharedMem <= 48 * 1024;
+                && flashAttn.graphCompatible();
+
+        // Qwen3.5-MoE: no whole-token graph (the routed experts are a host callback inside every
+        // layer), but each layer's device work — up to the FFN norm and the shared expert — replays
+        // as its own graph from the layer's second call (F10); the callback stays outside.
+        this.layerGraphExec = new MemorySegment[blockCount];
+        this.layerRan = new boolean[blockCount];
+        this.layerGraphsBroken = !hasMoe || !MoeAttentionCudaPass.LAYER_GRAPHS
+            || !cudaContext.isGraphApiAvailable() || !flashAttn.graphCompatible();
 
         long totalVram = 0;
         for (int i = 0; i < gpuLayerCount; i++) {
@@ -852,7 +929,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
 
         System.err.println("Qwen35 CUDA: " + gpuLayerCount + "/" + blockCount + " layers on GPU"
                 + " (state: " + (totalVram / 1024 / 1024) + " MB"
-                + ", graph: " + (graphAvailable ? "available" : "unavailable")
+                + ", graph: " + (graphAvailable ? "available" : !layerGraphsBroken ? "per layer" : "unavailable")
                 + (useDp4a ? ", dp4a: " + dp4aCount + "/" + totalMatmuls + " matmuls" : "") + ")");
     }
 
@@ -869,12 +946,12 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 if (!(lw.attnQkv() instanceof CudaFloatTensor)) return false;
                 if (!(lw.ssmAlpha() instanceof CudaFloatTensor)) return false;
                 if (!(lw.ssmOut() instanceof CudaFloatTensor)) return false;
-                if (!(lw.ffnGate() instanceof CudaFloatTensor)) return false;
+                if (!lw.isMoe() && !(lw.ffnGate() instanceof CudaFloatTensor)) return false;
             } else {
                 if (!(lw.wq() instanceof CudaFloatTensor)) return false;
                 if (!(lw.wk() instanceof CudaFloatTensor)) return false;
                 if (!(lw.wo() instanceof CudaFloatTensor)) return false;
-                if (!(lw.ffnGate() instanceof CudaFloatTensor)) return false;
+                if (!lw.isMoe() && !(lw.ffnGate() instanceof CudaFloatTensor)) return false;
             }
         }
         return true;
@@ -896,7 +973,22 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         return gpuLayerCount;
     }
 
+    /**
+     * A token at position 0 starts a new sequence: zero the recurrent (SSM) states of the layers.
+     * The kernels carry them from token to token and never read the position (the short conv does,
+     * so its history needs no reset), so without this a second generation in the same process (the
+     * web server, interactive mode, the placement calibrator) started from the previous sequence's
+     * state.
+     */
+    private void resetRecurrentState() {
+        long stateBytes = (long) timeStepRank * stateSize * stateSize * Float.BYTES;
+        for (int i = 0; i < gpuLayerCount; i++) {
+            if (gpuSsmState[i] != 0) cudaContext.fillBufferZero(gpuSsmState[i], stateBytes);
+        }
+    }
+
     public void uploadXAndUpdateParams(float[] x, int position) {
+        if (position == 0) resetRecurrentState();
         long embBytes = (long) dim * Float.BYTES;
         MemorySegment.copy(x, 0, hostCombined, ValueLayout.JAVA_FLOAT, 0, dim);
         hostCombined.set(ValueLayout.JAVA_INT, embBytes, position);
@@ -915,10 +1007,54 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
             forwardLayerProfiled(layerIdx, position);
             return;
         }
+        if (!layerGraphsBroken) {
+            MemorySegment g = layerGraphExec[layerIdx];
+            if (g == null && layerRan[layerIdx]) g = captureLayer(layerIdx, position);
+            if (g != null) {
+                cudaContext.launchGraph(g);
+            } else {
+                deviceLayer(layerIdx, position);
+                layerRan[layerIdx] = true;
+            }
+            if (moeLayer[layerIdx]) moeHost(layerIdx);
+            return;
+        }
         if (isDeltaNet[layerIdx]) {
             forwardDeltaNetLayer(layerIdx);
         } else {
             forwardAttentionLayer(layerIdx, position);
+        }
+    }
+
+    /** The device work of a layer: everything but the routed-expert host callback of a MoE layer. */
+    private void deviceLayer(int layerIdx, int position) {
+        moeDeviceOnly = true;
+        try {
+            if (isDeltaNet[layerIdx]) forwardDeltaNetLayer(layerIdx);
+            else forwardAttentionLayer(layerIdx, position);
+        } finally {
+            moeDeviceOnly = false;
+        }
+    }
+
+    private MemorySegment captureLayer(int layerIdx, int position) {
+        try {
+            cudaContext.beginCapture();
+            try {
+                deviceLayer(layerIdx, position);
+            } catch (RuntimeException e) {
+                try { cudaContext.endCapture(); } catch (RuntimeException ignored) { }
+                throw e;
+            }
+            MemorySegment graph = cudaContext.endCapture();
+            MemorySegment exec = cudaContext.instantiateGraph(graph);
+            cudaContext.destroyGraph(graph);
+            layerGraphExec[layerIdx] = exec;
+            return exec;
+        } catch (RuntimeException e) {
+            layerGraphsBroken = true;
+            System.err.println("Qwen35 CUDA: per-layer graph capture failed (" + e.getMessage() + ") — running per launch");
+            return null;
         }
     }
 
@@ -987,9 +1123,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 System.err.println("Qwen35 CUDA graph: captured " + gpuLayerCount + " layers");
             } catch (Exception e) {
                 if (capturing) {
-                    try { cudaContext.endCapture(); } catch (Exception ignored) {}
+                    try { MemorySegment partial = cudaContext.endCapture(); if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial); } catch (Exception ignored) {}
                 }
                 System.err.println("Qwen35 CUDA graph: capture failed — " + e.getMessage());
+                graphAvailable = false; // a failed capture would fail again: stay on per-layer mode
                 graphExec = null;
                 return false;
             }
@@ -1025,7 +1162,7 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 System.err.println("Qwen35 CUDA prefill graph: captured " + gpuLayerCount + " layers (no output)");
             } catch (Exception e) {
                 if (capturing) {
-                    try { cudaContext.endCapture(); } catch (Exception ignored) {}
+                    try { MemorySegment partial = cudaContext.endCapture(); if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial); } catch (Exception ignored) {}
                 }
                 prefillGraphExec = null;
                 return false;
@@ -1081,8 +1218,9 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
                 cudaContext.destroyGraph(graph);
                 System.err.println("Qwen35 CUDA graph: captured " + gpuLayerCount + " layers (argmax)");
             } catch (Exception e) {
-                if (capturing) { try { cudaContext.endCapture(); } catch (Exception ignored) {} }
+                if (capturing) { try { MemorySegment partial = cudaContext.endCapture(); if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial); } catch (Exception ignored) {} }
                 System.err.println("Qwen35 CUDA graph: capture failed — " + e.getMessage());
+                graphAvailable = false; // a failed capture would fail again: stay on per-layer mode
                 graphExec = null;
                 return -1;
             }
@@ -1094,6 +1232,259 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         launchKernel(argmaxFinalFunc, 1, 256, 0, argmaxFinalPBuf.ptrs);
         cudaContext.readBuffer(gpuArgmaxResult, hostArgmaxResult, Integer.BYTES);
         return hostArgmaxResult.get(ValueLayout.JAVA_INT, 0);
+    }
+
+    // === Batched prefill ===
+
+    /** Allocate the chunk buffers and the GEMM helper; returns the chunk size, 0 when unavailable. */
+    private int initBatchedPrefill(Qwen35Weights weights) {
+        int nb = PREFILL_BATCH;
+        if (nb <= 1 || gpuLayerCount != blockCount || !GemmF16.available()
+                || "false".equals(System.getProperty("prefill.gpu.batched", "true"))) {
+            return 0;
+        }
+        java.util.List<CudaFloatTensor> ws = new java.util.ArrayList<>();
+        for (int i = 0; i < blockCount; i++) {
+            Qwen35LayerWeights lw = weights.layers()[i];
+            FloatTensor[] ts = isDeltaNet[i]
+                ? new FloatTensor[] { lw.attnQkv(), lw.ssmAlpha(), lw.ssmBeta(), lw.attnGate(), lw.ssmOut() }
+                : new FloatTensor[] { lw.wq(), lw.wk(), lw.wv(), lw.wo() };
+            for (FloatTensor t : ts) {
+                if (!(t instanceof CudaFloatTensor)) return 0;
+                ws.add((CudaFloatTensor) t);
+            }
+            if (!moeLayer[i]) {
+                for (FloatTensor t : new FloatTensor[] { lw.ffnGate(), lw.ffnUp(), lw.ffnDown() }) {
+                    if (!(t instanceof CudaFloatTensor)) return 0;
+                    ws.add((CudaFloatTensor) t);
+                }
+            }
+        }
+        long f = Float.BYTES;
+        try {
+            int maxCols = Math.max(Math.max(dim, innerSize), Math.max(qDim, ffnDim));
+            gemm = new GemmF16(cudaContext, bufferManager, arena, nb, maxCols, 16L << 20, ws);
+            bX = bufferManager.createBuffer((long) nb * dim * f);
+            bXn = bufferManager.createBuffer((long) nb * dim * f);
+            bQkv = bufferManager.createBuffer((long) nb * deltaQkvDim * f);
+            bAlpha = bufferManager.createBuffer((long) nb * timeStepRank * f);
+            bBeta = bufferManager.createBuffer((long) nb * timeStepRank * f);
+            bGate = bufferManager.createBuffer((long) nb * innerSize * f);
+            bOut = bufferManager.createBuffer((long) nb * innerSize * f);
+            bQ = bufferManager.createBuffer((long) nb * qGateDim * f);
+            bQc = bufferManager.createBuffer((long) nb * qDim * f);
+            bAg = bufferManager.createBuffer((long) nb * qDim * f);
+            bK = bufferManager.createBuffer((long) nb * kvDim * f);
+            bV = bufferManager.createBuffer((long) nb * kvDim * f);
+            bAtt = bufferManager.createBuffer((long) nb * qDim * f);
+            boolean anyDense = false;
+            for (int i = 0; i < blockCount; i++) anyDense |= !moeLayer[i];
+            if (anyDense) {
+                bHb = bufferManager.createBuffer((long) nb * ffnDim * f);
+                bHb2 = bufferManager.createBuffer((long) nb * ffnDim * f);
+            }
+            if (hasMoe) {
+                bRouted = bufferManager.createBuffer((long) nb * dim * f);
+                bMoeIn = new float[nb][dim];
+                bMoeOut = new float[nb][dim];
+            }
+            bTP = bufferManager.createBuffer((long) nb * 8);
+            bHost = cudaContext.allocPinnedHost(2L * nb * dim * f + (long) nb * 8);
+            String bo = "kernels/cuda/batch_ops.cu";
+            rmsBatchFunc = cudaContext.compileKernel(bo, "rmsnorm_batch");
+            ropeBatchFunc = cudaContext.compileKernel(bo, "rope_apply_batch");
+            kvBatchFunc = cudaContext.compileKernel(bo, useFp16Kv ? "kv_cache_update_batch_f16" : "kv_cache_update_batch");
+            bNormPB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 5);
+            bRopePB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 9);
+            bKvPB = new it.denzosoft.llmplayer.gpu.KernelParams(arena, 6);
+            return nb;
+        } catch (RuntimeException e) {
+            System.err.println("Qwen35 CUDA: batched prefill unavailable — " + e.getMessage());
+            if (gemm != null) { gemm.close(); gemm = null; }
+            return 0;
+        }
+    }
+
+    @Override
+    public int maxBatchTokens() { return maxBatch; }
+
+    @Override
+    public void setMoeFfnBatch(LayerGpuForwardPass.MoeFfnBatch ffn) { this.moeFfnBatch = ffn; }
+
+    @Override
+    public void prefillBatch(float[][] x, int basePos, int n) {
+        if (n < 1 || n > maxBatch) throw new IllegalArgumentException("batch " + n + " > " + maxBatch);
+        if (basePos == 0) resetRecurrentState();
+        long f = Float.BYTES;
+        long xBytes = (long) n * dim * f;
+        long tpOff = 2L * maxBatch * dim * f;
+        for (int t = 0; t < n; t++) {
+            MemorySegment.copy(x[t], 0, bHost, ValueLayout.JAVA_FLOAT, (long) t * dim * f, dim);
+            bHost.set(ValueLayout.JAVA_INT, tpOff + t * 8L, basePos + t);
+            bHost.set(ValueLayout.JAVA_INT, tpOff + t * 8L + 4, basePos + t + 1);
+        }
+        cudaContext.writeBufferAsync(bX, bHost, xBytes);
+        cudaContext.writeBufferAsync(bTP, bHost.asSlice(tpOff, n * 8L), n * 8L);
+        for (int layer = 0; layer < blockCount; layer++) {
+            Qwen35LayerWeights lw = weights.layers()[layer];
+            rmsnormB(bXn, bX, gpuAttnNormWeights[layer], n);
+            gemm.toF16(bXn, n * dim);
+            if (isDeltaNet[layer]) deltaNetBatch(layer, lw, n);
+            else attentionBatch(layer, lw, n);
+            ffnBatch(layer, lw, n);
+        }
+        // The last token's hidden state where forwardFinalLogits and the next decode step read it
+        cudaContext.copyBufferDtoD(gpuX, bX + (long) (n - 1) * dim * f, (long) dim * f);
+        cudaContext.finish();
+    }
+
+    private void deltaNetBatch(int layer, Qwen35LayerWeights lw, int n) {
+        long f = Float.BYTES;
+        gemm.gemm((CudaFloatTensor) lw.attnQkv(), deltaQkvDim, dim, bQkv, deltaQkvDim, n, false);
+        gemm.gemm((CudaFloatTensor) lw.ssmAlpha(), timeStepRank, dim, bAlpha, timeStepRank, n, false);
+        gemm.gemm((CudaFloatTensor) lw.ssmBeta(), timeStepRank, dim, bBeta, timeStepRank, n, false);
+        gemm.gemm((CudaFloatTensor) lw.attnGate(), innerSize, dim, bGate, innerSize, n, false);
+        conv1dPB.setLong(1, gpuConvState[layer]);
+        conv1dPB.setLong(2, gpuConvWeights[layer]);
+        alphaBetaPB.setLong(2, gpuSsmAWeights[layer]);
+        alphaBetaPB.setLong(3, gpuDtBiasWeights[layer]);
+        deltanetPB.setLong(0, gpuSsmState[layer]);
+        deltanetPB.setLong(5, gpuSsmNormWeights[layer]);
+        try {
+            for (int t = 0; t < n; t++) {
+                long qkv = bQkv + (long) t * deltaQkvDim * f;
+                long al = bAlpha + (long) t * timeStepRank * f, be = bBeta + (long) t * timeStepRank * f;
+                conv1dPB.setLong(0, qkv);
+                conv1dPB.setLong(5, bTP + t * 8L);
+                launchKernel(conv1dFunc, conv1dGridDim, (int) blockSize, 0, conv1dPB.ptrs);
+                alphaBetaPB.setLong(0, al);
+                alphaBetaPB.setLong(1, be);
+                launchKernel(alphaBetaFunc, 1, (int) Math.max(32, timeStepRank), 0, alphaBetaPB.ptrs);
+                deltanetPB.setLong(1, qkv);
+                deltanetPB.setLong(2, al);
+                deltanetPB.setLong(3, be);
+                deltanetPB.setLong(4, bGate + (long) t * innerSize * f);
+                deltanetPB.setLong(6, bOut + (long) t * innerSize * f);
+                launchKernel(deltanetFunc, timeStepRank, stateSize, deltanetSharedMem, deltanetPB.ptrs);
+            }
+        } finally {
+            // The per-token decode path reads these parameter blocks as set in the constructor
+            conv1dPB.setLong(0, gpuQkv);
+            conv1dPB.setLong(5, gpuTokenParams);
+            alphaBetaPB.setLong(0, gpuAlpha);
+            alphaBetaPB.setLong(1, gpuBeta);
+            deltanetPB.setLong(1, gpuQkv);
+            deltanetPB.setLong(2, gpuAlpha);
+            deltanetPB.setLong(3, gpuBeta);
+            deltanetPB.setLong(4, gpuGate);
+            deltanetPB.setLong(6, gpuDeltaOut);
+        }
+        gemm.toF16(bOut, n * innerSize);
+        gemm.gemm((CudaFloatTensor) lw.ssmOut(), dim, innerSize, bX, dim, n, true);
+    }
+
+    private void attentionBatch(int layer, Qwen35LayerWeights lw, int n) {
+        gemm.gemm((CudaFloatTensor) lw.wq(), qGateDim, dim, bQ, qGateDim, n, false);
+        gemm.gemm((CudaFloatTensor) lw.wk(), kvDim, dim, bK, kvDim, n, false);
+        gemm.gemm((CudaFloatTensor) lw.wv(), kvDim, dim, bV, kvDim, n, false);
+        int bs = (int) blockSize;
+        try {
+            // Packed rows are [q | gate] per head: the chunk's n tokens are n * headCount heads
+            deinterleavePB.setLong(0, bQ);
+            deinterleavePB.setLong(1, bQc);
+            deinterleavePB.setLong(2, bAg);
+            deinterleavePB.setInt(3, n * headCount);
+            launchKernel(deinterleaveFunc, (n * qDim + bs - 1) / bs, bs, 0, deinterleavePB.ptrs);
+            if (gpuQNormWeights[layer] != 0) {
+                perHeadNormPB.setLong(0, bQc);
+                perHeadNormPB.setLong(1, gpuQNormWeights[layer]);
+                launchKernel(perHeadNormFunc, n * headCount, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
+                perHeadNormPB.setLong(0, bK);
+                perHeadNormPB.setLong(1, gpuKNormWeights[layer]);
+                launchKernel(perHeadNormFunc, n * headCountKV, perHeadNormBlockDim, perHeadNormSharedMem, perHeadNormPB.ptrs);
+            }
+            ropeB(bQc, headCount, qDim, n);
+            ropeB(bK, headCountKV, kvDim, n);
+            bKvPB.setLong(0, gpuKeyCache[layer]).setLong(1, gpuValueCache[layer]).setLong(2, bK).setLong(3, bV)
+                 .setInt(4, kvDim).setLong(5, bTP);
+            launch2(kvBatchFunc, (kvDim + bs - 1) / bs, n, bs, 0, bKvPB);
+            flashAttn.launchBatch(defaultStream, bAtt, bQc, gpuKeyCache[layer], gpuValueCache[layer], headCountKV,
+                headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, n, bTP, qDim);
+            sigmoidMulPB.setLong(0, bAtt);
+            sigmoidMulPB.setLong(1, bAg);
+            sigmoidMulPB.setInt(2, n * qDim);
+            launchKernel(sigmoidMulFunc, (n * qDim + bs - 1) / bs, bs, 0, sigmoidMulPB.ptrs);
+        } finally {
+            deinterleavePB.setLong(0, gpuQ);
+            deinterleavePB.setLong(1, gpuQCompact);
+            deinterleavePB.setLong(2, gpuAttnGate);
+            deinterleavePB.setInt(3, headCount);
+            sigmoidMulPB.setLong(0, gpuXb2);
+            sigmoidMulPB.setLong(1, gpuAttnGate);
+            sigmoidMulPB.setInt(2, qDim);
+        }
+        gemm.toF16(bAtt, n * qDim);
+        gemm.gemm((CudaFloatTensor) lw.wo(), dim, qDim, bX, dim, n, true);
+    }
+
+    private void ffnBatch(int layer, Qwen35LayerWeights lw, int n) {
+        long f = Float.BYTES;
+        rmsnormB(bXn, bX, gpuFfnNormWeights[layer], n);
+        int bs = (int) blockSize;
+        if (moeLayer[layer]) {
+            // Routed experts (and the shared expert) on the CPU for the whole chunk: one sync
+            long xBytes = (long) n * dim * f;
+            cudaContext.readBufferAsync(bXn, bHost, xBytes);
+            cudaContext.finish();
+            for (int t = 0; t < n; t++) MemorySegment.copy(bHost, ValueLayout.JAVA_FLOAT, (long) t * dim * f, bMoeIn[t], 0, dim);
+            if (moeFfnBatch != null) {
+                moeFfnBatch.routedBatch(layer, bMoeIn, n, bMoeOut);
+            } else {
+                for (int t = 0; t < n; t++) moeFfn.routed(layer, bMoeIn[t], bMoeOut[t], true);
+            }
+            for (int t = 0; t < n; t++) MemorySegment.copy(bMoeOut[t], 0, bHost, ValueLayout.JAVA_FLOAT, (long) t * dim * f, dim);
+            cudaContext.writeBufferAsync(bRouted, bHost, xBytes);
+            try {
+                accPB.setLong(0, bX);
+                accPB.setLong(1, bRouted);
+                accPB.setInt(2, n * dim);
+                launchKernel(accumulateFunc, (n * dim + bs - 1) / bs, bs, 0, accPB.ptrs);
+            } finally {
+                accPB.setInt(2, dim);
+            }
+            return;
+        }
+        gemm.toF16(bXn, n * dim);
+        gemm.gemm((CudaFloatTensor) lw.ffnGate(), ffnDim, dim, bHb, ffnDim, n, false);
+        gemm.gemm((CudaFloatTensor) lw.ffnUp(), ffnDim, dim, bHb2, ffnDim, n, false);
+        try {
+            siluMulPB.setLong(0, bHb);
+            siluMulPB.setLong(1, bHb2);
+            siluMulPB.setInt(2, n * ffnDim);
+            launchKernel(siluMulFunc, (n * ffnDim + bs - 1) / bs, bs, 0, siluMulPB.ptrs);
+        } finally {
+            siluMulPB.setLong(0, gpuHb);
+            siluMulPB.setLong(1, gpuHb2);
+            siluMulPB.setInt(2, ffnDim);
+        }
+        gemm.toF16(bHb, n * ffnDim);
+        gemm.gemm((CudaFloatTensor) lw.ffnDown(), dim, ffnDim, bX, dim, n, true);
+    }
+
+    private void rmsnormB(long out, long in, long w, int n) {
+        bNormPB.setLong(0, out).setLong(1, in).setLong(2, w).setInt(3, dim).setFloat(4, normEps);
+        launch2(rmsBatchFunc, n, 1, (int) blockSize, normSharedMem, bNormPB);
+    }
+
+    private void ropeB(long vec, int heads, int stride, int n) {
+        bRopePB.setLong(0, vec).setLong(1, gpuCosTable).setLong(2, gpuSinTable).setInt(3, heads).setInt(4, headSize)
+               .setInt(5, halfRope).setLong(6, bTP).setInt(7, ropeType).setInt(8, stride);
+        launch2(ropeBatchFunc, (int) ((heads * halfRope + blockSize - 1) / blockSize), n, (int) blockSize, 0, bRopePB);
+    }
+
+    private void launch2(MemorySegment fn, int gx, int gy, int block, int shared, it.denzosoft.llmplayer.gpu.KernelParams p) {
+        int err = CudaBindings.launchKernel(fn, gx, gy, 1, block, 1, 1, shared, defaultStream, p.ptrs(), MemorySegment.NULL);
+        if (err != CudaBindings.CUDA_SUCCESS) throw new RuntimeException("Qwen35 batched prefill launch error: " + err);
     }
 
     // === DeltaNet Layer ===
@@ -1183,10 +1574,8 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         launchKernel(kvCacheUpdateFunc, kvUpdateGridDim, (int) blockSize, 0, kvPB.ptrs);
 
         // 8. Full attention
-        attnPB.setLong(2, gpuKeyCache[layerIdx]);
-        attnPB.setLong(3, gpuValueCache[layerIdx]);
-        int attnSharedMem = (position + 1 + 32) * Float.BYTES;
-        launchKernel(attentionFullFunc, headCount, Math.min(256, (int) blockSize), attnSharedMem, attnPB.ptrs);
+        flashAttn.launch(defaultStream, gpuXb2, gpuQCompact, gpuKeyCache[layerIdx], gpuValueCache[layerIdx],
+            headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, position);
 
         // 9. Sigmoid gate: xb2 *= sigmoid(attnGate)
         launchKernel(sigmoidMulFunc, deinterleaveGridDim, (int) blockSize, 0, sigmoidMulPB.ptrs);
@@ -1206,6 +1595,10 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
     // === FFN (shared) ===
 
     private void forwardFFN(int layerIdx) {
+        if (moeLayer[layerIdx]) {
+            forwardMoeFFN(layerIdx);
+            return;
+        }
         MatmulLaunch[] ml = layerMatmuls[layerIdx];
 
         // FFN RMSNorm + Q8_1 quantize (T1.1 fused if enabled)
@@ -1231,6 +1624,52 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         } else {
             launchMatmul(ml[7]);
         }
+    }
+
+    @Override
+    public void setMoeFfn(LayerGpuForwardPass.MoeFfn ffn) { this.moeFfn = ffn; }
+
+    /**
+     * MoE FFN of one layer: norm, then the gated shared expert queued on the GPU, then the normed
+     * input downloaded (the one sync), the routed experts from the engine, uploaded and added.
+     */
+    private void forwardMoeFFN(int layerIdx) {
+        normAndQuantize(gpuFfnNormWeights[layerIdx]);
+        Qwen35LayerWeights lw = weights.layers()[layerIdx];
+        boolean shared = sharedOnGpu[layerIdx];
+        if (shared) {
+            mmShIn.invalidate();
+            mmShIn.matmul((CudaFloatTensor) lw.ffnGateShexp(), 0, gpuXb, gpuShG, sharedFfn, dim, false);
+            mmShIn.matmul((CudaFloatTensor) lw.ffnUpShexp(), 0, gpuXb, gpuShU, sharedFfn, dim, false);
+            launchKernel(shSiluFunc, (sharedFfn + (int) blockSize - 1) / (int) blockSize, (int) blockSize, 0, shSiluPB.ptrs());
+            mmShDown.invalidate();
+            mmShDown.matmul((CudaFloatTensor) lw.ffnDownShexp(), 0, gpuShG, gpuShOut, dim, sharedFfn, false);
+            long logit = 0;
+            if (lw.ffnGateInpShexp() != null) {
+                mmShIn.matmul((CudaFloatTensor) lw.ffnGateInpShexp(), 0, gpuXb, gpuShLogit, 1, dim, false);
+                logit = gpuShLogit;
+            }
+            shAxpyPB.setLong(2, logit);
+            launchKernel(gateAxpyFunc, (dim + (int) blockSize - 1) / (int) blockSize, (int) blockSize, 0, shAxpyPB.ptrs());
+        }
+        if (!moeDeviceOnly) moeHost(layerIdx);
+    }
+
+    /**
+     * Host part of a MoE layer: download the normed input (the layer's one synchronisation), run
+     * the routed experts in the engine, upload their sum and add it (with the shared expert's gate
+     * already applied on the device) to the residual.
+     */
+    private void moeHost(int layerIdx) {
+        boolean shared = sharedOnGpu[layerIdx];
+        long fb = Float.BYTES;
+        cudaContext.readBuffer(gpuXb, hostMoe, (long) dim * fb);
+        MemorySegment.copy(hostMoe, ValueLayout.JAVA_FLOAT, 0, moeXn, 0, dim);
+        moeFfn.routed(layerIdx, moeXn, moeOut, !shared);
+        MemorySegment routedHost = hostMoe.asSlice((long) dim * fb, (long) dim * fb);
+        MemorySegment.copy(moeOut, 0, routedHost, ValueLayout.JAVA_FLOAT, 0, dim);
+        cudaContext.writeBufferAsync(gpuRouted, routedHost, (long) dim * fb);
+        launchKernel(gateAxpyFunc, (dim + (int) blockSize - 1) / (int) blockSize, (int) blockSize, 0, routedAxpyPB.ptrs());
     }
 
     // === CUDA Graph layer (fixed shared mem) ===
@@ -1279,10 +1718,8 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         kvPB.setLong(1, gpuValueCache[layerIdx]);
         launchKernel(kvCacheUpdateFunc, kvUpdateGridDim, (int) blockSize, 0, kvPB.ptrs);
 
-        attnPB.setLong(2, gpuKeyCache[layerIdx]);
-        attnPB.setLong(3, gpuValueCache[layerIdx]);
-        // Fixed shared mem for graph capture
-        launchKernel(attentionFullFunc, headCount, Math.min(256, (int) blockSize), graphAttnSharedMem, attnPB.ptrs);
+        flashAttn.launch(defaultStream, gpuXb2, gpuQCompact, gpuKeyCache[layerIdx], gpuValueCache[layerIdx],
+            headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, -1);
 
         launchKernel(sigmoidMulFunc, deinterleaveGridDim, (int) blockSize, 0, sigmoidMulPB.ptrs);
         launchMatmul(ml[3]);
@@ -1311,7 +1748,11 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         switch (ml.dp4aType) {
             case 3: func = dp4aQ3kFunc; break;
             case 5: func = dp4aQ5kFunc; break;
-            case 6: func = dp4aQ6kFunc; break;
+            case 6:
+                // Measured ~3% slower than the FP32 Q6_K kernel (byte loads on the unaligned 210-byte
+                // block); opt-in like CudaForwardPass, -Dcuda.dp4a.q6=true.
+                if (!DP4A_Q6) { launchMatmul(ml); return; }
+                func = dp4aQ6kFunc; break;
             case 50: func = dp4aQ50Func; break;
             case 80: func = dp4aQ80Func; break;
             case 41: func = dp4aIq4nlFunc; break;
@@ -1366,7 +1807,11 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         switch (ml.dp4aType) {
             case 3: func = dp4aQ3kFunc; break;
             case 5: func = dp4aQ5kFunc; break;
-            case 6: func = dp4aQ6kFunc; break;
+            case 6:
+                // Measured ~3% slower than the FP32 Q6_K kernel (byte loads on the unaligned 210-byte
+                // block); opt-in like CudaForwardPass, -Dcuda.dp4a.q6=true.
+                if (!DP4A_Q6) { launchMatmul(ml); return; }
+                func = dp4aQ6kFunc; break;
             case 50: func = dp4aQ50Func; break;
             case 80: func = dp4aQ80Func; break;
             case 41: func = dp4aIq4nlFunc; break;
@@ -1429,7 +1874,6 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
         if (function == quantizeFunc) return "quantize_input";
         if (function == rmsnormQuantizeFunc) return "rmsnorm+quantize (T1.1 fused)";
         if (function == deltanetFunc) return "deltanet (recurrence+norm+gate)";
-        if (function == attentionFullFunc) return "attention.full";
         if (function == conv1dFunc) return "conv1d+silu";
         if (function == alphaBetaFunc) return "alpha_beta";
         if (function == deinterleaveFunc) return "deinterleave_q_gate";
@@ -1518,9 +1962,15 @@ public class Qwen35CudaForwardPass implements AutoCloseable {
 
     @Override
     public void close() {
+        if (gemm != null) gemm.close();
+        if (bHost != null) try { cudaContext.freePinnedHost(bHost); } catch (Exception ignored) {}
         if (graphExec != null) {
             try { cudaContext.destroyGraphExec(graphExec); } catch (Exception ignored) {}
         }
+        for (MemorySegment g : layerGraphExec) {
+            if (g != null) try { cudaContext.destroyGraphExec(g); } catch (Exception ignored) {}
+        }
+        if (hostMoe != null) try { cudaContext.freePinnedHost(hostMoe); } catch (Exception ignored) {}
         arena.close();
     }
 }

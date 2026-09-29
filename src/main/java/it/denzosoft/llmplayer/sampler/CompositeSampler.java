@@ -29,12 +29,25 @@ public class CompositeSampler implements Sampler {
         this.mirostatMu = 2.0f * config.mirostatTau();
     }
 
+    // Per-sampler scratch, reused across tokens (was two vocab-sized allocations per token)
+    private float[] probsBuf;
+    private float[] selectBuf;
+
     @Override
     public int sample(float[] logits) {
         int vocabSize = logits.length;
 
+        // Greedy without DRY: penalize the recent tokens in place, take the argmax, restore them.
+        // Same values and the same first-index tie-break as working on a copy, without copying
+        // (and walking) the whole vocabulary an extra time per token.
+        if (config.temperature() == 0.0f && config.dryMultiplier() <= 0f) {
+            return greedyInPlace(logits, vocabSize);
+        }
+
         // 0. Copy logits so we don't mutate caller's buffer
-        float[] probs = Arrays.copyOf(logits, vocabSize);
+        if (probsBuf == null || probsBuf.length != vocabSize) probsBuf = new float[vocabSize];
+        float[] probs = probsBuf;
+        System.arraycopy(logits, 0, probs, 0, vocabSize);
 
         // 1. DRY penalty (before repetition penalty, applied to logits)
         if (config.dryMultiplier() > 0f) {
@@ -249,6 +262,37 @@ public class CompositeSampler implements Sampler {
         return sampled;
     }
 
+    private int greedyInPlace(float[] logits, int vocabSize) {
+        float rp = config.repetitionPenalty();
+        int n = recentTokens.size();
+        int[] ids = null;
+        float[] saved = null;
+        if (rp != 1.0f && n > 0) {
+            ids = new int[n];
+            saved = new float[n];
+            // save originals first (a token can occur several times: penalized once per occurrence)
+            for (int i = 0; i < n; i++) {
+                int t = recentTokens.get(i);
+                ids[i] = t;
+                saved[i] = (t >= 0 && t < vocabSize) ? logits[t] : 0f;
+            }
+            for (int i = 0; i < n; i++) {
+                int t = ids[i];
+                if (t < 0 || t >= vocabSize) continue;
+                if (logits[t] > 0) logits[t] /= rp; else logits[t] *= rp;
+            }
+        }
+        int best = argmax(logits, vocabSize);
+        if (ids != null) {
+            for (int i = n - 1; i >= 0; i--) {
+                int t = ids[i];
+                if (t >= 0 && t < vocabSize) logits[t] = saved[i];
+            }
+        }
+        addRecentToken(best);
+        return best;
+    }
+
     private void addRecentToken(int token) {
         recentTokens.add(token);
         if (recentTokens.size() > maxRecentTokens) {
@@ -272,9 +316,10 @@ public class CompositeSampler implements Sampler {
      * Quickselect: find the k-th largest value in O(n) average time.
      * Returns the threshold value such that exactly k elements are >= threshold.
      */
-    private static float quickselect(float[] arr, int size, int k) {
-        // Copy to avoid modifying the original during partitioning
-        float[] work = new float[size];
+    private float quickselect(float[] arr, int size, int k) {
+        // Copy to avoid modifying the original during partitioning (scratch reused across tokens)
+        if (selectBuf == null || selectBuf.length < size) selectBuf = new float[size];
+        float[] work = selectBuf;
         System.arraycopy(arr, 0, work, 0, size);
         int targetIdx = size - k; // k-th largest = (size-k)-th smallest
         return select(work, 0, size - 1, targetIdx);

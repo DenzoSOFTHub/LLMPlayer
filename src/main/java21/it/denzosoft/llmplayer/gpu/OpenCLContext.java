@@ -39,6 +39,18 @@ public class OpenCLContext implements AutoCloseable {
      * Enumerate all OpenCL devices across all platforms.
      */
     public static List<DeviceInfo> enumerateDevices() {
+        // Loading the ICDs (PoCL with its LLVM runtime) replaces the JVM's own SIGSEGV/SIGBUS/
+        // SIGFPE/SIGILL handlers, after which an ordinary JVM fault kills the process without an
+        // hs_err report: keep the JVM's handlers around the probe (see JvmSignalGuard).
+        JvmSignalGuard guard = JvmSignalGuard.save();
+        try {
+            return enumerateDevicesUnguarded();
+        } finally {
+            guard.restore();
+        }
+    }
+
+    private static List<DeviceInfo> enumerateDevicesUnguarded() {
         List<DeviceInfo> result = new ArrayList<>();
         if (!OpenCLBindings.isAvailable()) return result;
 

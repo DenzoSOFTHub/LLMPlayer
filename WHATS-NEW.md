@@ -1,5 +1,168 @@
 # LLMPlayer — What's New
 
+## v1.19.0 — GPU/CUDA overhaul, MoE models on the GPU, MiniMax-M2 and Qwen3.5-MoE (2026-09-29)
+
+An audit of the CUDA integration found correctness bugs (a cached conversation could attend over
+another conversation's KV cache on the GPU, a GPU failure fell back to a CPU with no history,
+contexts past about 12,200 tokens broke every GPU pass) and a set of structural bottlenecks
+(prefill at decode speed, attention that re-read the KV cache once per query head, MoE projections
+round-tripping to the GPU one matmul at a time). All of them are addressed below. Benchmarks are in
+`BENCHMARKS.md`; the design is in `docs/optimization/cuda-forward-pass.md`.
+
+A follow-up investigation into MoE models that appeared to decode slower with the GPU than with
+`--no-gpu` is written up in `docs/optimization/gpu-slower-than-cpu.md`. Its main findings: the
+Qwen3MoE-engine profiler had been folding the per-token GPU-mode prefill into its per-token averages
+(fixed; the profile line now also prints the expert-cache hit rate), run-to-run drift on the laptop
+reaches 2× so only interleaved comparisons count, and the GPU spends a MoE-optimized decode in its
+idle or near-idle power state because the attention bursts are too short to wake the boost governor.
+The document also carries the prioritized fix plan (per-layer CUDA graphs, expert-cache arena,
+batched GPU-mode prefill, VRAM planner, placement calibration), the hypotheses that were measured
+and rejected, and, in its sections 8 and 9, how the plan was implemented and what it measured; the
+last subsection below summarizes it.
+
+### New models and formats
+
+- **MiniMax-M2** (`minimax-m2`) on the Qwen3-MoE engine: sigmoid routing with `exp_probs_b`, a
+  QK-norm over the whole projection, partial NEOX RoPE.
+- **Qwen3.5-MoE** (`qwen35moe`, e.g. Qwen3.5-35B-A3B) on the Qwen3.5 engine, with a softmax-routed
+  MoE FFN; on the GPU the pass runs everything but the routed experts, which the engine computes
+  on the CPU and the GPU expert cache (8 tok/s on an RTX 4050 Laptop GPU).
+- **IQ1_M and IQ2_XXS**, with scalar, SIMD and CUDA tensor classes, validated element by element
+  against gguf-py.
+- **MLA latent KV cache** (`-Dmla.latent`, on by default for the separate `wk_b`/`wv_b` layout):
+  the cache holds one `[latent | k_rope]` row per token, shared by every head, on the CPU and the
+  GPU; GLM-4.7-Flash at 2K context needs 222 MB of GPU KV instead of 3.9 GB.
+- **Faster MoE on the CPU**: routed experts split by rows over the matmul pool (they were parallel
+  over the top-K experts only), and small F32 tensors such as the router copied to the heap
+  (GLM-4.7-Flash CPU 607 → 316 ms per token).
+- End to end on the GPU with the hybrid expert cache: GLM-4.7-Flash 0.7 → about 5 tok/s,
+  DeepSeek-Coder-V2-Lite 1.3 → 6.8, Qwen3-Coder-30B 2.8 → 6.2, GPT-OSS-20B 0.9 → 3.7.
+
+### Performance
+
+- **Batched GPU prefill.** Full-offload dense models prefill prompts of 32 tokens or more in chunks
+  of up to 256 tokens: each projection is one cuBLAS GEMM on FP16-dequantized weight tiles, attention
+  is one causal launch per chunk. On ~1000-token prompts: Llama-3.2-1B 90 → 905 tok/s,
+  Gemma-3-1B 104 → 1570, Phi-3-mini IQ4_NL 11 → 274, Llama-3.2-3B Q3_K_L 40 → 435. Needs
+  `libcublas.so`; without it (or with `-Dcuda.prefill.batched=false`) prefill uses the per-token path.
+- **Prefill tokens skip the output projection on the GPU.** The layers-only CUDA graph replaces the
+  full graph for prompt tokens whose logits are discarded (+45% per-token prefill on Llama-1B).
+- **Flash-decoding attention in every GPU pass.** Coalesced K/V streaming, online softmax, one read
+  of each K/V row per GQA group, split over the sequence: Llama-3.2-1B decode at 4158 tokens of
+  context 42 → 75 tok/s. No context-length ceiling any more.
+- **dp4a for gate/up of every quant type** in `CudaForwardPass` (it was Q4_K only): Llama-3.2-3B
+  Q3_K_L 14.7 → 33 tok/s, Gemma-3-1B 39.5 → 63 tok/s.
+- **MoE attention on the GPU.** `MoeAttentionCudaPass` runs the attention half of every
+  Qwen3-MoE-family layer on the device with one upload and one download per layer (Qwen3-Coder-30B:
+  attention 197 → 37 ms per token).
+- **K-quant MoE experts in the GPU expert cache**, now correct and on by default (Qwen3-Coder-30B:
+  4.2 → 4.7 tok/s, output identical to the CPU expert path); the cache also runs the activation and
+  expert biases on the GPU with one synchronization per layer.
+- **CUDA graphs and one-quantization-per-input for LFM2, Falcon-H1 and Gemma 4.** Falcon-H1 now
+  gains from dp4a, which is on by default (+40% on Falcon-H1-1.5B); Gemma-4-E2B +8% decode.
+- **Per-tensor GPU matmuls** (architectures without a GPU-resident pass: Hunyuan, Spark2.5,
+  Nanbeige, Qwen3-VL, DeepSeek2, Ling) use a page-locked staging buffer, one upload instead of two,
+  and no per-call allocation (Hy-MT2-1.8B about 4 → 7–8 tok/s); their CPU fallback and every `dot()`
+  on a GPU-backed weight use the SIMD kernel instead of the scalar one.
+- **No reflection in the per-token GPU path.** All GPU passes are called through base-code
+  interfaces (`DenseGpuForwardPass`, `LayerGpuForwardPass`, `GpuAttentionPass`, `GpuMoeExperts`)
+  instead of `Method.invoke` per layer.
+- **Greedy sampling without copying the vocabulary**, and page-locked logits on the GPU pass.
+- **NVRTC disk cache and cubin output** (`~/.cache/llmplayer/cuda`), device enumeration done once
+  per process.
+
+### Correctness
+
+- **A resumed conversation could attend over another conversation's GPU KV cache.** The device
+  holds the history of the last state that ran; a different cached state is now restarted from
+  position 0 instead of resumed.
+- **A GPU failure mid-sequence produced garbage.** The CPU fallback attended over an empty KV
+  history. It now throws `GpuFailureException`; the request is redone on the CPU when nothing has
+  been streamed yet.
+- **Contexts past ~12,200 tokens failed on the GPU** (attention scores in shared memory) and then
+  fell into the failure above. The flash kernel has no such limit.
+- **CUDA context current on one thread only.** A model loaded on one HTTP worker thread failed on
+  another with `CUDA_ERROR_INVALID_CONTEXT`; every entry point now makes the context current.
+  Generations are serialized while a GPU backend is active.
+- **Graph capture error 906** (legacy-stream call during a global-mode capture) is gone: one
+  non-blocking stream, stream-ordered copies, thread-local capture mode. A failed capture is no
+  longer retried on every token.
+- **OLMo 2 Q/K norm** is one RMSNorm over the whole projection, not per head (CPU and GPU):
+  OLMo-2-1B on a 1000-token prompt went from gibberish (PPL 67) to a correct summary (PPL 2.4).
+- **Granite Hybrid logits were divided by the logit scale twice** on the GPU path (PPL 2600 → 1.2;
+  greedy output was unaffected, sampling was not).
+- **Attention-logit soft-cap, Wo bias and output bias** (Gemma 2, Qwen2 variants) are now applied
+  on the GPU; they were silently skipped.
+- **FP16 KV auto-enabled by the placement budget** was honoured only by `CudaForwardPass`; the other
+  passes allocated FP32 at twice the budgeted size. The setting also leaked into later loads in the
+  same process.
+- **The hardware plan picked a PoCL CPU device** as "GPU" when it reported more memory than the real
+  GPU.
+- **`CudaForwardPass` under `-Dcuda.profile=true`** skipped QK-norm and the Granite scaling (the
+  profiled path was a separate copy); the three per-layer copies are now one implementation.
+- **The embedding API returned a stale vector on the GPU** (it read `state.xb`, which the GPU pass
+  never writes).
+- **The Q2_K CPU layout was wrong** (a plain byte order instead of ggml's); fixed and validated
+  against gguf-py.
+- **GLM-4.7-Flash routing** normalized the selected expert weights with an L2 norm instead of
+  llama.cpp's sum, which produced garbage after about 60 tokens.
+- **Tokenizer control tokens** (type 3) are registered as special tokens, and a BOS already present
+  at the start of a prompt is no longer prepended a second time (GLM's `[gMASK]` was doubled).
+
+### MoE and hybrid models on the GPU: the fix plan of `gpu-slower-than-cpu.md`
+
+The fixes F0-F12 of `docs/optimization/gpu-slower-than-cpu.md` were implemented and measured with
+short interleaved runs; section 8 of that document records what was built and section 9 the
+measurements.
+
+- **Expert cache arena** (F2). Slots are sized per projection and packed into 128 MiB chunks, so
+  the 2 MiB page rounding is paid per chunk: Qwen3-Coder-30B keeps 1060 experts where 841 fitted
+  before, at a peak of 4542 MB instead of 5916 MB.
+- **Per-layer CUDA graphs** for the MoE attention passes and the Qwen3.5-MoE layers (F3, F10),
+  replayed bit-identically to the per-launch path. Qwen3.5-35B-A3B decodes at 122 ms per token
+  against 129.5 ms.
+- **A faster GPU expert cache** (F5): asynchronous promotions through page-locked staging, routing
+  profiles saved at close and loaded at the next start (hit rate 63-65% from the first token against
+  41-48% cold), a per-layer cap on the experts sent to the GPU, one launch per projection for all of
+  a layer's resident experts, and dp4a kernels for its K-quant slots (Qwen3-Coder-30B: 174 ms per
+  token against 198-252 ms without dp4a).
+- **Batched prefill in GPU mode** (F6) for the MoE attention passes (Qwen3-Coder-30B about 27 ms
+  per prompt token with the hybrid expert cache), the expanded MLA layout (DeepSeek-Coder-V2-Lite
+  2×) and the Qwen3.5 pass (Qwen3.5-0.8B 6.5× on a 452-token prompt, with final logits closer to
+  the CPU than the per-token GPU path).
+- **The matmul pool stays on with a GPU** (F4): the CPU share of a partial offload runs about 2×
+  faster on Qwen3-8B with 16 of 36 layers on the GPU, 18% on Qwen3-Coder-30B with 10 layers.
+- **VRAM guard** (F7): under WSL2 `cuMemAlloc` succeeds beyond the physical VRAM and the excess
+  runs at 9-24 GB/s. Large allocations made when little memory is free are now probed and released
+  when they landed in shared memory; the weight falls back to the CPU, the attention layer stays on
+  the CPU, the expert cache stops growing.
+- **`--auto-tune` calibrates on the loaded model** (F8): no reloads, a true CPU candidate, the
+  expert cache, the clock keeper and the thread count as axes, decode timed after a 256-token
+  prefix when the model is fast, prefill timed too (`-Dplacement.workload`), verdicts stored per
+  model and GPU.
+- **Output projection routing and small-matmul threshold** (F9): the output projection runs on
+  whichever device is currently faster, and weights under 1 MiB never take the per-tensor GPU path.
+- **Instrumentation** (F0): per-phase decode profile for the MoE engines, expert-cache statistics
+  in the CLI, JMX and `/api/metrics`, NVML P-state sampling (`-Dgpu.pstate.sample=true`).
+- **Clock keeper** (F1, `-Dcuda.clockkeeper`): rewritten to choose its duty by the total time per
+  token. It stays opt-in: with the graphs and the dp4a cache the GPU no longer idles in P8 on
+  Qwen3-Coder, and the keeper measured no gain.
+- F11 (CPU expert range compaction) was built, bit-identical, with its gain not confirmed; F12 was
+  rejected by its measurement.
+
+Correctness fixes found on the way:
+
+- **Qwen3.5, Nemotron-H and Falcon-H1 on the GPU reused the previous sequence's recurrent state.**
+  Every generation after the first in one process (the web server, interactive mode, `--auto-tune`)
+  started from the last sequence's DeltaNet or Mamba-2 state and produced different text. The
+  passes now reset it at position 0.
+- **The OpenCL device probe replaced the JVM's signal handlers** (PoCL/LLVM), which killed GPU runs
+  with a bare segmentation fault; the handlers are now restored after the probe.
+- **`--gpu-layers N` was ignored unless `--gpu` was also given.**
+- **`-Dmatmul.pool=force` left the matmul pool off** instead of forcing it on.
+- **The Qwen3.5 CPU attention failed on states smaller than the engine's context** (index out of
+  bounds), which the placement calibrator creates.
+
 ## v1.18.0 — New architectures, image input, text-to-speech, a faster CPU path and three RoPE/routing fixes (2026-09-25)
 
 This is the first published release since v1.16.1. Version 1.17.0 was prepared but never published

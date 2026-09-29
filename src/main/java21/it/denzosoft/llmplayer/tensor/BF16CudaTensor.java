@@ -34,7 +34,7 @@ public class BF16CudaTensor extends CudaFloatTensor {
     }
 
     @Override
-    public float dot(long thisOffset, float[] other, int otherOffset, int length) {
+    protected float dotScalar(long thisOffset, float[] other, int otherOffset, int length) {
         float result = 0f;
         for (int i = 0; i < length; i++) {
             result += getFloat(thisOffset + i) * other[otherOffset + i];

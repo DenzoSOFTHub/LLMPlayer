@@ -22,7 +22,7 @@ import java.lang.foreign.ValueLayout;
  * Gated by {@link #isSupported}: falls back to the per-tensor path if any weight is not GPU-resident.
  * Channel/attention multipliers are baked into the GGUF weights, so none are applied here.
  */
-public class FalconH1CudaForwardPass implements AutoCloseable {
+public class FalconH1CudaForwardPass implements LayerGpuForwardPass {
 
     private final CudaContext cudaContext;
     private final CudaBufferManager bufferManager;
@@ -50,14 +50,20 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
     private final long[] gpuConvW, gpuConvBias, gpuDtBias, gpuSsmA, gpuSsmD, gpuSsmNorm, gpuConvState, gpuSsmState;
     private final long[] gpuKeyCache, gpuValueCache;
 
-    private final MemorySegment rmsnormFunc, ropeFunc, kvUpdateFunc, attnFunc;
+    private final MemorySegment rmsnormFunc, ropeFunc, kvUpdateFunc;
+    // FP16 KV cache (-Dcuda.kv.fp16, also set by the KV-aware VRAM budget); inline-init so the
+    // constructor body sees it when sizing the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+    private FlashAttention flashAttn;
     private final MemorySegment convFunc, dtSoftplusFunc, scanFunc, gateNormFunc, siluFunc, siluMulFunc, elemMulFunc, accumFunc;
 
     // dp4a (int8) matmul path: quantize FP32 input -> Q8_1, then per-type dp4a kernel (FP32 fallback).
-    // OPT-IN for Falcon-H1 (default off): measured neutral-to-slower than FP32 here because the
-    // per-token cost is dominated by the Mamba-2 scan + many small matmuls, so the extra per-matmul
-    // quantize launch outweighs the int8 speedup (unlike LFM2, where dp4a is a clear +37%).
-    private final boolean useDp4a = "true".equals(System.getProperty("cuda.falcon.dp4a", "false"));
+    // Default on since the input is quantized once per buffer (the Q8_1 cache in matmul()) and the
+    // pass replays as a CUDA graph: +40% decode on Falcon-H1-1.5B Q4_K_M, +18% on 0.5B Q8_0. It was
+    // opt-in while every matmul re-quantized its input (the shared norm output 4x per layer).
+    // Disable with -Dcuda.falcon.dp4a=false or -Dcuda.dp4a=false.
+    private final boolean useDp4a = !"false".equals(System.getProperty("cuda.falcon.dp4a", "true"))
+        && !"false".equals(System.getProperty("cuda.dp4a", "true"));
     private final MemorySegment quantizeFunc, dp4aQ4kFunc, dp4aQ5kFunc, dp4aQ50Func, dp4aQ80Func,
                                 dp4aQ3kFunc, dp4aIq4nlFunc, dp4aIq4xsFunc;
     private final long gpuQ8In;
@@ -78,7 +84,7 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
         void setFloat(int i, float v) { args.set(ValueLayout.JAVA_FLOAT, i * 8L, v); }
     }
 
-    private final PB matmulPB, normPB, ropePB, kvPB, attnPB, convPB, convBiasPB, dtPB, scanPB, gateNormPB, siluPB, siluMulPB, elemMulPB, accumPB;
+    private final PB matmulPB, normPB, ropePB, kvPB, convPB, convBiasPB, dtPB, scanPB, gateNormPB, siluPB, siluMulPB, elemMulPB, accumPB;
 
     public FalconH1CudaForwardPass(ModelConfig config, FalconH1Weights weights,
                                    CudaBufferManager bufferManager, int maxSeqLen) {
@@ -119,8 +125,9 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
 
         rmsnormFunc    = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         ropeFunc       = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvUpdateFunc   = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attnFunc       = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        kvUpdateFunc   = useFp16Kv
+            ? cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16")
+            : cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         convFunc       = cudaContext.compileKernel("kernels/cuda/conv1d_short.cu", "conv1d_short");
         dtSoftplusFunc = cudaContext.compileKernel("kernels/cuda/mamba2_dt_softplus.cu", "mamba2_dt_softplus");
         scanFunc       = cudaContext.compileKernel("kernels/cuda/mamba2_scan.cu", "mamba2_scan");
@@ -175,7 +182,7 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
         gpuSsmA = new long[blockCount]; gpuSsmD = new long[blockCount]; gpuSsmNorm = new long[blockCount];
         gpuConvState = new long[blockCount]; gpuSsmState = new long[blockCount];
         gpuKeyCache = new long[blockCount]; gpuValueCache = new long[blockCount];
-        long kvBytes = (long) maxSeqLen * kvDim * fb;
+        long kvBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
         long convBytes = (long) (ssmConv - 1) * convChannels * fb;
         long stateBytes = (long) nheads * headDim * ssmState * fb;
         for (int i = 0; i < blockCount; i++) {
@@ -208,10 +215,8 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
         ropePB.setInt(4, headSize); ropePB.setInt(5, halfRope); ropePB.setLong(6, gpuTokenParams); ropePB.setInt(7, ropeType);
         kvPB = new PB(arena, 6);
         kvPB.setLong(2, gpuK); kvPB.setLong(3, gpuV); kvPB.setInt(4, kvDim); kvPB.setLong(5, gpuTokenParams);
-        attnPB = new PB(arena, 10);
-        attnPB.setLong(0, gpuAttnOut); attnPB.setLong(1, gpuQ);
-        attnPB.setInt(4, headCount); attnPB.setInt(5, headCountKV);
-        attnPB.setInt(6, headSize); attnPB.setInt(7, kvDim); attnPB.setLong(8, gpuTokenParams); attnPB.setInt(9, 0);
+        flashAttn = new FlashAttention(cudaContext, bufferManager, arena, headCount, headSize, maxSeqLen,
+            useFp16Kv, gpuTokenParams);
         convPB = new PB(arena, 6);
         convPB.setLong(0, gpuXBC); convPB.setInt(3, convChannels); convPB.setInt(4, ssmConv); convPB.setLong(5, gpuTokenParams);
         convBiasPB = new PB(arena, 3);
@@ -264,7 +269,22 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
 
     public int getGpuLayerCount() { return blockCount; }
 
+    /**
+     * A token at position 0 starts a new sequence: zero the recurrent (SSM) states of the layers.
+     * The kernels carry them from token to token and never read the position (the short conv does,
+     * so its history needs no reset), so without this a second generation in the same process (the
+     * web server, interactive mode, the placement calibrator) started from the previous sequence's
+     * state.
+     */
+    private void resetRecurrentState() {
+        long stateBytes = (long) nheads * headDim * ssmState * Float.BYTES;
+        for (int i = 0; i < blockCount; i++) {
+            if (gpuSsmState[i] != 0) cudaContext.fillBufferZero(gpuSsmState[i], stateBytes);
+        }
+    }
+
     public void uploadXAndUpdateParams(float[] x, int position) {
+        if (position == 0) resetRecurrentState();
         long embBytes = (long) dim * Float.BYTES;
         MemorySegment.copy(x, 0, hostCombined, ValueLayout.JAVA_FLOAT, 0, dim);
         hostCombined.set(ValueLayout.JAVA_INT, embBytes, position);
@@ -278,6 +298,7 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
     }
 
     public void forwardLayer(int li, int position) {
+        if (li == blockCount - 1 && position >= 0) warmedUp = true;
         FalconH1LayerWeights lw = weights.layers()[li];
         long fb = Float.BYTES;
 
@@ -295,15 +316,15 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
         launch(ropeFunc, ropeKGrid, (int) blockSize, 0, ropePB);
         kvPB.setLong(0, gpuKeyCache[li]); kvPB.setLong(1, gpuValueCache[li]);
         launch(kvUpdateFunc, kvGrid, (int) blockSize, 0, kvPB);
-        attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
-        int attnSM = (position + 1 + 32) * Float.BYTES;
-        launch(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB);
+        flashAttn.launch(defaultStream, gpuAttnOut, gpuQ, gpuKeyCache[li], gpuValueCache[li],
+            headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, position);
+        q8CachedIn = 0; // attention rewrote its output buffer, a matmul input
         matmul((CudaFloatTensor) lw.wo(), gpuAttnOut, gpuAttnRes, dim, qDim);
 
         // ---- mamba-2 path -> gpuSsmRes ----
         matmul((CudaFloatTensor) lw.ssmIn(), gpuNorm, gpuZxBCdt, projDim, dim);
-        cudaContext.copyBufferDtoD(gpuXBC, gpuZxBCdt + (long) ssmInner * fb, (long) convChannels * fb);
-        cudaContext.copyBufferDtoD(gpuDt, gpuZxBCdt + (long) (ssmInner + convChannels) * fb, (long) nheads * fb);
+        copyDtoD(gpuXBC, gpuZxBCdt + (long) ssmInner * fb, (long) convChannels * fb);
+        copyDtoD(gpuDt, gpuZxBCdt + (long) (ssmInner + convChannels) * fb, (long) nheads * fb);
         // conv1d (plain) -> +bias -> SiLU
         convPB.setLong(1, gpuConvState[li]); convPB.setLong(2, gpuConvW[li]);
         launch(convFunc, convGrid, (int) blockSize, 0, convPB);
@@ -345,27 +366,114 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
     }
 
     public boolean forwardFinalLogits(float[] logits) {
-        normPB.setLong(2, gpuOutputNorm);
-        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
-        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+        launchFinal();
+        outputWarm = true;
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
         return true;
     }
 
+    private void launchFinal() {
+        normPB.setLong(2, gpuOutputNorm);
+        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
+        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+    }
+
+    // --- CUDA graph: every kernel reads the position from gpuTokenParams, so one capture replays
+    // for every token. Two executables: all layers + output projection (decode), layers only
+    // (prefill tokens whose logits are discarded). A failed capture is not retried. Weights
+    // upload and kernels compile lazily on first use, which a capture does not allow, so the
+    // first token runs per-layer.
+    private MemorySegment graphExec, graphExecLayers;
+    private boolean graphAvailable;
+    private boolean graphInit;
+    private boolean warmedUp;     // every GPU layer ran once outside a capture
+    private boolean outputWarm;   // the output projection ran once outside a capture
+
+    private boolean ensureGraph(boolean withOutput) {
+        if (!graphInit) {
+            graphInit = true;
+            graphAvailable = !Boolean.getBoolean("cuda.nograph") && cudaContext.isGraphApiAvailable()
+                && flashAttn.graphCompatible() && true;
+        }
+        if (!graphAvailable || !warmedUp || (withOutput && !outputWarm)) return false;
+        if ((withOutput ? graphExec : graphExecLayers) != null) return true;
+        boolean capturing = false;
+        try {
+            cudaContext.beginCapture();
+            capturing = true;
+            for (int li = 0; li < blockCount; li++) forwardLayer(li, -1);
+            if (withOutput) launchFinal();
+            MemorySegment graph = cudaContext.endCapture();
+            capturing = false;
+            try {
+                MemorySegment exec = cudaContext.instantiateGraph(graph);
+                if (withOutput) graphExec = exec; else graphExecLayers = exec;
+            } finally {
+                cudaContext.destroyGraph(graph);
+            }
+            System.err.println("FalconH1 CUDA graph: captured " + blockCount + " layers"
+                + (withOutput ? " + output projection" : " (prefill)"));
+            return true;
+        } catch (Exception e) {
+            if (capturing) {
+                try {
+                    MemorySegment partial = cudaContext.endCapture();
+                    if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial);
+                } catch (Exception ignored) {}
+            }
+            graphAvailable = false;
+            System.err.println("FalconH1 CUDA graph: capture failed — " + e.getMessage() + ", using per-layer mode");
+            return false;
+        }
+    }
+
+    @Override
+    public boolean forwardGraph(float[] logits) {
+        if (!ensureGraph(true)) return false;
+        cudaContext.launchGraph(graphExec);
+        cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
+        MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
+        return true;
+    }
+
+    @Override
+    public boolean forwardGraphPrefill() {
+        if (!ensureGraph(false)) return false;
+        cudaContext.launchGraph(graphExecLayers);
+        return true;
+    }
+
+    // Q8_1 quantization cache: consecutive dp4a matmuls on the same input (Q/K/V, gate/up) reuse
+    // one quantization. Any other kernel launch or device copy invalidates it, as does a matmul
+    // that writes the quantized buffer itself.
+    private long q8CachedIn;
+    private int q8CachedCols;
+
+    private void copyDtoD(long dst, long src, long bytes) {
+        q8CachedIn = 0;
+        cudaContext.copyBufferDtoD(dst, src, bytes);
+    }
+
     private void matmul(CudaFloatTensor t, long in, long out, int rows, int cols) {
         MemorySegment dp4a = useDp4a ? dp4aFunc(t) : null;
         if (dp4a != null) {
-            quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
-            launch(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+            if (q8CachedIn != in || q8CachedCols != cols) {
+                quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
+                launchRaw(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+                q8CachedIn = in;
+                q8CachedCols = cols;
+            }
             dp4aPB.setLong(0, t.getGpuWeights()); dp4aPB.setLong(1, gpuQ8In); dp4aPB.setLong(2, out);
             dp4aPB.setInt(3, rows); dp4aPB.setInt(4, cols); dp4aPB.setInt(5, 0);
-            launch(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            launchRaw(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            if (out == q8CachedIn) q8CachedIn = 0;
             return;
         }
         matmulPB.setLong(0, t.getGpuWeights()); matmulPB.setLong(1, in); matmulPB.setLong(2, out);
         matmulPB.setInt(3, rows); matmulPB.setInt(4, cols); matmulPB.setInt(5, 0);
-        launch(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), t.getMatmulSharedMem(cols), matmulPB);
+        launchRaw(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), t.getMatmulSharedMem(cols), matmulPB);
+        if (out == q8CachedIn) q8CachedIn = 0;
     }
 
     private MemorySegment dp4aFunc(CudaFloatTensor t) {
@@ -381,7 +489,13 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
         }
     }
 
+    /** Launch a non-matmul kernel; it may overwrite a matmul input, so the Q8_1 cache is dropped. */
     private void launch(MemorySegment fn, int grid, int block, int sm, PB params) {
+        q8CachedIn = 0;
+        launchRaw(fn, grid, block, sm, params);
+    }
+
+    private void launchRaw(MemorySegment fn, int grid, int block, int sm, PB params) {
         int err = CudaBindings.launchKernel(fn, grid, 1, 1, block, 1, 1, sm, defaultStream, params.ptrs, MemorySegment.NULL);
         if (err != CudaBindings.CUDA_SUCCESS) throw new RuntimeException("FalconH1 CUDA error: " + err);
     }
@@ -408,5 +522,9 @@ public class FalconH1CudaForwardPass implements AutoCloseable {
     }
 
     @Override
-    public void close() { arena.close(); }
+    public void close() {
+        if (graphExec != null) try { cudaContext.destroyGraphExec(graphExec); } catch (Exception ignored) {}
+        if (graphExecLayers != null) try { cudaContext.destroyGraphExec(graphExecLayers); } catch (Exception ignored) {}
+        arena.close();
+    }
 }

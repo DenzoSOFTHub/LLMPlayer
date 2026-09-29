@@ -157,3 +157,22 @@ extern "C" __global__ void matmul_iq3_xxs(
         else output[row] = sum;
     }
 }
+
+// FP16 row-range dequantization for the batched prefill GEMM (see dequant_f16.cu for the contract).
+extern "C" __global__ void dequant_iq3_xxs_f16t(const unsigned char* __restrict__ w, unsigned short* __restrict__ out,
+                                                int rowStart, int nRows, int cols) {
+    long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long) nRows * cols) return;
+    int rr = (int) (idx / cols), col = (int) (idx - (long) rr * cols);
+    long bo = ((long) rowStart + rr) * (cols / 256) * 98 + (long) (col / 256) * 98;
+    int j = col & 255, ib32 = j / 32, l = (j % 32) / 8, jj = j % 8;
+    float d = half2float(read_u16(w + bo));
+    unsigned int aux32 = read_u32(w + bo + 2 + 64 + 4 * ib32);
+    float db = d * (0.5f + (float) (aux32 >> 28)) * 0.5f;
+    unsigned int signs = KSIGNS_IQ2XS[(aux32 >> (7 * l)) & 0x7F];
+    unsigned int grid = IQ3XXS_GRID[w[bo + 2 + ib32 * 8 + 2 * l + (jj >> 2)]];
+    int gv = (grid >> (8 * (jj & 3))) & 0xFF;
+    float v = db * (float) gv * ((signs & (1u << jj)) ? -1.0f : 1.0f);
+    unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    out[idx] = h;
+}

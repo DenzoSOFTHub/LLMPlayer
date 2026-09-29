@@ -62,6 +62,8 @@ public class ChatTemplate {
             return formatHunyuan(userMessage);
         } else if (architecture == ModelArchitecture.BAILINGMOE3) {
             return formatLing(null, userMessage);
+        } else if (architecture == ModelArchitecture.MINIMAX_M2) {
+            return formatMiniMax(null, userMessage);
         } else if (architecture == ModelArchitecture.SPARK2_5) {
             return formatSpark(null, userMessage);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {
@@ -105,6 +107,8 @@ public class ChatTemplate {
             return formatHunyuanChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.BAILINGMOE3) {
             return formatLing(systemMessage, userMessage);
+        } else if (architecture == ModelArchitecture.MINIMAX_M2) {
+            return formatMiniMax(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.SPARK2_5) {
             return formatSpark(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {
@@ -194,6 +198,37 @@ public class ChatTemplate {
         if (systemMessage != null) messages.add(new String[] {"system", systemMessage});
         messages.add(new String[] {"user", userMessage});
         return formatLingConversation(messages);
+    }
+
+    // MiniMax-M2: "]~!b[" (BOS, prepended by the engine) "]~b]system\n...[e~[\n" per turn
+    // "]~b]user\n...[e~[\n" / "]~b]ai\n...[e~[\n", and the generation prompt opens a <think> block.
+    private String formatMiniMax(String systemMessage, String userMessage) {
+        List<String[]> m = new java.util.ArrayList<>();
+        if (systemMessage != null) m.add(new String[] {"system", systemMessage});
+        m.add(new String[] {"user", userMessage});
+        return formatMiniMaxConversation(m);
+    }
+
+    private String formatMiniMaxConversation(List<String[]> messages) {
+        StringBuilder sb = new StringBuilder("]~b]system\n");
+        int start = 0;
+        if (!messages.isEmpty() && "system".equals(messages.get(0)[0])) {
+            sb.append(messages.get(0)[1]);
+            start = 1;
+        } else {
+            sb.append("You are a helpful assistant.");
+        }
+        sb.append("[e~[\n");
+        for (int i = start; i < messages.size(); i++) {
+            String[] msg = messages.get(i);
+            if ("user".equals(msg[0])) {
+                sb.append("]~b]user\n").append(msg[1]).append("[e~[\n");
+            } else if ("assistant".equals(msg[0])) {
+                sb.append("]~b]ai\n").append(msg[1]).append("[e~[\n");
+            }
+        }
+        sb.append("]~b]ai\n<think>\n");
+        return sb.toString();
     }
 
     private String formatLingConversation(List<String[]> messages) {
@@ -402,6 +437,8 @@ public class ChatTemplate {
             return formatHunyuanConversation(messages);
         } else if (architecture == ModelArchitecture.BAILINGMOE3) {
             return formatLingConversation(messages);
+        } else if (architecture == ModelArchitecture.MINIMAX_M2) {
+            return formatMiniMaxConversation(messages);
         } else if (architecture == ModelArchitecture.SPARK2_5) {
             return formatSparkConversation(messages);
         } else if (architecture == ModelArchitecture.ERNIE4_5) {

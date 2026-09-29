@@ -86,9 +86,8 @@ public class Gemma4InferenceEngine {
     private final float[] ropeFreqFactorsArr;
 
     // GPU-resident forward pass (Gemma 4 PLE-only; null on CPU / Gemma 3n AltUp / unsupported)
-    private AutoCloseable gpuForwardPass;
+    private LayerGpuForwardPass gpuForwardPass;
     private int gpuLayerCount;
-    private Method gpuUploadX, gpuUploadPle, gpuForwardLayer, gpuForwardFinalLogits, gpuDownloadX;
 
     public Gemma4InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen,
                                   FloatTensor pleTokenEmbd, FloatTensor pleModelProj,
@@ -220,13 +219,8 @@ public class Gemma4InferenceEngine {
                     float[][].class, float[].class, float[].class, int.class)
                 .newInstance(config, weights, bufferManager, maxSeqLen,
                     pleInpGate, pleProj, plePostNorm, layerOutputScale, ropeFreqFactorsArr, pleDim);
-            gpuUploadX = cls.getMethod("uploadXAndUpdateParams", float[].class, int.class);
-            gpuUploadPle = cls.getMethod("uploadPleCombined", float[].class);
-            gpuForwardLayer = cls.getMethod("forwardLayer", int.class, int.class);
-            gpuDownloadX = cls.getMethod("downloadX", float[].class);
-            gpuForwardFinalLogits = cls.getMethod("forwardFinalLogits", float[].class);
             gpuLayerCount = (Integer) cls.getMethod("getGpuLayerCount").invoke(fwd);
-            gpuForwardPass = (AutoCloseable) fwd;
+            gpuForwardPass = (LayerGpuForwardPass) fwd;
             System.err.println("Gemma 4 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
         } catch (Throwable e) {
             System.err.println("Gemma 4 CUDA forward pass: unavailable — " + e.getMessage());
@@ -234,33 +228,49 @@ public class Gemma4InferenceEngine {
     }
 
     private float[] forwardGpu(Gemma4State state, int position, boolean computeLogits, boolean doPle) throws Exception {
-        gpuUploadX.invoke(gpuForwardPass, state.x, position);
-        if (doPle) gpuUploadPle.invoke(gpuForwardPass, state.pleCombined);
-        for (int i = 0; i < gpuLayerCount; i++) gpuForwardLayer.invoke(gpuForwardPass, i, position);
+        gpuForwardPass.uploadXAndUpdateParams(state.x, position);
+        if (doPle) gpuForwardPass.uploadPleCombined(state.pleCombined);
+        // Graph replay: all GPU layers (+ output projection with a full offload and logits needed)
+        boolean logitsDone = false;
+        boolean layersDone = false;
+        if (computeLogits && gpuLayerCount == blockCount) {
+            logitsDone = layersDone = gpuForwardPass.forwardGraph(state.logits);
+        } else {
+            layersDone = gpuForwardPass.forwardGraphPrefill();
+        }
+        if (!layersDone) {
+            for (int i = 0; i < gpuLayerCount; i++) gpuForwardPass.forwardLayer(i, position);
+        }
 
         // Partial offload (e.g. the 12B at 7 GB on a 6 GB card): the first gpuLayerCount layers ran
         // on the GPU; finish the remaining layers on the CPU engine. The GPU layers keep their KV
         // in GPU buffers and the CPU layers in the CPU KVCache — disjoint sets, each self-consistent
         // across tokens (Gemma 4 dense uses no shared KV).
         if (gpuLayerCount < blockCount) {
-            gpuDownloadX.invoke(gpuForwardPass, state.x);   // activation after the GPU layers
+            gpuForwardPass.downloadX(state.x);   // activation after the GPU layers
             for (int layer = gpuLayerCount; layer < blockCount; layer++) {
                 forwardLayer(state, layer, position, doPle);
             }
             if (!computeLogits) return null;
             // The final output projection weight is GPU-resident; re-upload the CPU-finished
             // activation so forwardFinalLogits can project it on the GPU.
-            gpuUploadX.invoke(gpuForwardPass, state.x, position);
+            gpuForwardPass.uploadXAndUpdateParams(state.x, position);
         }
 
         if (!computeLogits) return null;
-        gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
+        if (!logitsDone) gpuForwardPass.forwardFinalLogits(state.logits);
         if (finalLogitSoftCap > 0f) {
             for (int i = 0; i < vocabSize; i++) {
                 state.logits[i] = finalLogitSoftCap * (float) Math.tanh(state.logits[i] / finalLogitSoftCap);
             }
         }
         return state.logits;
+    }
+
+
+    /** True when a GPU-resident forward pass (which owns the device-side state) is active. */
+    public boolean hasGpuForwardPass() {
+        return gpuForwardPass != null;
     }
 
     public Gemma4State createState() {
@@ -310,8 +320,15 @@ public class Gemma4InferenceEngine {
             try {
                 return forwardGpu(state, position, computeLogits, doPle);
             } catch (Exception e) {
-                System.err.println("Gemma 4 GPU forward failed: " + e.getMessage());
+                System.err.println("Gemma 4 GPU forward failed: " + GpuFailureException.describe(e));
+                // The pass owned the device KV cache / recurrent state for every earlier position:
+                // the CPU can take over only at position 0 (see InferenceEngine.forwardGpu).
+                AutoCloseable failed = gpuForwardPass;
                 gpuForwardPass = null;
+                try { failed.close(); } catch (Exception ignored) { }
+                if (position > 0) {
+                    throw new GpuFailureException("GPU forward pass failed at position " + position, e);
+                }
                 for (int layer = 0; layer < blockCount; layer++) forwardLayer(state, layer, position, doPle);
             }
         } else {
@@ -367,13 +384,33 @@ public class Gemma4InferenceEngine {
      * matmul kernels differs. Gemma 3n (AltUp) and the GPU pass keep the one-token loop. Disable
      * with {@code -Dprefill.batched=false}.
      */
+    // F4: whether any layer weight is GPU-resident (scanned once). The batched CPU prefill used to
+    // be gated on the matmul pool, which GPU init switched off; the pool now stays on.
+    private volatile Boolean layersGpuResident;
+
+    private boolean layersGpuResident() {
+        Boolean b = layersGpuResident;
+        if (b == null) layersGpuResident = b = it.denzosoft.llmplayer.tensor.FloatTensor.anyGpuResident(gpuHolders());
+        // GPU matmuls switched off (the placement calibrator's CPU candidate): the tensors run
+        // on their CPU twins, so the batched prefill applies as in a CPU-only run
+        return b && it.denzosoft.llmplayer.tensor.FloatTensor.gpuMatmulEnabled();
+    }
+
+    /** The layer weights plus this engine's own PLE tensors. */
+    private Object[] gpuHolders() {
+        Object[] l = weights.layers();
+        Object[] h = java.util.Arrays.copyOf(l, l.length + 1);
+        h[l.length] = this;
+        return h;
+    }
+
     public float[] forwardPrefill(Gemma4State st, int[] tokens, int fromPos, int toPos) {
         this.state = st;
         int count = toPos - fromPos;
         if (count <= 0) return null;
         boolean useAltup = g3n != null && g3n.isFullyLoaded() && st.altupStreams != null;
         if (count == 1 || !PREFILL_BATCHED || useAltup || gpuForwardPass != null
-                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled()) {
+                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled() || layersGpuResident()) {
             float[] logits = null;
             for (int i = fromPos; i < toPos; i++) {
                 logits = forward(tokens[i], i, i == toPos - 1);

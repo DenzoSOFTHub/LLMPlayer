@@ -49,7 +49,7 @@ import java.lang.foreign.ValueLayout;
  * {@link #isSupported}: if any matmul weight (incl. PLE tensors) is not GPU-resident the engine
  * falls back to the per-tensor / CPU path, so this can never regress correctness.
  */
-public class Gemma4CudaForwardPass implements AutoCloseable {
+public class Gemma4CudaForwardPass implements LayerGpuForwardPass {
 
     private final CudaContext cudaContext;
     private final CudaBufferManager bufferManager;
@@ -89,7 +89,11 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
     private final long[] gpuPlePostNorm;
     private final long[] gpuKeyCache, gpuValueCache;
 
-    private final MemorySegment rmsnormFunc, perHeadNormFunc, ropeFunc, kvUpdateFunc, attnFunc;
+    private final MemorySegment rmsnormFunc, perHeadNormFunc, ropeFunc, kvUpdateFunc;
+    // FP16 KV cache (-Dcuda.kv.fp16, also set by the KV-aware VRAM budget); inline-init so the
+    // constructor body sees it when sizing the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+    private FlashAttention flashAttn;
     private final MemorySegment geluFunc, elemMulFunc, accumFunc, scaleFunc;
 
     // dp4a (int8) matmul path: quantize FP32 input -> Q8_1, then per-type dp4a kernel. Default on
@@ -114,7 +118,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         void setFloat(int i, float v) { args.set(ValueLayout.JAVA_FLOAT, i * 8L, v); }
     }
 
-    private final PB matmulPB, normPB, perHeadPB, ropePB, kvPB, attnPB, geluPB, elemMulPB, accumPB, scalePB;
+    private final PB matmulPB, normPB, perHeadPB, ropePB, kvPB, geluPB, elemMulPB, accumPB, scalePB;
 
     public Gemma4CudaForwardPass(ModelConfig config, ModelWeights weights,
                                  CudaBufferManager bufferManager, int maxSeqLen,
@@ -193,8 +197,9 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         rmsnormFunc     = cudaContext.compileKernel("kernels/cuda/rmsnorm.cu", "rmsnorm_fused");
         perHeadNormFunc = cudaContext.compileKernel("kernels/cuda/rmsnorm_per_head.cu", "rmsnorm_per_head");
         ropeFunc        = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvUpdateFunc    = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attnFunc        = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        kvUpdateFunc    = useFp16Kv
+            ? cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16")
+            : cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         geluFunc        = cudaContext.compileKernel("kernels/cuda/gelu.cu", "gelu");
         elemMulFunc     = cudaContext.compileKernel("kernels/cuda/elementwise_mul.cu", "elementwise_mul");
         accumFunc       = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
@@ -274,7 +279,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
             if (plePostNorm != null && plePostNorm[i] != null) gpuPlePostNorm[i] = uploadFloatArray(plePostNorm[i]);
             // Allocate KV cache only for own-KV layers (shared layers reuse an earlier layer's).
             if (i < firstShared) {
-                long kvBytes = (long) maxSeqLen * kvDim * fb;
+                long kvBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
                 gpuKeyCache[i]   = bufferManager.createBuffer(kvBytes);
                 gpuValueCache[i] = bufferManager.createBuffer(kvBytes);
             }
@@ -309,10 +314,8 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
 
         // attention_full: [output, q, keyCache, valueCache, headCount, headCountKV, headSize, kvDim,
         //                  tokenParams, slidingWindow] — headSize/kvDim/caches/window per layer
-        attnPB = new PB(arena, 10);
-        attnPB.setLong(0, gpuAttnOut); attnPB.setLong(1, gpuQ);
-        attnPB.setInt(4, headCount); attnPB.setInt(5, headCountKV);
-        attnPB.setLong(8, gpuTokenParams);
+        flashAttn = new FlashAttention(cudaContext, bufferManager, arena, headCount, maxHeadSize, maxSeqLen,
+            useFp16Kv, gpuTokenParams);
 
         // gelu: [x, size] — x/size set per use
         geluPB = new PB(arena, 2);
@@ -381,6 +384,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
     }
 
     public void forwardLayer(int li, int position) {
+        if (li == gpuLayers - 1 && position >= 0) warmedUp = true;
         TransformerLayerWeights lw = weights.layers()[li];
         long fb = Float.BYTES;
 
@@ -419,9 +423,12 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         ropePB.setLong(0, gpuQ); ropePB.setLong(1, cosTable); ropePB.setLong(2, sinTable);
         ropePB.setInt(3, headCount); ropePB.setInt(4, hs); ropePB.setInt(5, halfRope); ropePB.setInt(7, ropeType);
         launch(ropeFunc, ropeQGrid, (int) blockSize, 0, ropePB);
-        // Attention scale = 1.0: cancel the kernel's 1/sqrt(hs) by scaling Q by sqrt(hs).
-        scalePB.setLong(0, gpuQ); scalePB.setFloat(1, (float) Math.sqrt((double) hs)); scalePB.setInt(2, qDim);
-        launch(scaleFunc, qDimGrid, (int) blockSize, 0, scalePB);
+        // Attention scale = 1.0. The flash kernel takes it directly; the legacy kernel hard-codes
+        // 1/sqrt(hs), cancelled by scaling Q by sqrt(hs).
+        if (!flashAttn.supportsCustomScale()) {
+            scalePB.setLong(0, gpuQ); scalePB.setFloat(1, (float) Math.sqrt((double) hs)); scalePB.setInt(2, qDim);
+            launch(scaleFunc, qDimGrid, (int) blockSize, 0, scalePB);
+        }
 
         // === 3. K/V projection (own-KV layers only) ===
         if (hasOwnKv) {
@@ -431,7 +438,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
             } else {
                 // Gemma 4 alternative attention (global layers): no V projection — V = raw K
                 // (copied before the K-norm/RoPE below mutate gpuK).
-                cudaContext.copyBufferDtoD(gpuV, gpuK, (long) kvDim * fb);
+                copyDtoD(gpuV, gpuK, (long) kvDim * fb);
             }
             // QK-norm on K (per-head, with learnable scale)
             if (gpuKNorm[li] != 0) {
@@ -450,12 +457,11 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         }
 
         // === 4. Attention: reads source layer's KV cache (same hs/kvDim as this layer) ===
-        attnPB.setLong(2, gpuKeyCache[kvLayer]); attnPB.setLong(3, gpuValueCache[kvLayer]);
-        attnPB.setInt(5, kvHeads);   // per-layer KV head count (GQA grouping); 1 on global layers
-        attnPB.setInt(6, hs); attnPB.setInt(7, kvDim);
-        attnPB.setInt(9, (swa && slidingWindow > 0) ? slidingWindow : 0);
-        int attnSM = (position + 1 + 32) * Float.BYTES;
-        launch(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB);
+        // kvHeads: per-layer KV head count (GQA grouping); 1 on global layers
+        flashAttn.launch(defaultStream, gpuAttnOut, gpuQ, gpuKeyCache[kvLayer], gpuValueCache[kvLayer],
+            kvHeads, hs, kvDim, (swa && slidingWindow > 0) ? slidingWindow : 0,
+            flashAttn.supportsCustomScale() ? 1.0f : (float) (1.0 / Math.sqrt(hs)), 0f, position);
+        q8CachedIn = 0; // attention rewrote its output buffer, a matmul input
 
         // === 5. Wo projection: gpuAttnOut -> gpuBx ===
         matmul((CudaFloatTensor) lw.wo(), gpuAttnOut, gpuBx, dim, qDim);
@@ -468,7 +474,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
 
         // === 7. Attention residual: gpuAttnRes = gpuBx + gpuX ===
         // (copy gpuX into gpuAttnRes, then accumulate gpuBx)
-        cudaContext.copyBufferDtoD(gpuAttnRes, gpuX, (long) dim * fb);
+        copyDtoD(gpuAttnRes, gpuX, (long) dim * fb);
         accumPB.setLong(0, gpuAttnRes); accumPB.setLong(1, gpuBx); accumPB.setInt(2, dim);
         launch(accumFunc, dimGrid, (int) blockSize, 0, accumPB);
 
@@ -496,7 +502,7 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
 
         // === 11. FFN residual: gpuX = gpuBx + gpuAttnRes ===
         // (copy gpuAttnRes into gpuX, then accumulate gpuBx)
-        cudaContext.copyBufferDtoD(gpuX, gpuAttnRes, (long) dim * fb);
+        copyDtoD(gpuX, gpuAttnRes, (long) dim * fb);
         accumPB.setLong(0, gpuX); accumPB.setLong(1, gpuBx); accumPB.setInt(2, dim);
         launch(accumFunc, dimGrid, (int) blockSize, 0, accumPB);
 
@@ -539,29 +545,118 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
 
     /** Final RMSNorm + output projection. Returns RAW logits (logit soft-cap applied by caller). */
     public boolean forwardFinalLogits(float[] logits) {
-        normPB.setLong(0, gpuNorm); normPB.setLong(1, gpuX); normPB.setLong(2, gpuOutputNorm); normPB.setInt(3, dim);
-        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
-        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+        launchFinal();
+        outputWarm = true;
         cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
         MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
         return true;
     }
 
+    private void launchFinal() {
+        normPB.setLong(0, gpuNorm); normPB.setLong(1, gpuX); normPB.setLong(2, gpuOutputNorm); normPB.setInt(3, dim);
+        launch(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB);
+        matmul((CudaFloatTensor) weights.output(), gpuNorm, gpuLogits, vocabSize, dim);
+    }
+
+    // --- CUDA graph: every kernel reads the position from gpuTokenParams, so one capture replays
+    // for every token. Two executables: all layers + output projection (decode), layers only
+    // (prefill tokens whose logits are discarded). A failed capture is not retried. Weights
+    // upload and kernels compile lazily on first use, which a capture does not allow, so the
+    // first token runs per-layer.
+    private MemorySegment graphExec, graphExecLayers;
+    private boolean graphAvailable;
+    private boolean graphInit;
+    private boolean warmedUp;     // every GPU layer ran once outside a capture
+    private boolean outputWarm;   // the output projection ran once outside a capture
+
+    private boolean ensureGraph(boolean withOutput) {
+        if (!graphInit) {
+            graphInit = true;
+            graphAvailable = !Boolean.getBoolean("cuda.nograph") && cudaContext.isGraphApiAvailable()
+                && flashAttn.graphCompatible();
+        }
+        if (!graphAvailable || !warmedUp || (withOutput && !outputWarm)) return false;
+        // The output projection belongs in the graph only with every layer on the GPU; the
+        // layers-only graph also serves the GPU prefix of a partial offload.
+        if (withOutput && gpuLayers != blockCount) return false;
+        if ((withOutput ? graphExec : graphExecLayers) != null) return true;
+        boolean capturing = false;
+        try {
+            cudaContext.beginCapture();
+            capturing = true;
+            for (int li = 0; li < gpuLayers; li++) forwardLayer(li, -1);
+            if (withOutput) launchFinal();
+            MemorySegment graph = cudaContext.endCapture();
+            capturing = false;
+            try {
+                MemorySegment exec = cudaContext.instantiateGraph(graph);
+                if (withOutput) graphExec = exec; else graphExecLayers = exec;
+            } finally {
+                cudaContext.destroyGraph(graph);
+            }
+            System.err.println("Gemma4 CUDA graph: captured " + gpuLayers + " layers"
+                + (withOutput ? " + output projection" : " (prefill)"));
+            return true;
+        } catch (Exception e) {
+            if (capturing) {
+                try {
+                    MemorySegment partial = cudaContext.endCapture();
+                    if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial);
+                } catch (Exception ignored) {}
+            }
+            graphAvailable = false;
+            System.err.println("Gemma4 CUDA graph: capture failed — " + e.getMessage() + ", using per-layer mode");
+            return false;
+        }
+    }
+
+    @Override
+    public boolean forwardGraph(float[] logits) {
+        if (!ensureGraph(true)) return false;
+        cudaContext.launchGraph(graphExec);
+        cudaContext.readBuffer(gpuLogits, hostLogits, gpuLogitsBytes);
+        MemorySegment.copy(hostLogits, ValueLayout.JAVA_FLOAT, 0, logits, 0, vocabSize);
+        return true;
+    }
+
+    @Override
+    public boolean forwardGraphPrefill() {
+        if (!ensureGraph(false)) return false;
+        cudaContext.launchGraph(graphExecLayers);
+        return true;
+    }
+
+    // Q8_1 quantization cache: consecutive dp4a matmuls on the same input (Q/K/V, gate/up) reuse
+    // one quantization. Any other kernel launch or device copy invalidates it, as does a matmul
+    // that writes the quantized buffer itself.
+    private long q8CachedIn;
+    private int q8CachedCols;
+
+    private void copyDtoD(long dst, long src, long bytes) {
+        q8CachedIn = 0;
+        cudaContext.copyBufferDtoD(dst, src, bytes);
+    }
+
     private void matmul(CudaFloatTensor t, long in, long out, int rows, int cols) {
         MemorySegment dp4a = useDp4a ? dp4aFunc(t) : null;
         if (dp4a != null) {
-            // quantize FP32 input[cols] -> Q8_1, then int8 dp4a matmul
-            quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
-            launch(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+            if (q8CachedIn != in || q8CachedCols != cols) {
+                quantPB.setLong(0, in); quantPB.setLong(1, gpuQ8In); quantPB.setInt(2, cols);
+                launchRaw(quantizeFunc, (((cols + 31) / 32) + 7) / 8, 256, 0, quantPB);
+                q8CachedIn = in;
+                q8CachedCols = cols;
+            }
             dp4aPB.setLong(0, t.getGpuWeights()); dp4aPB.setLong(1, gpuQ8In); dp4aPB.setLong(2, out);
             dp4aPB.setInt(3, rows); dp4aPB.setInt(4, cols); dp4aPB.setInt(5, 0);
-            launch(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            launchRaw(dp4a, t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols), 0, dp4aPB);
+            if (out == q8CachedIn) q8CachedIn = 0;
             return;
         }
         matmulPB.setLong(0, t.getGpuWeights()); matmulPB.setLong(1, in); matmulPB.setLong(2, out);
         matmulPB.setInt(3, rows); matmulPB.setInt(4, cols); matmulPB.setInt(5, 0); // write mode
-        launch(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols),
+        launchRaw(t.getCudaFunction(), t.getMatmulGridDim(rows, cols), t.getMatmulBlockDim(cols),
                t.getMatmulSharedMem(cols), matmulPB);
+        if (out == q8CachedIn) q8CachedIn = 0;
     }
 
     /** dp4a kernel for the tensor's quant type, or null if not dp4a-eligible (FP32 fallback). */
@@ -578,7 +673,13 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
         }
     }
 
+    /** Launch a non-matmul kernel; it may overwrite a matmul input, so the Q8_1 cache is dropped. */
     private void launch(MemorySegment fn, int grid, int block, int sm, PB params) {
+        q8CachedIn = 0;
+        launchRaw(fn, grid, block, sm, params);
+    }
+
+    private void launchRaw(MemorySegment fn, int grid, int block, int sm, PB params) {
         int err = CudaBindings.launchKernel(fn, grid, 1, 1, block, 1, 1, sm, defaultStream, params.ptrs, MemorySegment.NULL);
         if (err != CudaBindings.CUDA_SUCCESS) throw new RuntimeException("Gemma4 CUDA error: " + err);
     }
@@ -606,5 +707,9 @@ public class Gemma4CudaForwardPass implements AutoCloseable {
     }
 
     @Override
-    public void close() { arena.close(); }
+    public void close() {
+        if (graphExec != null) try { cudaContext.destroyGraphExec(graphExec); } catch (Exception ignored) {}
+        if (graphExecLayers != null) try { cudaContext.destroyGraphExec(graphExecLayers); } catch (Exception ignored) {}
+        arena.close();
+    }
 }

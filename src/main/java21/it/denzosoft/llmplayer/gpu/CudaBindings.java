@@ -185,6 +185,26 @@ public final class CudaBindings {
     private static final MethodHandle cuStreamCreate = findCudaIfAvailable("cuStreamCreate",
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
 
+    // CUresult cuStreamCreateWithPriority(CUstream* phStream, unsigned int flags, int priority)
+    private static final MethodHandle cuStreamCreateWithPriority = findCudaIfAvailable("cuStreamCreateWithPriority",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+    // CUresult cuCtxGetStreamPriorityRange(int* leastPriority, int* greatestPriority)
+    private static final MethodHandle cuCtxGetStreamPriorityRange = findCudaIfAvailable("cuCtxGetStreamPriorityRange",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    /** Create a stream with an explicit priority (lower number = higher priority). */
+    public static int streamCreateWithPriority(MemorySegment phStream, int flags, int priority) {
+        try { return (int) cuStreamCreateWithPriority.invokeExact(phStream, flags, priority); }
+        catch (Throwable t) { throw new RuntimeException("cuStreamCreateWithPriority failed", t); }
+    }
+
+    /** [least, greatest] stream priorities of the current context (least = lowest priority, numerically largest). */
+    public static int streamPriorityRange(MemorySegment least, MemorySegment greatest) {
+        try { return (int) cuCtxGetStreamPriorityRange.invokeExact(least, greatest); }
+        catch (Throwable t) { throw new RuntimeException("cuCtxGetStreamPriorityRange failed", t); }
+    }
+
     // CUresult cuStreamSynchronize(CUstream hStream)
     private static final MethodHandle cuStreamSynchronize = findCudaIfAvailable("cuStreamSynchronize",
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
@@ -208,6 +228,51 @@ public final class CudaBindings {
     // CUresult cuEventDestroy_v2(CUevent hEvent)
     private static final MethodHandle cuEventDestroy_v2 = findCudaIfAvailable("cuEventDestroy_v2",
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    // CUresult cuEventQuery(CUevent hEvent): CUDA_SUCCESS when complete, CUDA_ERROR_NOT_READY otherwise
+    private static final MethodHandle cuEventQuery = findCudaIfAvailable("cuEventQuery",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    // CUresult cuEventSynchronize(CUevent hEvent)
+    private static final MethodHandle cuEventSynchronize = findCudaIfAvailable("cuEventSynchronize",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    // CUresult cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd)
+    private static final MethodHandle cuEventElapsedTime = findCudaIfAvailable("cuEventElapsedTime",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    /** cuEventQuery / cuStreamQuery result while work is still pending (not an error). */
+    public static final int CUDA_ERROR_NOT_READY = 600;
+    /** cuEventCreate flags. */
+    public static final int CU_EVENT_DEFAULT = 0x0;
+    public static final int CU_EVENT_BLOCKING_SYNC = 0x1;
+    /** cuCtxCreate scheduling flags: how a blocking call waits for the GPU. */
+    public static final int CU_CTX_SCHED_AUTO = 0x0;
+    public static final int CU_CTX_SCHED_SPIN = 0x1;
+    public static final int CU_CTX_SCHED_YIELD = 0x2;
+    public static final int CU_CTX_SCHED_BLOCKING_SYNC = 0x4;
+
+    public static boolean isEventQueryAvailable() { return cuEventQuery != null && cuEventElapsedTime != null; }
+
+    /** Returns CUDA_SUCCESS when the event has completed, CUDA_ERROR_NOT_READY while pending. */
+    public static int eventQuery(MemorySegment hEvent) {
+        try { return (int) cuEventQuery.invokeExact(hEvent); }
+        catch (Throwable t) { throw new RuntimeException("cuEventQuery failed", t); }
+    }
+
+    public static int eventSynchronize(MemorySegment hEvent) {
+        try { return (int) cuEventSynchronize.invokeExact(hEvent); }
+        catch (Throwable t) { throw new RuntimeException("cuEventSynchronize failed", t); }
+    }
+
+    public static int eventElapsedTime(MemorySegment pMilliseconds, MemorySegment hStart, MemorySegment hEnd) {
+        try { return (int) cuEventElapsedTime.invokeExact(pMilliseconds, hStart, hEnd); }
+        catch (Throwable t) { throw new RuntimeException("cuEventElapsedTime failed", t); }
+    }
+
+    public static boolean isStreamPriorityAvailable() {
+        return cuStreamCreateWithPriority != null && cuCtxGetStreamPriorityRange != null;
+    }
 
     // --- Unified/Managed Memory ---
 
@@ -521,6 +586,114 @@ public final class CudaBindings {
     public static int graphDestroy(MemorySegment hGraph) {
         try { return (int) cuGraphDestroy.invokeExact(hGraph); }
         catch (Throwable t) { throw new RuntimeException("cuGraphDestroy failed", t); }
+    }
+
+    // --- Stream-ordered copies, function attributes, NVRTC cubin/version ---
+
+    /** cuStreamCreate flag: the stream does not synchronize with the legacy NULL stream. */
+    public static final int CU_STREAM_NON_BLOCKING = 0x1;
+    /** Capture mode that only rejects unsafe calls made by the capturing thread itself. */
+    public static final int CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1;
+    /** CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES */
+    public static final int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
+    /** CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN */
+    public static final int CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
+
+    // CUresult cuMemcpyDtoHAsync_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream)
+    private static final MethodHandle cuMemcpyDtoHAsync_v2 = findCudaIfAvailable("cuMemcpyDtoHAsync_v2",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+            ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+    // CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value)
+    private static final MethodHandle cuFuncSetAttribute = findCudaIfAvailable("cuFuncSetAttribute",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+    // CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream)
+    private static final MethodHandle cuMemsetD32Async = findCudaIfAvailable("cuMemsetD32Async",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+    // CUresult cuStreamCreate(CUstream* phStream, unsigned int Flags) is already bound as streamCreate.
+
+    // nvrtcResult nvrtcVersion(int* major, int* minor)
+    private static final MethodHandle nvrtcVersion = findNvrtcIfAvailable("nvrtcVersion",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    // nvrtcResult nvrtcGetNumSupportedArchs(int* numArchs) / nvrtcGetSupportedArchs(int* archs)
+    private static final MethodHandle nvrtcGetNumSupportedArchs = findNvrtcIfAvailable("nvrtcGetNumSupportedArchs",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+    private static final MethodHandle nvrtcGetSupportedArchs = findNvrtcIfAvailable("nvrtcGetSupportedArchs",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    // nvrtcResult nvrtcGetCUBINSize(nvrtcProgram prog, size_t* size) / nvrtcGetCUBIN(prog, char* cubin)
+    private static final MethodHandle nvrtcGetCUBINSize = findNvrtcIfAvailable("nvrtcGetCUBINSize",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+    private static final MethodHandle nvrtcGetCUBIN = findNvrtcIfAvailable("nvrtcGetCUBIN",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    public static boolean isMemcpyDtoHAsyncAvailable() { return cuMemcpyDtoHAsync_v2 != null; }
+
+    public static int memcpyDtoHAsync(MemorySegment dstHost, long srcDevice, long byteCount, MemorySegment stream) {
+        try { return (int) cuMemcpyDtoHAsync_v2.invokeExact(dstHost, srcDevice, byteCount, stream); }
+        catch (Throwable t) { throw new RuntimeException("cuMemcpyDtoHAsync failed", t); }
+    }
+
+    public static boolean isMemsetAsyncAvailable() { return cuMemsetD32Async != null; }
+
+    public static int memsetD32Async(long dstDevice, int ui, long n, MemorySegment stream) {
+        try { return (int) cuMemsetD32Async.invokeExact(dstDevice, ui, n, stream); }
+        catch (Throwable t) { throw new RuntimeException("cuMemsetD32Async failed", t); }
+    }
+
+    /** Returns CUDA_SUCCESS, or -1 when the symbol is missing (old driver). */
+    public static int funcSetAttribute(MemorySegment func, int attrib, int value) {
+        if (cuFuncSetAttribute == null) return -1;
+        try { return (int) cuFuncSetAttribute.invokeExact(func, attrib, value); }
+        catch (Throwable t) { throw new RuntimeException("cuFuncSetAttribute failed", t); }
+    }
+
+    /** NVRTC version as major*10+minor style pair, or null when unavailable. */
+    public static int[] nvrtcVersion() {
+        if (nvrtcVersion == null) return null;
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment maj = a.allocate(ValueLayout.JAVA_INT);
+            MemorySegment min = a.allocate(ValueLayout.JAVA_INT);
+            int err = (int) nvrtcVersion.invokeExact(maj, min);
+            if (err != 0) return null;
+            return new int[] { maj.get(ValueLayout.JAVA_INT, 0), min.get(ValueLayout.JAVA_INT, 0) };
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The SM architectures (e.g. 89 for sm_89) this NVRTC can target, or null when unknown. */
+    public static int[] nvrtcSupportedArchs() {
+        if (nvrtcGetNumSupportedArchs == null || nvrtcGetSupportedArchs == null) return null;
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment n = a.allocate(ValueLayout.JAVA_INT);
+            if ((int) nvrtcGetNumSupportedArchs.invokeExact(n) != 0) return null;
+            int count = n.get(ValueLayout.JAVA_INT, 0);
+            if (count <= 0) return null;
+            MemorySegment arr = a.allocate(ValueLayout.JAVA_INT, count);
+            if ((int) nvrtcGetSupportedArchs.invokeExact(arr) != 0) return null;
+            int[] out = new int[count];
+            for (int i = 0; i < count; i++) out[i] = arr.getAtIndex(ValueLayout.JAVA_INT, i);
+            return out;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public static boolean isCubinAvailable() { return nvrtcGetCUBINSize != null && nvrtcGetCUBIN != null; }
+
+    public static int getCUBINSize(MemorySegment prog, MemorySegment sizeRet) {
+        try { return (int) nvrtcGetCUBINSize.invokeExact(prog, sizeRet); }
+        catch (Throwable t) { throw new RuntimeException("nvrtcGetCUBINSize failed", t); }
+    }
+
+    public static int getCUBIN(MemorySegment prog, MemorySegment cubin) {
+        try { return (int) nvrtcGetCUBIN.invokeExact(prog, cubin); }
+        catch (Throwable t) { throw new RuntimeException("nvrtcGetCUBIN failed", t); }
     }
 
     // --- NVRTC wrappers ---

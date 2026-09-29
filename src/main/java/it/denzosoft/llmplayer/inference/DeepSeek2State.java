@@ -32,7 +32,11 @@ public class DeepSeek2State {
 
     // KV cache: uses asymmetric KVCache (keyLength != valueLength for MLA).
     // Supports -Dkv.q8=true for Q8_0 storage (3.56× memory reduction).
-    public final KVCache kvCache;
+    // Allocated on first use: the decompressed per-head cache is large (3.7 GB for GLM-4.7-Flash at
+    // 2K context), and when the attention runs on the GPU the CPU cache is never touched.
+    private KVCache kvCache;
+    private final int kvBlockCount, kvKeyDim, kvValDim, kvMaxSeqLen;
+    private final KVCache.Mode kvMode;
 
     // Dense FFN buffers (for leading dense blocks)
     public final float[] hb;    // [ffnDim]
@@ -47,6 +51,7 @@ public class DeepSeek2State {
     public final float[] moeHb;          // [expertFfnLength] - per-expert gate/silu buffer
     public final float[] moeHb2;         // [expertFfnLength] - per-expert up buffer
     public final float[] expertOut;      // [dim] - single expert output
+    public final float[] sharedPre;      // [dim] - shared expert output computed by the GPU attention pass
     public final float[] sharedHb;       // [sharedFfnDim] - shared expert gate buffer
     public final float[] sharedHb2;      // [sharedFfnDim] - shared expert up buffer
     // Per-expert parallel buffers
@@ -65,6 +70,46 @@ public class DeepSeek2State {
     int[] prefillGroupStart;  // [expertCount + 1] start of each expert's run in prefillGroupSlots
     int[] prefillGroupSlots;  // [chunk * topK] (token, slot) indices grouped by expert
     int[] prefillUsed;        // [expertCount] distinct experts of the current layer
+    int[] prefillCpuUsed;     // [expertCount] the ones the GPU expert cache does not compute
+    boolean[] prefillOnGpu;   // [expertCount] computed by the GPU expert cache in this layer
+
+    // Latent MLA cache (ModelConfig.mlaLatentCache): per layer [maxSeqLen][kvLoraRank + ropeDim],
+    // allocated per layer on first use, plus the per-head latent query and output.
+    private float[][] mlaLatent;
+    private float[] mlaQLatent, mlaOLatent;
+
+    float[] mlaLatentLayer(int layer, int entry) {
+        if (mlaLatent == null) mlaLatent = new float[kvBlockCount][];
+        float[] c = mlaLatent[layer];
+        if (c == null) mlaLatent[layer] = c = new float[kvMaxSeqLen * entry];
+        return c;
+    }
+
+    float[] mlaQLatent(int n) {
+        if (mlaQLatent == null) mlaQLatent = new float[n];
+        return mlaQLatent;
+    }
+
+    float[] mlaOLatent(int n) {
+        if (mlaOLatent == null) mlaOLatent = new float[n];
+        return mlaOLatent;
+    }
+
+    /** The CPU MLA KV cache, allocated on the first call. */
+    public KVCache kvCache() {
+        KVCache kv = kvCache;
+        if (kv == null) {
+            kv = new KVCache(kvBlockCount, kvKeyDim, kvValDim, kvMaxSeqLen, kvMode);
+            if (kvMode != KVCache.Mode.FLOAT32) {
+                System.out.println("  DeepSeek2 MLA KV cache: " + kvMode + " mode (~"
+                    + (kv.memoryBytes() / (1024 * 1024)) + " MB, vs ~"
+                    + ((long) kvBlockCount * kvMaxSeqLen * (kvKeyDim + kvValDim) * 4 / (1024 * 1024))
+                    + " MB in FLOAT32)");
+            }
+            kvCache = kv;
+        }
+        return kv;
+    }
 
     public DeepSeek2State(ModelConfig config, int maxSeqLen) {
         int dim = config.embeddingLength();
@@ -117,14 +162,11 @@ public class DeepSeek2State {
         } else {
             ds2KvMode = KVCache.Mode.FLOAT32;
         }
-        this.kvCache = new KVCache(blockCount, totalKeyDim, totalValDim, maxSeqLen, ds2KvMode);
-        if (ds2KvMode != KVCache.Mode.FLOAT32) {
-            long quantBytes = kvCache.memoryBytes();
-            System.out.println("  DeepSeek2 MLA KV cache: " + ds2KvMode + " mode (~"
-                + (quantBytes / (1024 * 1024)) + " MB, vs ~"
-                + ((long) blockCount * maxSeqLen * (totalKeyDim + totalValDim) * 4 / (1024 * 1024))
-                + " MB in FLOAT32)");
-        }
+        this.kvBlockCount = blockCount;
+        this.kvKeyDim = totalKeyDim;
+        this.kvValDim = totalValDim;
+        this.kvMaxSeqLen = maxSeqLen;
+        this.kvMode = ds2KvMode;
 
         // Dense FFN
         this.hb = new float[ffnDim];
@@ -139,6 +181,7 @@ public class DeepSeek2State {
         this.moeHb = new float[Math.max(expertFfnDim, 1)];
         this.moeHb2 = new float[Math.max(expertFfnDim, 1)];
         this.expertOut = new float[dim];
+        this.sharedPre = new float[dim];
         this.sharedHb = new float[Math.max(sharedFfnDim, 1)];
         this.sharedHb2 = new float[Math.max(sharedFfnDim, 1)];
 

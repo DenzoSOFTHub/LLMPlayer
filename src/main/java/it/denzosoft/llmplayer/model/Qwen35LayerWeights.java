@@ -97,6 +97,35 @@ public final class Qwen35LayerWeights {
 
     public boolean isDeltaNet() { return isDeltaNet; }
 
+    // Mixture-of-experts FFN (qwen35moe; null for the dense model, whose ffnGate/Up/Down are set)
+    private FloatTensor ffnGateInp;       // router [dim, expertCount]
+    private FloatTensor ffnGateExps, ffnUpExps, ffnDownExps;
+    private FloatTensor ffnGateShexp, ffnUpShexp, ffnDownShexp;
+    private FloatTensor ffnGateInpShexp;  // shared-expert gate [dim] -> one logit
+
+    /** Attach the MoE FFN tensors (the dense FFN tensors are then null). */
+    public void setMoe(FloatTensor gateInp, FloatTensor gateExps, FloatTensor upExps, FloatTensor downExps,
+                       FloatTensor gateShexp, FloatTensor upShexp, FloatTensor downShexp, FloatTensor gateInpShexp) {
+        this.ffnGateInp = gateInp;
+        this.ffnGateExps = gateExps;
+        this.ffnUpExps = upExps;
+        this.ffnDownExps = downExps;
+        this.ffnGateShexp = gateShexp;
+        this.ffnUpShexp = upShexp;
+        this.ffnDownShexp = downShexp;
+        this.ffnGateInpShexp = gateInpShexp;
+    }
+
+    public boolean isMoe() { return ffnGateInp != null; }
+    public FloatTensor ffnGateInp() { return ffnGateInp; }
+    public FloatTensor ffnGateExps() { return ffnGateExps; }
+    public FloatTensor ffnUpExps() { return ffnUpExps; }
+    public FloatTensor ffnDownExps() { return ffnDownExps; }
+    public FloatTensor ffnGateShexp() { return ffnGateShexp; }
+    public FloatTensor ffnUpShexp() { return ffnUpShexp; }
+    public FloatTensor ffnDownShexp() { return ffnDownShexp; }
+    public FloatTensor ffnGateInpShexp() { return ffnGateInpShexp; }
+
     // Common accessors
     public FloatTensor attnNorm() { return attnNorm; }
     public FloatTensor postAttnNorm() { return postAttnNorm; }

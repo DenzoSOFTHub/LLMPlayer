@@ -24,6 +24,7 @@ public class CLIOptions {
     private int threads = detectPhysicalCores();  // default to physical cores (bandwidth-bound matmul)
     private boolean showInfo;
     private int expertCacheSizeMb = -1;
+    private int gpuExpertCacheMb = -1;
     private boolean ssdStreaming;
     private int expertTopK = -1;
     private boolean help;
@@ -123,6 +124,8 @@ public class CLIOptions {
                 opts.ssdStreaming = true;
             } else if ("--expert-cache-size".equals(arg)) {
                 opts.expertCacheSizeMb = Integer.parseInt(args[++i]);
+            } else if ("--gpu-expert-cache".equals(arg)) {
+                opts.gpuExpertCacheMb = Integer.parseInt(args[++i]);
             } else if ("--info".equals(arg)) {
                 opts.showInfo = true;
             } else if ("--context-length".equals(arg) || "-c".equals(arg)) {
@@ -252,6 +255,7 @@ public class CLIOptions {
 
     /** RAM budget in MB for the SSD-streaming MoE expert cache; -1 leaves the default. */
     public int getExpertCacheSizeMb() { return expertCacheSizeMb; }
+    public int getGpuExpertCacheMb() { return gpuExpertCacheMb; }
 
     /** Run a model larger than RAM by streaming weights from the model file (MoE expert cache). */
     public boolean isSsdStreaming() { return ssdStreaming; }
@@ -363,7 +367,7 @@ public class CLIOptions {
         System.out.println("  --dry-range <num>        DRY lookback window (default: 1024)");
         System.out.println("  --seed <num>             Random seed");
         System.out.println("  --threads <num>          Number of threads (default: physical cores)");
-        System.out.println("  --auto-tune              Measure GPU vs CPU placement and use the faster");
+        System.out.println("  --auto-tune              Measure the placement alternatives on the loaded model and keep the fastest (stored per model)");
         System.out.println("  --context-length, -c <n> Max context length (default: 2048)");
         System.out.println("  --info                   Show model info and exit");
         System.out.println("  --web, -w                Start web UI server");
@@ -385,6 +389,7 @@ public class CLIOptions {
         System.out.println("  --ssd-streaming          Run a model larger than RAM by streaming weights from disk");
         System.out.println("                           (MoE: routed experts cached in RAM; skips the confirmation)");
         System.out.println("  --expert-cache-size <MB> RAM budget for the SSD-streaming MoE expert cache");
+        System.out.println("  --gpu-expert-cache <MB> VRAM cap for the hybrid GPU expert cache (0 disables it)");
         System.out.println("                           (default: 1/4 of physical RAM, max 4 GB)");
         System.out.println("  --thinking               Enable extended thinking/reasoning (SmolLM3, Qwen3, Qwen3.5)");
         System.out.println();

@@ -32,6 +32,8 @@ import it.denzosoft.llmplayer.tokenizer.Tokenizer;
 import it.denzosoft.llmplayer.gpu.GpuConfig;
 import it.denzosoft.llmplayer.tensor.FloatTensor;
 import it.denzosoft.llmplayer.tensor.TensorFactory;
+import it.denzosoft.llmplayer.tensor.MatmulPool;
+import it.denzosoft.llmplayer.inference.GpuExpertCache;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -73,6 +75,12 @@ public class LLMEngine implements AutoCloseable {
 
     // Explicit command-line -Dmmap.advise, captured before load() ever writes the property
     private static final String USER_MMAP_ADVISE = System.getProperty("mmap.advise");
+    // -Dcuda.kv.fp16 as given on the command line. The KV-aware budget may turn FP16 KV on for one
+    // load; capturing the user's value keeps that decision from leaking into later loads.
+    private static final String USER_KV_FP16 = System.getProperty("cuda.kv.fp16");
+    // Set by load() for the constructor running on the same thread: whether the KV cache of the
+    // GPU-resident MoE attention fits in the VRAM budget.
+    private static final ThreadLocal<Boolean> MOE_ATTENTION_KV_FITS = new ThreadLocal<>();
 
     private LLMEngine(ModelLoader.LoadedModel loadedModel, int maxContextLength) {
         this(loadedModel, maxContextLength, null, -1, null, false, true);
@@ -157,7 +165,7 @@ public class LLMEngine implements AutoCloseable {
             this.q3moeEngine = null;
             this.q35Engine = null;
             this.nemHEngine = null;
-        } else if (arch == ModelArchitecture.QWEN3MOE) {
+        } else if (arch == ModelArchitecture.QWEN3MOE || arch == ModelArchitecture.MINIMAX_M2) {
             this.engine = null;
             this.ds2Engine = null;
             this.q35Engine = null;
@@ -238,6 +246,24 @@ public class LLMEngine implements AutoCloseable {
             }
         }
 
+        // MoE (Qwen3-MoE family): GPU-resident attention half per layer, experts on the CPU
+        Boolean moeKvFits = MOE_ATTENTION_KV_FITS.get();
+        MOE_ATTENTION_KV_FITS.remove();
+        if (this.q3moeEngine != null && gpuChainEnabled && gpuResources != null
+                && !Boolean.FALSE.equals(moeKvFits)) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null && "cuda".equals(TensorFactory.getGpuBackend())) {
+                this.q3moeEngine.tryInitGpuAttention(bufMgr);
+            }
+        }
+        if (this.ds2Engine != null && gpuChainEnabled && gpuResources != null
+                && !Boolean.FALSE.equals(moeKvFits)) {
+            Object bufMgr = TensorFactory.getGpuBufferManager();
+            if (bufMgr != null && "cuda".equals(TensorFactory.getGpuBackend())) {
+                this.ds2Engine.tryInitGpuAttention(bufMgr);
+            }
+        }
+
         // Try to initialize Qwen3.5 GPU-resident forward pass
         if (this.q35Engine != null && gpuChainEnabled && gpuResources != null) {
             Object bufMgr = TensorFactory.getGpuBufferManager();
@@ -278,9 +304,43 @@ public class LLMEngine implements AutoCloseable {
             }
         }
 
+        // Qwen3.5-MoE: the routed experts run on the CPU (on the matmul pool, which GPU init no
+        // longer switches off) next to the GPU-resident pass
+        if (this.q35Engine != null && gpuResources != null && loadedModel.config().expertCount() > 0) {
+            if ("false".equals(System.getProperty("moe.cpu.pool"))) MatmulPool.disable();
+            if (GpuExpertCache.hybrid()) tryInitExpertGpuCache();
+        }
+
         // Try to initialize expert GPU cache for MoE models
-        if (this.q3moeEngine != null && gpuResources != null && moeOptimizedGpu) {
+        if ((this.q3moeEngine != null || this.ds2Engine != null) && gpuResources != null && moeOptimizedGpu) {
             tryInitExpertGpuCache();
+            // The routed experts, most of the work, run on the CPU matmul pool (GLM-4.7-Flash
+            // decode: 393 -> 312 ms/token against the ForkJoin fallback). -Dmoe.cpu.pool=false
+            // turns it off for these placements only.
+            if ("false".equals(System.getProperty("moe.cpu.pool"))) MatmulPool.disable();
+        }
+
+        try {
+            LLMPlayerMetrics.getInstance().setGpuExpertCache(gpuExpertCache());
+        } catch (Throwable ignored) { }
+        attachRoutingProfile();
+        applyPersistedPlacement();
+
+        // GPU clock keeper (-Dcuda.clockkeeper, opt-in; see CudaClockKeeper and
+        // docs/optimization/gpu-slower-than-cpu.md, F1): installed only now, after every weight
+        // upload, and it runs only while a generation is in progress (GpuActivity hooks in generate).
+        // -Dgpu.pstate.sample=true installs only its NVML sampler (P-state histogram per generation).
+        boolean keeper = System.getProperty("cuda.clockkeeper") != null
+            && !"false".equals(System.getProperty("cuda.clockkeeper"));
+        if (gpuResources != null && "cuda".equals(TensorFactory.getGpuBackend())
+                && (keeper || "true".equals(System.getProperty("gpu.pstate.sample")))) {
+            try {
+                Object bufMgr = TensorFactory.getGpuBufferManager();
+                Object ctx = bufMgr.getClass().getMethod("getCudaContext").invoke(bufMgr);
+                ctx.getClass().getMethod("installClockKeeper").invoke(ctx);
+            } catch (Exception e) {
+                System.err.println("CUDA clock keeper not installed: " + e);
+            }
         }
     }
 
@@ -363,8 +423,11 @@ public class LLMEngine implements AutoCloseable {
                 long kvAllFp32 = estimateKvCache(quickConfig, ctxForKv);     // all layers, FP32
                 long kvPerLayerFp32 = kvAllFp32 / Math.max(1, blockCount);
                 long kvPerLayerFp16 = kvPerLayerFp32 / 2;
-                boolean fp16KvSet = System.getProperty("cuda.kv.fp16") != null;
-                boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+                // Start from the user's setting on every load (see USER_KV_FP16).
+                if (USER_KV_FP16 != null) System.setProperty("cuda.kv.fp16", USER_KV_FP16);
+                else System.clearProperty("cuda.kv.fp16");
+                boolean fp16KvSet = USER_KV_FP16 != null;
+                boolean useFp16Kv = "true".equals(USER_KV_FP16);
 
                 // With managed or host-mapped memory, force all layers on GPU
                 // (driver handles paging between VRAM and system RAM)
@@ -375,12 +438,45 @@ public class LLMEngine implements AutoCloseable {
                     System.out.println("GPU: offloading all " + blockCount + " layers (" + memMode +
                         " memory — VRAM + system RAM shared)");
                 } else if (requestedLayers == -1) {
-                    // Auto-detect: estimate bytes per layer, fit into VRAM
+                    // Auto-detect: estimate bytes per layer, fit into VRAM. The budget uses the
+                    // device total: under WSL2/WDDM cuMemGetInfo reports ~1 GB less "free" memory
+                    // than a load can actually use (an 8B Q4_K_M fits fully by the total and runs
+                    // 1.6x faster than the partial offload the free figure would impose), so the
+                    // free figure is only reported, via -Dgpu.budget=free it can be enforced.
                     long vram = getDeviceGlobalMemory(gpuConfig.getDeviceId());
-                    if (vram > 0 && quickConfig.expertCount() > 0) {
+                    if ("free".equals(System.getProperty("gpu.budget"))) {
+                        long freeVram = queryFreeVram();
+                        if (freeVram > 0 && (vram <= 0 || freeVram < vram)) vram = freeVram;
+                    }
+                    if (vram > 0 && quickConfig.expertCount() > 0
+                            && modelFileSize + kvAllFp32 <= (long) (vram * 0.90)
+                            && !"false".equals(System.getProperty("moe.full.offload", "true"))) {
+                        // The whole MoE model (experts included) fits in VRAM: offload it all, so the
+                        // routed experts run on the GPU too instead of staying on the CPU as in the
+                        // MoE-optimized placement below (LFM2.5-8B-A1B, Granite 4.0-H Tiny).
+                        gpuLayersUsed = blockCount;
+                        System.out.println("GPU: MoE model fits in VRAM — offloading all " + blockCount
+                            + " layers including the experts (" + (modelFileSize >> 20) + " MB, "
+                            + (vram >> 20) + " MB available)");
+                    } else if (vram > 0 && quickConfig.expertCount() > 0) {
                         // MoE model: try MoE-optimized placement (attention on GPU, experts on CPU)
-                        long nonExpertBytes = sumNonExpertTensorBytes(quickParse, quickConfig);
-                        long usableVram = (long) (vram * 0.80);
+                        long nonExpertBytes = moeGpuPlanBytes(quickParse, quickConfig);
+                        long usableVram = moeUsableVram(vram);
+                        // The GPU-resident MoE attention keeps every layer's KV cache in VRAM too.
+                        // Reserve it (FP16 when only that fits); without room for it the
+                        // attention stays on the CPU and only the projections use the GPU.
+                        boolean kvFits = nonExpertBytes + (useFp16Kv ? kvAllFp32 / 2 : kvAllFp32) <= usableVram;
+                        if (!kvFits && !fp16KvSet && nonExpertBytes + kvAllFp32 / 2 <= usableVram) {
+                            System.setProperty("cuda.kv.fp16", "true");
+                            useFp16Kv = true;
+                            kvFits = true;
+                            System.out.println("GPU: FP16 KV auto-enabled for the GPU-resident MoE attention");
+                        }
+                        MOE_ATTENTION_KV_FITS.set(kvFits);
+                        if (!kvFits) {
+                            System.out.println("GPU: KV cache for " + ctxForKv + " tokens does not fit next to the "
+                                + "attention weights — MoE attention stays on the CPU");
+                        }
                         if (nonExpertBytes <= usableVram) {
                             // All attention+norms+router+shared-expert fit in VRAM
                             moeOptimized = true;
@@ -527,7 +623,9 @@ public class LLMEngine implements AutoCloseable {
 
         // Prepend BOS token if chat mode or rawMode, and the model expects BOS
         int[] promptTokens;
-        if ((request.useChat() || request.rawMode()) && specialTokens.shouldAddBos() && specialTokens.getBosId() >= 0) {
+        // (not when the formatted prompt already starts with it, e.g. GLM's [gMASK])
+        if ((request.useChat() || request.rawMode()) && specialTokens.shouldAddBos() && specialTokens.getBosId() >= 0
+                && !(encodedTokens.length > 0 && encodedTokens[0] == specialTokens.getBosId())) {
             int bosId = specialTokens.getBosId();
             promptTokens = new int[encodedTokens.length + 1];
             promptTokens[0] = bosId;
@@ -550,18 +648,84 @@ public class LLMEngine implements AutoCloseable {
                 (maxContextLength - 1) + ")", 0, promptLen, 0, 0, Collections.<EvaluationResult>emptyList());
         }
 
-        if (request.hasImages()) {
-            return generateMultimodal(request, callback, sampler, promptTokens);
+        // GPU work is serialized: the GPU-resident passes keep the KV cache (and recurrent state)
+        // of a single sequence on the device, and the per-tensor path shares pooled buffers. Two
+        // concurrent generations (generateBatch, the Swing UI, an embedded caller) would corrupt
+        // each other's context, so they run one after the other.
+        boolean gpu = TensorFactory.getGpuBufferManager() != null;
+        if (gpu) {
+            gpuGenerationLock.lock();
+            it.denzosoft.llmplayer.gpu.GpuActivity.LLMEngineHooks.generationStarted();
         }
+        try {
+            if (request.hasImages()) {
+                return generateMultimodal(request, callback, sampler, promptTokens);
+            }
+            final int[] emitted = new int[1];
+            StreamingCallback counting = callback == null ? null : new StreamingCallback() {
+                @Override
+                public boolean onToken(String token, int tokenId) {
+                    emitted[0]++;
+                    return callback.onToken(token, tokenId);
+                }
+            };
+            try {
+                return generateTokens(request, counting, sampler, promptTokens, true);
+            } catch (it.denzosoft.llmplayer.inference.GpuFailureException e) {
+                // The engine already dropped its GPU pass. If nothing reached the caller yet the
+                // whole request can be redone on the CPU from position 0; otherwise report it.
+                if (emitted[0] > 0) throw e;
+                System.err.println("GPU failure during prefill — retrying the request on the CPU");
+                return generateTokens(request, counting, new CompositeSampler(request.samplerConfig()),
+                    promptTokens, false);
+            }
+        } finally {
+            if (gpu) {
+                it.denzosoft.llmplayer.gpu.GpuActivity.LLMEngineHooks.generationEnded();
+                gpuGenerationLock.unlock();
+            }
+        }
+    }
 
+    private final java.util.concurrent.locks.ReentrantLock gpuGenerationLock =
+        new java.util.concurrent.locks.ReentrantLock();
+
+    // State object that ran last on a GPU-resident pass of an alternative engine (whose device
+    // state holds that sequence only); the standard engine tracks this itself.
+    private volatile Object lastGpuResidentState;
+
+    /** Whether {@code state}'s history is fully available to the engine (see gpuHoldsHistoryOf). */
+    private boolean gpuHoldsHistoryOf(Object state) {
+        if (engine != null) return engine.gpuHoldsHistoryOf(state);
+        return !altEngineHasGpuPass() || state == lastGpuResidentState;
+    }
+
+    private boolean altEngineHasGpuPass() {
+        return (q35Engine != null && q35Engine.hasGpuForwardPass())
+            || (q3moeEngine != null && q3moeEngine.hasGpuForwardPass())
+            || (ds2Engine != null && ds2Engine.hasGpuForwardPass())
+            || (nemHEngine != null && nemHEngine.hasGpuForwardPass())
+            || (lfm2Engine != null && lfm2Engine.hasGpuForwardPass())
+            || (falconH1Engine != null && falconH1Engine.hasGpuForwardPass())
+            || (gemma4Engine != null && gemma4Engine.hasGpuForwardPass());
+    }
+
+    private GenerationResponse generateTokens(GenerationRequest request, StreamingCallback callback,
+                                              CompositeSampler sampler, int[] promptTokens, boolean useCache) {
         // KV cache reuse: check for cached conversation state
-        String cacheKey = request.cacheKey();
+        String cacheKey = useCache ? request.cacheKey() : null;
         ConversationCache.CachedConversation cached = null;
         int prefillStart = 0;
 
         if (cacheKey != null) {
             cached = conversationCache.take(cacheKey); // exclusive access
+            if (cached != null && !gpuHoldsHistoryOf(cached.state)) {
+                // Another sequence ran on the GPU since this conversation was cached: the device
+                // no longer holds its KV cache, so start over with a fresh state.
+                cached = null;
+            }
             if (cached != null) {
+                int promptLen = promptTokens.length;
                 prefillStart = findPrefixMatch(cached.promptTokens, promptTokens);
                 if (prefillStart == 0) {
                     cached = null; // no match, create fresh state
@@ -632,6 +796,8 @@ public class LLMEngine implements AutoCloseable {
             stateForCache = state;
             response = generateStandard(engine, sampler, promptTokens, request, callback, state, prefillStart);
         }
+
+        if (altEngineHasGpuPass()) lastGpuResidentState = stateForCache;
 
         // Update cache with the state (KV cache now includes prompt + generated tokens)
         if (cacheKey != null) {
@@ -800,6 +966,7 @@ public class LLMEngine implements AutoCloseable {
         int promptLen = promptTokens.length;
         long startTime = System.nanoTime();
         float[] logits = null;
+        eng.resetProfile();
         for (int i = prefillStart; i < promptLen; i++) {
             // Only the last prompt token's logits are used, so skip the output projection for the
             // rest. On a large vocabulary that single matmul dominates prefill — 151936 x 2048 costs
@@ -1179,6 +1346,16 @@ public class LLMEngine implements AutoCloseable {
      * and returns an L2-normalized vector.
      */
     public float[] embed(String text) {
+        boolean gpu = TensorFactory.getGpuBufferManager() != null;
+        if (gpu) gpuGenerationLock.lock();
+        try {
+            return embedLocked(text);
+        } finally {
+            if (gpu) gpuGenerationLock.unlock();
+        }
+    }
+
+    private float[] embedLocked(String text) {
         int[] encodedTokens = tokenizer.encode(text);
         int[] tokens = new int[encodedTokens.length + 1];
         tokens[0] = specialTokens.getBosId();
@@ -1189,7 +1366,11 @@ public class LLMEngine implements AutoCloseable {
         if (engine != null) {
             InferenceState state = engine.createState(maxContextLength);
             engine.prefill(state, tokens);
-            return l2Normalize(state.xb, dim);
+            // The GPU pass may have run the final norm on the device; take the hidden state from
+            // the residual stream instead of state.xb.
+            float[] hidden = new float[dim];
+            engine.finalHidden(state, hidden);
+            return l2Normalize(hidden, dim);
         } else if (ds2Engine != null) {
             DeepSeek2State state = ds2Engine.createState(maxContextLength);
             ds2Engine.prefill(state, tokens);
@@ -1305,7 +1486,10 @@ public class LLMEngine implements AutoCloseable {
 
     private static long estimateKvCache(ModelConfig config, int maxCtxLen) {
         long bytesPerFloat = 4L;
-        if (config.architecture() == ModelArchitecture.DEEPSEEK2) {
+        if (config.architecture() == ModelArchitecture.DEEPSEEK2 && config.mlaLatentCache()) {
+            // Latent MLA cache: normalized latent + rotated k_rope per token, shared by every head
+            return config.blockCount() * (long) maxCtxLen * (config.kvLoraRank() + config.ropeDimensionCount()) * bytesPerFloat;
+        } else if (config.architecture() == ModelArchitecture.DEEPSEEK2) {
             // DeepSeek2 MLA: key=[headCount * keyLength], value=[headCount * valueLength]
             long keySize = (long) config.headCount() * config.keyLength();
             long valSize = (long) config.headCount() * config.valueLength();
@@ -1509,12 +1693,240 @@ public class LLMEngine implements AutoCloseable {
     public String getGpuDeviceName() { return gpuDeviceName; }
     public boolean isMoeOptimizedGpu() { return moeOptimizedGpu; }
 
+    /** The GPU expert cache of the loaded MoE model, or null. */
+    private it.denzosoft.llmplayer.inference.GpuExpertCache gpuExpertCache() {
+        if (q3moeEngine != null) return q3moeEngine.getGpuExpertCache();
+        if (ds2Engine != null) return ds2Engine.getGpuExpertCache();
+        if (q35Engine != null) return q35Engine.getGpuExpertCache();
+        return null;
+    }
+
+    /**
+     * Give the GPU expert cache its routing profile: routing counts of earlier runs of this model
+     * file, so the most routed experts are uploaded before the first token, written back at close.
+     * Stored under {@code ~/.cache/llmplayer/routing} (not next to the model, which may be
+     * read-only), keyed by file name and size. Disable with {@code -Dmoe.routing.profile=false}.
+     */
+    private void attachRoutingProfile() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache();
+        if (c == null || "false".equals(System.getProperty("moe.routing.profile"))) return;
+        try {
+            java.nio.file.Path model = loadedModel.ggufFile().getPath();
+            String name = (model != null ? model.getFileName().toString() : loadedModel.config().name())
+                .replaceAll("[^A-Za-z0-9._-]", "_");
+            java.nio.file.Path dir = java.nio.file.Paths.get(System.getProperty("moe.routing.profile.dir",
+                System.getProperty("user.home", ".") + "/.cache/llmplayer/routing"));
+            c.setRoutingProfile(dir.resolve(name + "-" + modelFileSize + ".routing"));
+        } catch (Throwable e) {
+            System.err.println("  Expert GPU cache: routing profile unavailable — " + e);
+        }
+    }
+
+    // ==================== Placement calibration (F8) ====================
+
+    private volatile String placementReport;
+
+    /** The last placement calibration's report (or the applied stored verdict), or null. */
+    public String getPlacementReport() { return placementReport; }
+
+    private String placementKey() {
+        java.nio.file.Path model = loadedModel.ggufFile().getPath();
+        String name = model != null ? model.getFileName().toString() : loadedModel.config().name();
+        return name + "-" + modelFileSize + "-" + (gpuDeviceName != null ? gpuDeviceName : "cpu") + "-ctx"
+            + maxContextLength + "-v" + PlacementCalibrator.VERSION;
+    }
+
+    private boolean calibratable() {
+        return gpuResources != null && (engine != null || q3moeEngine != null || ds2Engine != null || q35Engine != null);
+    }
+
+    /** Apply a stored calibration verdict for this model (unless -Dplacement.calibrate=false), or calibrate with =force. */
+    private void applyPersistedPlacement() {
+        String mode = System.getProperty("placement.calibrate", "auto");
+        if ("false".equals(mode) || !calibratable()) return;
+        if ("force".equals(mode)) {
+            calibratePlacement(true);
+            return;
+        }
+        PlacementCalibrator.Config c = PlacementCalibrator.load(PlacementCalibrator.verdictFile(placementKey()));
+        if (c == null) return;
+        if (c.threads <= 0) c.threads = it.denzosoft.llmplayer.tensor.MatmulPool.configuredThreads();
+        new CalTarget().apply(c);
+        placementReport = "stored calibration applied: " + c;
+        System.out.println("Placement: " + placementReport);
+        try { LLMPlayerMetrics.getInstance().setPlacementReport(placementReport); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Measure the placement alternatives on the loaded model (see {@link PlacementCalibrator}) and
+     * keep the fastest; with {@code force} even when a stored verdict exists. Returns the report.
+     */
+    public String calibratePlacement(boolean force) {
+        if (!calibratable()) return "placement calibration: nothing to calibrate (no GPU placement)";
+        java.nio.file.Path file = PlacementCalibrator.verdictFile(placementKey());
+        if (!force) {
+            PlacementCalibrator.Config c = PlacementCalibrator.load(file);
+            if (c != null) {
+                new CalTarget().apply(c);
+                return placementReport = "stored calibration applied: " + c;
+            }
+        }
+        if (gpuResources != null) gpuGenerationLock.lock();
+        try {
+            System.out.println("=== Placement calibration (in-process, interleaved rounds) ===");
+            int[] tokens = tokenizer.encode("The history of computing began with mechanical calculators and");
+            CalTarget target = new CalTarget();
+            PlacementCalibrator cal = new PlacementCalibrator(target);
+            PlacementCalibrator.Config c = cal.calibrate(tokens);
+            PlacementCalibrator.save(file, c, cal.log());
+            lastGpuResidentState = null; // the device state now holds a calibration sequence
+            trainingState = null;
+            placementReport = "calibrated: " + c;
+            System.out.println("Placement: " + placementReport);
+            try { LLMPlayerMetrics.getInstance().setPlacementReport(placementReport); } catch (Throwable ignored) { }
+            return cal.log();
+        } finally {
+            if (gpuResources != null) gpuGenerationLock.unlock();
+        }
+    }
+
+    /** The calibrator's view of this engine: park switches, thread count, keeper, timed decode. */
+    private final class CalTarget implements PlacementCalibrator.Target {
+        private final boolean poolWasEnabled = it.denzosoft.llmplayer.tensor.MatmulPool.enabled();
+
+        @Override public boolean hasGpuAttention() {
+            if (q3moeEngine != null) return q3moeEngine.hasGpuForwardPass() || q3moeEngine.hasParkedAttention();
+            if (ds2Engine != null) return ds2Engine.hasGpuForwardPass() || ds2Engine.hasParkedAttention();
+            if (q35Engine != null) return q35Engine.hasGpuForwardPass() || q35Engine.hasParkedPass();
+            if (engine != null) return engine.hasGpuForwardPass() || engine.hasParkedPass();
+            return false;
+        }
+
+        @Override public boolean hasGpuExpertCache() { return gpuExpertCache() != null; }
+
+        @Override public boolean hasKeeper() {
+            it.denzosoft.llmplayer.gpu.GpuActivity.Listener l = it.denzosoft.llmplayer.gpu.GpuActivity.listener();
+            return l != null && l.hasKeeper();
+        }
+
+        @Override public int configuredThreads() { return it.denzosoft.llmplayer.tensor.MatmulPool.configuredThreads(); }
+
+        @Override public int logicalCpus() { return Runtime.getRuntime().availableProcessors(); }
+
+        @Override public void apply(PlacementCalibrator.Config c) {
+            boolean gpuAttn = c.gpuAttention;
+            if (q3moeEngine != null) { q3moeEngine.setGpuAttentionParked(!gpuAttn); q3moeEngine.setExpertGpuCacheParked(!c.cache); }
+            if (ds2Engine != null) { ds2Engine.setGpuAttentionParked(!gpuAttn); ds2Engine.setExpertGpuCacheParked(!c.cache); }
+            if (q35Engine != null) { q35Engine.setGpuForwardPassParked(!gpuAttn); q35Engine.setExpertGpuCacheParked(!c.cache); }
+            if (engine != null) engine.setGpuForwardPassParked(!gpuAttn);
+            FloatTensor.setGpuMatmulEnabled(c.gpuMatmul);
+            // The CPU candidate must run on the pool it would use on its own
+            if (!c.gpuMatmul) it.denzosoft.llmplayer.tensor.MatmulPool.enable();
+            else if (!poolWasEnabled) it.denzosoft.llmplayer.tensor.MatmulPool.disable();
+            it.denzosoft.llmplayer.gpu.GpuActivity.Listener l = it.denzosoft.llmplayer.gpu.GpuActivity.listener();
+            if (l != null) l.setKeeperEnabled(c.keeper);
+            if (c.threads > 0) it.denzosoft.llmplayer.tensor.MatmulPool.setActiveThreads(c.threads);
+            lastGpuResidentState = null;
+        }
+
+        @Override public int maxContext() { return maxContextLength; }
+
+        @Override public PlacementCalibrator.Sample run(int[] tokens, int warm, int[] prefix) {
+            it.denzosoft.llmplayer.gpu.GpuActivity.LLMEngineHooks.generationStarted();
+            try {
+                int p = prefix.length;
+                int ctx = Math.min(maxContextLength, p + tokens.length + 8);
+                double prefillMs = Double.NaN;
+                long t0;
+                if (q3moeEngine != null) {
+                    Qwen3MoEState st = q3moeEngine.createState(ctx);
+                    if (p > 0) { t0 = System.nanoTime(); q3moeEngine.forwardPrefill(st, prefix, 0, p); prefillMs = ms(t0) / p; }
+                    t0 = System.nanoTime();
+                    for (int i = 0; i < tokens.length; i++) { if (i == warm) t0 = System.nanoTime(); q3moeEngine.forward(st, tokens[i], p + i); }
+                } else if (ds2Engine != null) {
+                    DeepSeek2State st = ds2Engine.createState(ctx);
+                    if (p > 0) { t0 = System.nanoTime(); ds2Engine.forwardPrefill(st, prefix, 0, p); prefillMs = ms(t0) / p; }
+                    t0 = System.nanoTime();
+                    for (int i = 0; i < tokens.length; i++) { if (i == warm) t0 = System.nanoTime(); ds2Engine.forward(st, tokens[i], p + i); }
+                } else if (q35Engine != null) {
+                    Qwen35State st = q35Engine.createState(ctx);
+                    if (p > 0) { t0 = System.nanoTime(); q35Engine.forwardPrefill(st, prefix, 0, p); prefillMs = ms(t0) / p; }
+                    t0 = System.nanoTime();
+                    for (int i = 0; i < tokens.length; i++) { if (i == warm) t0 = System.nanoTime(); q35Engine.forward(st, tokens[i], p + i); }
+                } else {
+                    InferenceState st = engine.createState(ctx);
+                    if (p > 0) { t0 = System.nanoTime(); engine.forwardPrefill(st, prefix, 0, p); prefillMs = ms(t0) / p; }
+                    t0 = System.nanoTime();
+                    for (int i = 0; i < tokens.length; i++) { if (i == warm) t0 = System.nanoTime(); engine.forward(st, tokens[i], p + i); }
+                }
+                double decodeMs = ms(t0) / Math.max(1, tokens.length - warm);
+                return new PlacementCalibrator.Sample(decodeMs, prefillMs);
+            } finally {
+                it.denzosoft.llmplayer.gpu.GpuActivity.LLMEngineHooks.generationEnded();
+            }
+        }
+
+        private double ms(long t0) { return (System.nanoTime() - t0) / 1e6; }
+    }
+
+    /** One-line GPU expert cache summary (hits, misses, residency), or null when there is none. */
+    public String getGpuExpertCacheStats() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache();
+        if (c == null) return null;
+        String s = c.getStats();
+        if (c.capacityExperts() > 0) {
+            s += ", " + c.residentExperts() + "/" + c.capacityExperts() + " experts resident";
+        }
+        return s;
+    }
+
+    /** One-line report of the GPU helpers (clock keeper duty cycle and P-states), or null. */
+    public String getGpuActivityReport() {
+        return gpuResources == null ? null : it.denzosoft.llmplayer.gpu.GpuActivity.report();
+    }
+
     /**
      * Enumerate available GPU (OpenCL) devices via reflection.
      * Returns a list of maps with device info, or empty list if GPU support unavailable.
      */
-    @SuppressWarnings("unchecked")
+    // Device enumeration (CUDA + OpenCL, including a PoCL probe) takes a few hundred ms and was
+    // repeated about five times per load; the device set does not change within a process.
+    private static volatile List<Map<String, Object>> cachedGpuDevices;
+
     public static List<Map<String, Object>> listGpuDevices() {
+        List<Map<String, Object>> cached = cachedGpuDevices;
+        if (cached == null) {
+            synchronized (LLMEngine.class) {
+                cached = cachedGpuDevices;
+                if (cached == null) {
+                    cached = enumerateGpuDevices();
+                    cachedGpuDevices = cached;
+                }
+            }
+        }
+        List<Map<String, Object>> copy = new ArrayList<>(cached.size());
+        for (Map<String, Object> m : cached) copy.add(new LinkedHashMap<>(m));
+        return copy;
+    }
+
+    /**
+     * Free device memory reported by the active CUDA context (cuMemGetInfo), or -1 when no CUDA
+     * context is active.
+     */
+    private static long queryFreeVram() {
+        try {
+            Object bm = TensorFactory.getGpuBufferManager();
+            if (bm == null || !bm.getClass().getName().endsWith("CudaBufferManager")) return -1;
+            Object ctx = bm.getClass().getMethod("getCudaContext").invoke(bm);
+            long[] info = (long[]) ctx.getClass().getMethod("getMemoryInfo").invoke(ctx);
+            return info[0];
+        } catch (Throwable e) {
+            return -1;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> enumerateGpuDevices() {
         List<Map<String, Object>> result = new ArrayList<>();
 
         // Try CUDA devices first
@@ -1574,17 +1986,14 @@ public class LLMEngine implements AutoCloseable {
             long fileSize = Files.size(ggufPath);
 
             // Quick parse to get config for KV cache estimate
-            int blockCount = 32; // default estimate
-            int kvDim = 256;
+            long kvCache = 2L * 32 * contextLength * 256 * 4L; // default estimate
             try {
                 it.denzosoft.llmplayer.gguf.GGUFFile quickParse = it.denzosoft.llmplayer.gguf.GGUFParser.parse(ggufPath);
                 ModelConfig config = ModelConfig.fromMetadata(quickParse.getMetadata());
-                blockCount = config.blockCount();
-                kvDim = config.kvDim();
+                kvCache = estimateKvCache(config, contextLength); // MLA caches decompressed per-head K/V
                 quickParse.close();
             } catch (Exception ignored) {}
 
-            long kvCache = 2L * blockCount * contextLength * kvDim * 4L;
             long estimatedRam = fileSize + kvCache;
 
             // Two separate budgets: the weights are mmap'd off-heap, so they compete for physical
@@ -1755,6 +2164,42 @@ public class LLMEngine implements AutoCloseable {
     }
 
     /**
+     * Index (in {@link #listGpuDevices()}) of the device a load would use: the CUDA GPU with the
+     * most memory, else the OpenCL GPU with the most memory; -1 when only OpenCL CPU devices
+     * (PoCL) exist, since OpenCL on a CPU is slower than the native SIMD path.
+     */
+    private static int selectBestGpuIndex(List<Map<String, Object>> devices) {
+        int bestCuda = -1, bestOcl = -1;
+        long bestCudaMem = -1, bestOclMem = -1;
+        for (int i = 0; i < devices.size(); i++) {
+            Map<String, Object> dev = devices.get(i);
+            Object mem = dev.get("globalMemory");
+            long vram = (mem instanceof Number) ? ((Number) mem).longValue() : 0;
+            String backend = dev.get("backend") != null ? dev.get("backend").toString() : "opencl";
+            if ("cuda".equals(backend)) {
+                if (vram > bestCudaMem) { bestCudaMem = vram; bestCuda = i; }
+            } else if (!isCpuDevice(dev)) {
+                if (vram > bestOclMem) { bestOclMem = vram; bestOcl = i; }
+            }
+        }
+        return bestCuda >= 0 ? bestCuda : bestOcl;
+    }
+
+    private static boolean isCpuDevice(Map<String, Object> dev) {
+        Object deviceType = dev.get("deviceType");
+        if (deviceType != null) {
+            String typeStr = deviceType.toString().toUpperCase();
+            return typeStr.contains("CPU") || "2".equals(typeStr);
+        }
+        Object name = dev.get("name");
+        if (name != null) {
+            String n = name.toString().toLowerCase();
+            return n.contains("cpu") || n.contains("pocl");
+        }
+        return false;
+    }
+
+    /**
      * Auto-detect the best GPU and configure it optimally for the given model.
      * Returns null if no GPU is available.
      */
@@ -1850,7 +2295,7 @@ public class LLMEngine implements AutoCloseable {
             modelName = planConfig.name();
             isMoE = planConfig.expertCount() > 0;
             if (isMoE) {
-                nonExpertBytes = sumNonExpertTensorBytes(quickParse, planConfig);
+                nonExpertBytes = moeGpuPlanBytes(quickParse, planConfig);
             }
             quickParse.close();
         } catch (Exception e) {
@@ -1866,25 +2311,24 @@ public class LLMEngine implements AutoCloseable {
         int gpuLayers = 0;
 
         if (gpuAvailable) {
-            // Select device with most VRAM
-            for (int i = 0; i < devices.size(); i++) {
-                Object mem = devices.get(i).get("globalMemory");
-                if (mem instanceof Number) {
-                    long vram = ((Number) mem).longValue();
-                    if (vram > bestVram) {
-                        bestVram = vram;
-                        bestDeviceIdx = i;
-                    }
-                }
+            // Same priority as autoConfigureGpu (CUDA GPU > OpenCL GPU, never an OpenCL CPU device
+            // such as PoCL), so the plan describes the device the load will actually use.
+            bestDeviceIdx = selectBestGpuIndex(devices);
+            if (bestDeviceIdx < 0) gpuAvailable = false;
+            else {
+                Object mem = devices.get(bestDeviceIdx).get("globalMemory");
+                bestVram = (mem instanceof Number) ? ((Number) mem).longValue() : 0;
             }
-            if (bestDeviceIdx >= 0) {
+            if (gpuAvailable && bestDeviceIdx >= 0) {
                 Object name = devices.get(bestDeviceIdx).get("name");
                 bestDeviceName = name != null ? name.toString() : "GPU " + bestDeviceIdx;
             }
 
             // Calculate layers that fit in VRAM
-            if (bestVram > 0) {
-                long usableVram = (long) (bestVram * 0.80);
+            if (!gpuAvailable) {
+                gpuLayers = 0;
+            } else if (bestVram > 0) {
+                long usableVram = isMoE ? moeUsableVram(bestVram) : (long) (bestVram * 0.80);
                 if (isMoE && nonExpertBytes <= usableVram) {
                     // MoE-optimized: all attention on GPU, experts on CPU
                     moeOptimized = true;
@@ -2008,9 +2452,41 @@ public class LLMEngine implements AutoCloseable {
         }
     }
 
+    /** cuMemAlloc backs every allocation with 2 MiB pages; each weight tensor is its own allocation. */
+    private static final long VRAM_PAGE = 2L << 20;
+
+    private static long pageRound(long bytes) {
+        return bytes <= 0 ? 0 : (bytes + VRAM_PAGE - 1) / VRAM_PAGE * VRAM_PAGE;
+    }
+
+    /**
+     * Device memory the MoE-optimized placement uploads before the expert cache is sized (F7 of
+     * docs/optimization/gpu-slower-than-cpu.md): every non-expert tensor of every layer (dense
+     * leading layers in full), the output projection and norm, each rounded to the 2 MiB page;
+     * the latent MLA pass's FP16 copies of {@code attn_k_b} / {@code attn_v_b} instead of the
+     * quantized tensors; no router (it stays on the CPU). The KV cache is added by the caller.
+     */
+    private static long moeGpuPlanBytes(it.denzosoft.llmplayer.gguf.GGUFFile gguf, ModelConfig config) {
+        long total = sumNonExpertTensorBytes(gguf, config);
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.OUTPUT));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.OUTPUT_NORM));
+        return total;
+    }
+
+    /**
+     * VRAM the MoE placement may plan with: the device total minus a flat reserve for the CUDA
+     * context and modules, the passes' activation and prefill buffers, the flash attention scratch
+     * and the small allocations' page rounding (the KV cache is planned separately). It replaces a
+     * flat 80% of the total; the expert cache later takes what is really free.
+     */
+    private static long moeUsableVram(long totalVram) {
+        return totalVram - Math.max(768L << 20, totalVram / 8);
+    }
+
     /**
      * Sum the byte sizes of all non-expert tensors across all layers of a MoE model.
-     * This includes: attention tensors, norms, router, shared experts, plus dense leading layers in full.
+     * This includes: attention tensors, norms, shared experts, plus dense leading layers in full;
+     * each is rounded to the 2 MiB allocation page. The router is not counted (it stays on the CPU).
      */
     private static long sumNonExpertTensorBytes(it.denzosoft.llmplayer.gguf.GGUFFile gguf, ModelConfig config) {
         long total = 0;
@@ -2044,11 +2520,7 @@ public class LLMEngine implements AutoCloseable {
 
         // Attention
         if (isDeepSeek2) {
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvAMqa(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvANorm(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvB(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnOutput(layer));
+            total += mlaAttentionBytes(gguf, config, layer);
         } else {
             total += tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer));
             total += tensorByteSize(gguf, ArchitectureRegistry.attnK(layer));
@@ -2073,34 +2545,56 @@ public class LLMEngine implements AutoCloseable {
                                                    int layer, boolean isDeepSeek2) {
         long total = 0;
 
-        // Norms
-        total += tensorByteSize(gguf, ArchitectureRegistry.attnNorm(layer));
-        total += tensorByteSize(gguf, ArchitectureRegistry.ffnNorm(layer));
+        // Norms (uploaded as FP32 arrays by the passes; small, one page each)
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnNorm(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.ffnNorm(layer)));
 
         // Attention tensors
         if (isDeepSeek2) {
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvAMqa(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvANorm(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKvB(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnOutput(layer));
+            total += mlaAttentionBytes(gguf, config, layer);
         } else {
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnK(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnV(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnOutput(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnQNorm(layer));
-            total += tensorByteSize(gguf, ArchitectureRegistry.attnKNorm(layer));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer)));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnK(layer)));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnV(layer)));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnOutput(layer)));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQNorm(layer)));
+            total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnKNorm(layer)));
         }
 
-        // Router (small)
-        total += tensorByteSize(gguf, ArchitectureRegistry.ffnGateInp(layer));
+        // The router is not counted: it is loaded on the CPU (only used through a CPU matmul).
 
         // Shared experts (small)
-        total += tensorByteSize(gguf, ArchitectureRegistry.ffnGateShexp(layer));
-        total += tensorByteSize(gguf, ArchitectureRegistry.ffnUpShexp(layer));
-        total += tensorByteSize(gguf, ArchitectureRegistry.ffnDownShexp(layer));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.ffnGateShexp(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.ffnUpShexp(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.ffnDownShexp(layer)));
 
+        return total;
+    }
+
+    /**
+     * MLA attention tensors of a DeepSeek2 layer: direct or Q-LoRA query, {@code wkv_a} and its
+     * norm, and either a combined {@code wkv_b} or separate {@code wk_b} / {@code wv_b} — which the
+     * latent pass uploads as FP16 copies (2 bytes per element), not as the quantized tensors.
+     * A name the model does not carry contributes 0.
+     */
+    private static long mlaAttentionBytes(it.denzosoft.llmplayer.gguf.GGUFFile gguf, ModelConfig config, int layer) {
+        long total = 0;
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQ(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQA(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQANorm(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnQB(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnKvAMqa(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnKvANorm(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnKvB(layer)));
+        total += pageRound(tensorByteSize(gguf, ArchitectureRegistry.attnOutput(layer)));
+        GGUFTensorInfo kb = gguf.findTensor(ArchitectureRegistry.attnKB(layer));
+        GGUFTensorInfo vb = gguf.findTensor(ArchitectureRegistry.attnVB(layer));
+        if (kb != null || vb != null) {
+            boolean latent = config.mlaLatentCache();
+            long kbElems = kb != null ? kb.elementCount() : 0, vbElems = vb != null ? vb.elementCount() : 0;
+            total += latent ? pageRound(kbElems * 2) + pageRound(vbElems * 2)
+                : pageRound(kbElems * 2) + pageRound(vb != null ? vb.byteSize() : 0); // wk_b transposed FP16, wv_b as is
+        }
         return total;
     }
 
@@ -2143,14 +2637,49 @@ public class LLMEngine implements AutoCloseable {
 
             Object cudaContext = cudaBufMgrClass.getMethod("getCudaContext").invoke(bufMgr);
 
-            // Query free VRAM
+            // Upload the output projection first: GPU weights are uploaded on first use, and once
+            // the cache has taken the free VRAM a later allocation still succeeds under WDDM but
+            // lands in shared system memory, read over PCIe (Qwen3-Coder-30B: 55 ms per token for
+            // the output matmul instead of 3.5).
+            FloatTensor out = loadedModel.qwen3MoEWeights() != null ? loadedModel.qwen3MoEWeights().output()
+                : loadedModel.deepSeek2Weights() != null ? loadedModel.deepSeek2Weights().output()
+                : loadedModel.qwen35Weights() != null ? loadedModel.qwen35Weights().output() : null;
+            if (out != null) {
+                int dim = loadedModel.config().embeddingLength(), vocab = loadedModel.config().vocabSize();
+                out.matmulParallel(new float[dim], new float[vocab], vocab, dim);
+            }
+            // Same for every other GPU tensor reached through the per-tensor path (F7)
+            if (q3moeEngine != null) q3moeEngine.warmGpuTensors();
+            if (ds2Engine != null) ds2Engine.warmGpuTensors();
+
+            // Query free VRAM; keep a margin for activations, kernels and the driver
             long[] memInfo = (long[]) cudaContext.getClass().getMethod("getMemoryInfo").invoke(cudaContext);
             long freeVram = memInfo[0];
-            long safetyMargin = 200L * 1024 * 1024; // 200 MB reserved
+            long safetyMargin = Math.max(512L << 20, memInfo[1] / 10);
+            // -Dmoe.expert.gpu.margin.mb overrides the margin; a negative value asks for more than
+            // the free figure (WSL2 lets cuMemAlloc overcommit), and the VRAM guard then releases
+            // every chunk that lands in shared system memory (F7).
+            Long marginMb = Long.getLong("moe.expert.gpu.margin.mb");
+            if (marginMb != null) safetyMargin = marginMb << 20;
             long cacheBytes = Math.max(0, freeVram - safetyMargin);
+            // Optional cap (-Dmoe.expert.gpu.cache.mb / --gpu-expert-cache). Not moe.expert.cache.mb:
+            // that one is the budget of the SSD-streaming RAM cache.
+            Long capMb = Long.getLong("moe.expert.gpu.cache.mb");
+            if (capMb != null && capMb >= 0) cacheBytes = Math.min(cacheBytes, capMb << 20);
 
             if (cacheBytes > 50L * 1024 * 1024) { // At least 50 MB for cache
-                q3moeEngine.initExpertGpuCache(cudaContext, cacheBytes);
+                if (q35Engine != null && !"false".equals(System.getProperty("moe.expert.gpu"))) {
+                    q35Engine.initExpertGpuCache(cudaContext, cacheBytes);
+                }
+                if (q3moeEngine != null && !"false".equals(System.getProperty("moe.expert.gpu"))) {
+                    q3moeEngine.initExpertGpuCache(cudaContext, cacheBytes);
+                }
+                // DeepSeek2: the upload-on-miss cache was slower than the CPU experts (2.5 -> 0.8 tok/s
+                // on DeepSeek-Coder-V2-Lite); the hybrid split is faster (3.1 -> 6.8 tok/s).
+                if (ds2Engine != null && it.denzosoft.llmplayer.inference.GpuExpertCache.hybrid()
+                        && !"false".equals(System.getProperty("moe.expert.gpu.ds2"))) {
+                    ds2Engine.initExpertGpuCache(cudaContext, cacheBytes);
+                }
             }
         } catch (Exception e) {
             // Expert GPU cache not available — no problem, CPU fallback works
@@ -2309,7 +2838,12 @@ public class LLMEngine implements AutoCloseable {
             if (cacheStats != null) System.out.println("  " + cacheStats);
             expertCache.close(); // frees the off-heap slots and the file handle
         }
+        it.denzosoft.llmplayer.inference.GpuExpertCache gpuCache = gpuExpertCache();
+        if (gpuCache != null) {
+            try { gpuCache.close(); } catch (Throwable ignored) { } // before the context goes away
+        }
         if (gpuResources != null) {
+            it.denzosoft.llmplayer.gpu.GpuActivity.setListener(null);
             try { gpuResources.close(); } catch (Exception ignored) {}
         }
         loadedModel.close();

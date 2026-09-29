@@ -30,9 +30,18 @@ There is no pre-attention norm and no pre-FFN norm. The RMSNorm is applied after
 ### Attention
 
 - Multi-Head Attention (MHA): 16 query heads, 16 key-value heads (1:1 ratio, not grouped)
-- RoPE positional encoding: type NEOX (split-half), base frequency 10000
-- No QK-norm, no bias, no sliding window
+- RoPE positional encoding: type NEOX (split-half), base frequency 500000 (`olmo2.rope.freq_base`)
+- QK-norm over the **whole** projection: `attn_q_norm` and `attn_k_norm` have 2048 weights each and
+  are applied as one RMSNorm over the full Q (and K) vector before it is split into heads, as in
+  llama.cpp `olmo2.cpp`. No bias, no sliding window.
 - Head size 128 (larger than Llama's 64)
+
+**QK-norm fix (v1.19.0).** LLMPlayer used to apply these norms per head with only
+the first 128 weights, on both the CPU and the GPU. Short answers looked plausible, but a
+1037-token summarization prompt produced gibberish with a perplexity of about 67 on both paths.
+With the whole-vector norm (`Attention.initNormCaches` / `CudaForwardPass.fullQkNorm`, detected
+from the weight size) the same prompt gives a correct summary: PPL 2.37 on the CPU, 2.83 on the GPU,
+where the batched GPU prefill runs at about 1000 tok/s.
 
 ### FFN
 

@@ -35,6 +35,22 @@ public class CudaBufferManager implements AutoCloseable {
     private final List<Long> hostMappedPointers = new ArrayList<>();
     private volatile boolean closed = false;
 
+    // Per-tensor matmul path (CudaFloatTensor.matmulParallel): the pooled device buffers, the
+    // staging block and the parameter block below are shared, so calls are serialized on
+    // perTensorLock. All GPU work goes to one stream anyway.
+    private final Object perTensorLock = new Object();
+    private final Arena sharedArena = Arena.ofShared();
+    private final KernelParams perTensorParams = new KernelParams(sharedArena, 6);
+    private MemorySegment staging;      // pinned when possible, grown on demand
+    private float[] accumulateScratch = new float[0];
+
+    /** Heap scratch for the per-tensor path's accumulate (call under perTensorLock). */
+    public float[] accumulateScratch(int n) {
+        if (accumulateScratch.length < n) accumulateScratch = new float[n];
+        return accumulateScratch;
+    }
+    private boolean stagingPinned;
+
     public CudaBufferManager(CudaContext cudaContext) {
         this(cudaContext, MemoryMode.DEVICE);
     }
@@ -73,9 +89,17 @@ public class CudaBufferManager implements AutoCloseable {
                 MemorySegment hostSeg = MemorySegment.ofAddress(hostPtr).reinterpret(sizeBytes);
                 copyDataToSegment(data, byteOffset, sizeBytes, hostSeg);
             } else {
-                // Standard device memory: allocate + copy
+                // Standard device memory: allocate + copy, then verify that a large block did not
+                // land in shared system memory (WSL2 lets cuMemAlloc overcommit; F7). A rejected
+                // upload throws, and the tensor falls back to its CPU twin.
                 gpuPtr = cudaContext.allocBuffer(sizeBytes);
                 copyDataToPtr(data, byteOffset, sizeBytes, gpuPtr);
+                VramGuard guard = cudaContext.vramGuard();
+                if (guard != null && !guard.verify(gpuPtr, sizeBytes, "weights")) {
+                    cudaContext.freeBuffer(gpuPtr);
+                    throw new VramGuard.VramExhaustedException("weights: " + (sizeBytes >> 20)
+                        + " MiB would live in shared system memory");
+                }
             }
 
             if (offsetMap == null) {
@@ -179,6 +203,37 @@ public class CudaBufferManager implements AutoCloseable {
 
     public CudaContext getCudaContext() { return cudaContext; }
 
+    /** Lock serializing the per-tensor matmul path (see {@link #perTensorParams()}). */
+    public Object perTensorLock() { return perTensorLock; }
+
+    /** Reusable 6-argument kernel parameter block; use only while holding {@link #perTensorLock()}. */
+    public KernelParams perTensorParams() { return perTensorParams; }
+
+    /**
+     * Host staging block of at least {@code bytes}, page-locked when the driver allows it so that
+     * copies are direct DMA transfers. Use only while holding {@link #perTensorLock()}; the
+     * content is overwritten by the next caller.
+     */
+    public MemorySegment staging(long bytes) {
+        MemorySegment s = staging;
+        if (s != null && s.byteSize() >= bytes) return s;
+        long size = Math.max(bytes, 1L << 20);
+        if (s != null) {
+            if (stagingPinned) {
+                try { cudaContext.freePinnedHost(s); } catch (Exception ignored) {}
+            }
+        }
+        try {
+            s = cudaContext.allocPinnedHost(size);
+            stagingPinned = true;
+        } catch (Exception e) {
+            s = sharedArena.allocate(size, 64);
+            stagingPinned = false;
+        }
+        staging = s;
+        return s;
+    }
+
     @Override
     public void close() {
         if (closed) return;
@@ -206,5 +261,10 @@ public class CudaBufferManager implements AutoCloseable {
             try { cudaContext.freeBuffer(ptr); } catch (Exception ignored) {}
         }
         outputBufferPool.clear();
+        if (staging != null && stagingPinned) {
+            try { cudaContext.freePinnedHost(staging); } catch (Exception ignored) {}
+        }
+        staging = null;
+        try { sharedArena.close(); } catch (Exception ignored) {}
     }
 }

@@ -94,11 +94,16 @@ public final class MatmulPool {
         }
     }
 
+    /** Threads that take part in a dispatch (caller included); see {@link #setActiveThreads}. */
+    private volatile int active;
+
     private MatmulPool(int threads) {
         this.threads = threads;
+        this.active = threads;
         this.workers = new Thread[threads - 1];
         for (int i = 0; i < workers.length; i++) {
-            Thread t = new Thread(this::workerLoop, "matmul-" + (i + 1));
+            final int index = i;
+            Thread t = new Thread(() -> workerLoop(index), "matmul-" + (i + 1));
             t.setDaemon(true);
             workers[i] = t;
             t.start();
@@ -120,18 +125,28 @@ public final class MatmulPool {
         }
     }
 
-    private static volatile boolean disabled = !"true".equals(System.getProperty("matmul.pool", "true"));
+    // Only "false" turns the pool off; "force" (and "true") keep it on. "force" used to start it
+    // disabled, since it is not "true", which made every -Dmatmul.pool=force A/B measure no pool.
+    private static volatile boolean disabled = "false".equals(System.getProperty("matmul.pool"));
 
     /** Whether the pool may be used at all. */
     public static boolean enabled() { return !disabled; }
 
     /**
-     * Stop routing matmuls through the pool. Called when a GPU backend is initialised, together
-     * with {@link FloatTensor#disableVirtualThreadMatmul()}, so GPU runs keep the dispatch they
-     * were validated with. {@code -Dmatmul.pool=force} keeps the pool on regardless.
+     * Stop routing matmuls through the pool ({@code -Dmoe.cpu.pool=false}, the placement
+     * calibrator). {@code -Dmatmul.pool=force} keeps the pool on regardless. GPU initialisation
+     * no longer calls it (F4).
      */
     public static void disable() {
         if (!"force".equals(System.getProperty("matmul.pool"))) disabled = true;
+    }
+
+    /**
+     * Route matmuls through the pool again after {@link #disable()}. {@code -Dmatmul.pool=false}
+     * still wins.
+     */
+    public static void enable() {
+        if (!"false".equals(System.getProperty("matmul.pool"))) disabled = false;
     }
 
     /** Thread count: {@code -Dmatmul.threads}, else the ForkJoin parallelism set by the CLI, else all logical CPUs. */
@@ -143,6 +158,22 @@ public final class MatmulPool {
     }
 
     public int threads() { return threads; }
+
+    /**
+     * Use only {@code n} of the pool's threads (the caller plus {@code n - 1} workers) from the
+     * next dispatch on; the others stay parked. For the placement calibrator's thread-count axis;
+     * {@code n} is clamped to {@code [1, threads]}.
+     */
+    public static void setActiveThreads(int n) {
+        MatmulPool p = get();
+        if (p != null) p.active = Math.max(1, Math.min(p.threads, n));
+    }
+
+    /** Threads a dispatch uses now. */
+    public static int activeThreads() {
+        MatmulPool p = get();
+        return p == null ? configuredThreads() : p.active;
+    }
 
     /**
      * Parallel loop over {@code [0, n)} on the shared pool (one index per chunk), falling back to
@@ -162,12 +193,31 @@ public final class MatmulPool {
     }
 
     /**
+     * Parallel loop over {@code [0, units)} in chunks of at least {@code minChunk} units, on the
+     * shared pool, or on the ForkJoin common pool when the pool is disabled (GPU runs). The MoE
+     * decode loops use it to split the routed experts' rows across every core: a loop over the
+     * top-K experts alone keeps only K threads busy.
+     */
+    public static void forRange(int units, int minChunk, RangeTask task) {
+        MatmulPool pool = enabled() ? get() : null;
+        if (pool != null) {
+            pool.parallelFor(units, minChunk, task);
+            return;
+        }
+        int threads = Math.max(1, configuredThreads());
+        int size = Math.max(Math.max(1, minChunk), (units + threads * CHUNKS_PER_THREAD - 1) / (threads * CHUNKS_PER_THREAD));
+        int count = (units + size - 1) / size;
+        java.util.stream.IntStream.range(0, count).parallel()
+            .forEach(c -> task.run(c * size, Math.min(units, (c + 1) * size)));
+    }
+
+    /**
      * Runs {@code task} over {@code [0, units)} split into chunks of at least {@code minChunk} units,
      * using every worker plus the calling thread, and returns once all units are done.
      */
     public void parallelFor(int units, int minChunk, RangeTask task) {
         if (units <= 0) return;
-        int target = threads * CHUNKS_PER_THREAD;
+        int target = active * CHUNKS_PER_THREAD;
         int size = Math.max(Math.max(1, minChunk), (units + target - 1) / target);
         int count = (units + size - 1) / size;
         if (count <= 1 || workers.length == 0 || !busy.compareAndSet(false, true)) {
@@ -219,12 +269,13 @@ public final class MatmulPool {
         }
     }
 
-    private void workerLoop() {
+    private void workerLoop(int index) {
         Job seen = null;
         while (true) {
             int spins = 0;
             Job j;
-            while ((j = job) == seen) {
+            while ((j = job) == seen || index >= active - 1) {
+                if (j != seen && index >= active - 1) seen = j; // not taking part: skip this job
                 if (++spins < SPIN_LIMIT) {
                     spinHint();
                 } else {

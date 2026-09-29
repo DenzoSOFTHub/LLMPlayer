@@ -54,6 +54,11 @@ public class Qwen35State {
 
     /** Per-token buffers for batched prefill, created on first use by {@link Qwen35InferenceEngine#forwardPrefill}. */
     float[][][] prefillBuffers;
+    SoftmaxMoe.Scratch moeScratch;  // qwen35moe FFN buffers, created on first use
+    float[] moeOut;
+    SoftmaxMoe.BatchScratch moeBatch; // batched-prefill MoE buffers, created on first use
+    float[][] moeBatchOut;
+    float[][] gpuPrefillX;            // embeddings of a GPU batched-prefill chunk
 
     public Qwen35State(ModelConfig config, int maxSeqLen) {
         this.blockCount = config.blockCount();

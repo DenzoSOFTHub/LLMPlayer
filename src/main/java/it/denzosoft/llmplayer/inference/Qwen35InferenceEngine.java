@@ -68,25 +68,28 @@ public class Qwen35InferenceEngine {
     private final float[][] kNormCache;
 
     // GPU forward pass (loaded via reflection from java21/, null if unavailable)
-    private AutoCloseable gpuForwardPass;
+    private LayerGpuForwardPass gpuForwardPass;
+    private final SoftmaxMoe moe; // qwen35moe FFN, null for the dense model
+    private volatile Qwen35State gpuMoeState; // state of the running GPU forward (MoE callback)
     private int gpuLayerCount;
-    private Method gpuUploadXAndUpdateParams;
-    private Method gpuForwardLayer;
-    private Method gpuForwardGraph;
-    private Method gpuForwardGraphArgmax;
-    private Method gpuForwardFinalLogits;
-    private Method gpuForwardFinalArgmax;
-    private Method gpuForwardGraphPrefill;
-    private Method gpuDownloadX;
 
     public Qwen35InferenceEngine(ModelConfig config, Qwen35Weights weights, int maxSeqLen,
                                   float[] ropeFreqFactors) {
         this.config = config;
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
+        this.batchWarmCalls = new int[config.blockCount()];
 
         this.dim = config.embeddingLength();
         this.ffnDim = config.intermediateSize();
+        this.moe = config.expertCount() > 0
+            ? new SoftmaxMoe(dim, config.expertCount(), MoERouting.effectiveTopK(config.expertUsedCount()),
+                config.expertFfnLength(), config.expertSharedFeedForwardLength())
+            : null;
+        if (this.moe != null) {
+            this.moe.setProfile(prof);
+            this.moe.enableRoutingStats(config.blockCount());
+        }
         this.vocabSize = config.vocabSize();
         this.blockCount = config.blockCount();
         this.timeStepRank = config.ssmTimeStepRank();
@@ -178,33 +181,93 @@ public class Qwen35InferenceEngine {
                 .newInstance(config, weights, bufferManager, maxSeqLen);
 
             // Cache methods
-            gpuUploadXAndUpdateParams = fwdClass.getMethod("uploadXAndUpdateParams", float[].class, int.class);
-            gpuForwardLayer = fwdClass.getMethod("forwardLayer", int.class, int.class);
-            gpuForwardGraph = fwdClass.getMethod("forwardGraph", float[].class);
-            gpuForwardGraphArgmax = fwdClass.getMethod("forwardGraphArgmax");
-            gpuForwardFinalLogits = fwdClass.getMethod("forwardFinalLogits", float[].class);
-            gpuForwardFinalArgmax = fwdClass.getMethod("forwardFinalArgmax");
-            gpuForwardGraphPrefill = fwdClass.getMethod("forwardGraphPrefill");
-            gpuDownloadX = fwdClass.getMethod("downloadX", float[].class);
 
             Method getGpuLayers = fwdClass.getMethod("getGpuLayerCount");
             gpuLayerCount = (Integer) getGpuLayers.invoke(fwd);
-            gpuForwardPass = (AutoCloseable) fwd;
+            gpuForwardPass = (LayerGpuForwardPass) fwd;
+            if (moe != null) {
+                // Qwen3.5-MoE: the pass hands every MoE layer's routed experts back to the CPU
+                gpuForwardPass.setMoeFfn((layer, xn, out, withShared) -> {
+                    Qwen35State st = gpuMoeState;
+                    if (st.moeScratch == null) st.moeScratch = moe.newScratch();
+                    long t = System.nanoTime();
+                    moe.forward(st.moeScratch, weights.layers()[layer], layer, xn, out, withShared);
+                    prof.moe(System.nanoTime() - t);
+                });
+            }
 
-            System.err.println("Qwen35 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers)");
+            if (moe != null) {
+                // Batched GPU prefill: the chunk's routed experts (and shared expert) on the CPU, batched
+                gpuForwardPass.setMoeFfnBatch((layer, xn, n, out) -> {
+                    Qwen35State st = gpuMoeState;
+                    if (st.moeBatch == null || st.moeBatch.cap < n) {
+                        st.moeBatch = moe.newBatchScratch(Math.max(n, PREFILL_BATCH), blockCount);
+                    }
+                    long t = System.nanoTime();
+                    moe.forwardBatch(st.moeBatch, weights.layers()[layer], layer, xn, n, out);
+                    // Decode computes the CPU experts through other loops: run them a few times now
+                    if (batchWarmCalls[layer] < 3) {
+                        batchWarmCalls[layer]++;
+                        if (st.moeScratch == null) st.moeScratch = moe.newScratch();
+                        moe.warmDecodePath(st.moeScratch, weights.layers()[layer], xn[n - 1]);
+                    }
+                    prof.moe(System.nanoTime() - t);
+                });
+            }
+
+            System.err.println("Qwen35 CUDA forward pass: enabled (" + gpuLayerCount + "/" + blockCount + " layers"
+                + (gpuForwardPass.maxBatchTokens() > 0 ? ", batched prefill " + gpuForwardPass.maxBatchTokens() + " tokens" : "") + ")");
         } catch (Throwable e) {
             System.err.println("Qwen35 CUDA forward pass: unavailable — " + e.getMessage());
             gpuForwardPass = null;
         }
     }
 
+    /** Qwen3.5-MoE: GPU hot-expert cache over the routed experts (hybrid CPU/GPU split). */
+    public void initExpertGpuCache(Object cudaContext, long maxCacheBytes) {
+        if (moe == null) return;
+        FloatTensor[][] ex = new FloatTensor[weights.layers().length][];
+        for (int i = 0; i < ex.length; i++) {
+            Qwen35LayerWeights lw = weights.layers()[i];
+            if (lw.isMoe()) ex[i] = new FloatTensor[] { lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps() };
+        }
+        moe.setGpuCache(GpuExpertCache.create(cudaContext, maxCacheBytes, ex, config.expertFfnLength(),
+            config.embeddingLength(), config.expertCount()));
+    }
+
     /** See {@link InferenceEngine#disableGpuForwardPass}. */
     public void disableGpuForwardPass() {
+        if (parkedPass != null) setGpuForwardPassParked(false);
         if (gpuForwardPass != null) {
             try { gpuForwardPass.close(); } catch (Exception ignored) { }
             gpuForwardPass = null;
+            it.denzosoft.llmplayer.gpu.GpuActivity.gpuPathDisabled();
             System.out.println("Qwen3.5 GPU forward pass: disabled (vision input needs the CPU layer path)");
         }
+    }
+
+
+    private LayerGpuForwardPass parkedPass;
+    private GpuExpertCache parkedCache;
+
+    /** Park (or restore) the GPU pass without closing it (placement calibrator); see InferenceEngine. */
+    public synchronized void setGpuForwardPassParked(boolean park) {
+        if (park && gpuForwardPass != null) { parkedPass = gpuForwardPass; gpuForwardPass = null; }
+        else if (!park && parkedPass != null) { gpuForwardPass = parkedPass; parkedPass = null; }
+    }
+
+    public boolean hasParkedPass() { return parkedPass != null; }
+
+    /** Park (or restore) the GPU expert cache (placement calibrator). */
+    public synchronized void setExpertGpuCacheParked(boolean park) {
+        if (moe == null) return;
+        if (park && moe.gpuCache() != null) { parkedCache = moe.gpuCache(); moe.setGpuCache(null); }
+        else if (!park && parkedCache != null) { moe.setGpuCache(parkedCache); parkedCache = null; }
+    }
+
+    /** True when a GPU-resident forward pass (which owns the device-side state) is active. */
+    public boolean hasGpuForwardPass() {
+        return gpuForwardPass != null;
     }
 
     public Qwen35State createState(int maxSeqLen) {
@@ -230,8 +293,16 @@ public class Qwen35InferenceEngine {
             try {
                 return forwardGpu(state, position, computeLogits);
             } catch (Exception e) {
-                System.err.println("Qwen35 GPU forward failed, falling back to CPU: " + e.getMessage());
+                System.err.println("Qwen35 GPU forward failed, falling back to CPU: " + GpuFailureException.describe(e));
+                // The pass owned the device KV cache / recurrent state for every earlier position:
+                // the CPU can take over only at position 0 (see InferenceEngine.forwardGpu).
+                AutoCloseable failed = gpuForwardPass;
                 gpuForwardPass = null;
+                try { failed.close(); } catch (Exception ignored) { }
+                it.denzosoft.llmplayer.gpu.GpuActivity.gpuPathDisabled();
+                if (position > 0) {
+                    throw new GpuFailureException("GPU forward pass failed at position " + position, e);
+                }
             }
         }
 
@@ -242,19 +313,25 @@ public class Qwen35InferenceEngine {
         return finishLogits(state);
     }
 
+    private void noteToken(int position) {
+        GpuExpertCache gc = moe != null ? moe.gpuCache() : null;
+        if (gc != null) gc.noteToken(position);
+    }
+
     /** All layers for the residual stream already in {@code state.x}, on the CPU. */
     private void forwardLayersCpu(Qwen35State state, int position) {
-        long t0 = 0, t1;
+        noteToken(position);
+        long t0 = 0, m0 = 0;
         for (int layer = 0; layer < blockCount; layer++) {
             Qwen35LayerWeights lw = weights.layers()[layer];
+            if (cpuProfile) { t0 = System.nanoTime(); m0 = prof.tokenMoeNs(); }
             if (lw.isDeltaNet()) {
-                if (cpuProfile) t0 = System.nanoTime();
                 forwardDeltaNet(state, lw, layer);
-                if (cpuProfile) { t1 = System.nanoTime(); profDeltaNetNs += t1 - t0; }
+                // the layer's MoE FFN is timed on its own (moe_ffn): count only the rest here
+                if (cpuProfile) prof.add(P_DELTANET, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
             } else {
-                if (cpuProfile) t0 = System.nanoTime();
                 forwardAttention(state, lw, layer, position);
-                if (cpuProfile) { t1 = System.nanoTime(); profAttnNs += t1 - t0; }
+                if (cpuProfile) prof.add(P_ATTN_CPU, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
             }
         }
     }
@@ -267,7 +344,7 @@ public class Qwen35InferenceEngine {
     public void prefillEmbeddings(Qwen35State state, float[][] embds, int kvStart) {
         int n = embds.length;
         if (n > 1 && PREFILL_BATCHED && gpuForwardPass == null
-                && it.denzosoft.llmplayer.tensor.MatmulPool.enabled()) {
+                && it.denzosoft.llmplayer.tensor.MatmulPool.enabled() && !layersGpuResident()) {
             float[][][] b = prefillBuffers(state);
             int cap = b[B_X].length;
             for (int base = 0; base < n; base += cap) {
@@ -285,82 +362,105 @@ public class Qwen35InferenceEngine {
 
     /** Final norm and output projection for the residual stream in {@code state.x}. */
     private float[] finishLogits(Qwen35State state) {
-        long t0 = 0;
-        if (cpuProfile) t0 = System.nanoTime();
+        long t0 = System.nanoTime();
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
         Arrays.fill(state.logits, 0);
         weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
-        if (cpuProfile) {
-            profOutputNs += System.nanoTime() - t0;
-            profTokenCount++;
-            if (profTokenCount % 10 == 0) printProfile();
-        }
-
+        prof.endToken(System.nanoTime() - t0, cacheStatsSupplier); // drops the prompt at the first call
         return state.logits;
     }
 
-    private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
-    private long profDeltaNetNs, profAttnNs, profOutputNs;
-    private int profTokenCount;
+    // Phase timing (see DecodeProfile). CPU mode: deltanet / attn(GQA) layers (their MoE FFN
+    // excluded) and moe_ffn; GPU mode: layers(GPU) is every GPU-resident layer minus the routed
+    // experts the pass hands back to the CPU (moe_ffn).
+    private static final int P_DELTANET = 0, P_ATTN_CPU = 1, P_GPU_LAYERS = 2, P_MOE = 3, P_OUTPUT = 4;
+    private final DecodeProfile prof = new DecodeProfile("Qwen35", new String[] {
+        "deltanet", "attn(GQA)", "layers(GPU)", "moe_ffn", "output" }, P_GPU_LAYERS, P_MOE, P_OUTPUT);
+    private final boolean cpuProfile = prof.detailed;
+    private final java.util.function.Supplier<String> cacheStatsSupplier = this::getExpertCacheStats;
+    private boolean decodeKernelsWarm;
+    private final int[] batchWarmCalls; // per layer: decode-path warm-ups run by the GPU batched prefill
 
-    private void printProfile() {
-        int n = profTokenCount;
-        double ms = 1e6;
-        long total = profDeltaNetNs + profAttnNs + profOutputNs;
-        System.out.printf("[cpu-profile Qwen35] %d tokens, per-token avg (ms): deltanet=%.1f attn(GQA)=%.1f output=%.1f | total=%.1f%n",
-            n, profDeltaNetNs / ms / n, profAttnNs / ms / n, profOutputNs / ms / n, total / ms / n);
+    /** Expert GPU cache statistics (Qwen3.5-MoE), or null when the cache is not active. */
+    public String getExpertCacheStats() {
+        GpuExpertCache c = moe != null ? moe.gpuCache() : null;
+        return c == null ? null : c.getStats();
+    }
+
+    /** The GPU expert cache, or null (for metrics). */
+    public GpuExpertCache getGpuExpertCache() {
+        if (moe == null) return null;
+        return moe.gpuCache() != null ? moe.gpuCache() : parkedCache;
     }
 
     private float[] forwardGpu(Qwen35State state, int position, boolean computeLogits) throws Exception {
+        gpuMoeState = state;
+        if (moe != null && !decodeKernelsWarm) {
+            warmDecodeKernels(); // routed experts run on the CPU: warm their dot kernels once
+            decodeKernelsWarm = true;
+        }
+        noteToken(position);
+        long t0 = System.nanoTime(), m0 = prof.tokenMoeNs();
         // Upload embedding + token params
-        gpuUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
+        gpuForwardPass.uploadXAndUpdateParams(state.x, position);
 
         // Try CUDA graph (use generation graph for both prefill and generation)
         if (gpuLayerCount == blockCount) {
-            Boolean graphOk = (Boolean) gpuForwardGraph.invoke(gpuForwardPass, state.logits);
-            if (graphOk) return computeLogits ? state.logits : null;
+            Boolean graphOk = (Boolean) gpuForwardPass.forwardGraph(state.logits);
+            if (graphOk) {
+                prof.add(P_GPU_LAYERS, System.nanoTime() - t0); // layers and output in one replay
+                if (!computeLogits) return null;
+                prof.endToken(0, cacheStatsSupplier);
+                return state.logits;
+            }
         }
 
         // Per-layer GPU forward
         for (int layer = 0; layer < gpuLayerCount; layer++) {
-            gpuForwardLayer.invoke(gpuForwardPass, layer, position);
+            gpuForwardPass.forwardLayer(layer, position);
         }
         // Profiling hook (no-op unless -Dqwen35.profile=true)
-        try {
-            java.lang.reflect.Method m = gpuForwardPass.getClass().getMethod("profileTokenComplete");
-            m.invoke(gpuForwardPass);
-        } catch (NoSuchMethodException ignored) {}
+        gpuForwardPass.profileTokenComplete();
 
         // If not all layers on GPU, download X and continue on CPU
         if (gpuLayerCount < blockCount) {
-            gpuDownloadX.invoke(gpuForwardPass, state.x);
-            for (int layer = gpuLayerCount; layer < blockCount; layer++) {
-                Qwen35LayerWeights lw = weights.layers()[layer];
-                if (lw.isDeltaNet()) {
-                    forwardDeltaNet(state, lw, layer);
-                } else {
-                    forwardAttention(state, lw, layer, position);
-                }
-            }
+            gpuForwardPass.downloadX(state.x);
+            prof.add(P_GPU_LAYERS, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
+            forwardLayersCpuFrom(state, gpuLayerCount, position);
             if (!computeLogits) return null;
-            VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
-            Arrays.fill(state.logits, 0);
-            weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
-            return state.logits;
+            return finishLogits(state);
         }
+        prof.add(P_GPU_LAYERS, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
 
         if (!computeLogits) return null;
 
         // All layers on GPU — try GPU output projection
-        Boolean logitsOk = (Boolean) gpuForwardFinalLogits.invoke(gpuForwardPass, state.logits);
-        if (logitsOk) return state.logits;
+        long t1 = System.nanoTime();
+        Boolean logitsOk = (Boolean) gpuForwardPass.forwardFinalLogits(state.logits);
+        if (logitsOk) {
+            prof.endToken(System.nanoTime() - t1, cacheStatsSupplier);
+            return state.logits;
+        }
 
         // Fallback: download X and compute output on CPU
-        gpuDownloadX.invoke(gpuForwardPass, state.x);
-        VectorOpsFactory.get().rmsnorm(state.xb, state.x, outputNormCache, dim, normEps);
-        Arrays.fill(state.logits, 0);
-        weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
-        return state.logits;
+        gpuForwardPass.downloadX(state.x);
+        return finishLogits(state);
+    }
+
+    /** CPU layers {@code from..blockCount-1} after a partial GPU offload. */
+    private void forwardLayersCpuFrom(Qwen35State state, int from, int position) {
+        long t0 = 0, m0 = 0;
+        for (int layer = from; layer < blockCount; layer++) {
+            Qwen35LayerWeights lw = weights.layers()[layer];
+            if (cpuProfile) { t0 = System.nanoTime(); m0 = prof.tokenMoeNs(); }
+            if (lw.isDeltaNet()) {
+                forwardDeltaNet(state, lw, layer);
+                if (cpuProfile) prof.add(P_DELTANET, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
+            } else {
+                forwardAttention(state, lw, layer, position);
+                if (cpuProfile) prof.add(P_ATTN_CPU, System.nanoTime() - t0 - (prof.tokenMoeNs() - m0));
+            }
+        }
     }
 
     public float[] prefill(Qwen35State state, int[] tokens) {
@@ -392,11 +492,29 @@ public class Qwen35InferenceEngine {
      * evolves exactly as before; only the summation order inside the matmul kernels differs.
      * Disable with {@code -Dprefill.batched=false}.
      */
+    // F4: whether any layer weight is GPU-resident (scanned once). The batched CPU prefill used to
+    // be gated on the matmul pool, which GPU init switched off; the pool now stays on.
+    private volatile Boolean layersGpuResident;
+
+    private boolean layersGpuResident() {
+        Boolean b = layersGpuResident;
+        if (b == null) layersGpuResident = b = it.denzosoft.llmplayer.tensor.FloatTensor.anyGpuResident(weights.layers());
+        // GPU matmuls switched off (the placement calibrator's CPU candidate): the tensors run
+        // on their CPU twins, so the batched prefill applies as in a CPU-only run
+        return b && it.denzosoft.llmplayer.tensor.FloatTensor.gpuMatmulEnabled();
+    }
+
     public float[] forwardPrefill(Qwen35State state, int[] tokens, int fromPos, int toPos) {
         int count = toPos - fromPos;
         if (count <= 0) return null;
+        prof.startGeneration();
+        if (count > 1 && PREFILL_BATCHED && gpuForwardPass != null && gpuLayerCount == blockCount
+                && gpuForwardPass.maxBatchTokens() > 0) {
+            float[] logits = prefillGpuBatched(state, tokens, fromPos, toPos);
+            if (logits != null) return logits; // null: the GPU pass was dropped at position 0
+        }
         if (count == 1 || !PREFILL_BATCHED || gpuForwardPass != null
-                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled()) {
+                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled() || layersGpuResident()) {
             float[] logits = null;
             for (int i = fromPos; i < toPos; i++) {
                 if (i < toPos - 1) forwardNoOutput(state, tokens[i], i);
@@ -418,6 +536,48 @@ public class Qwen35InferenceEngine {
             if (base + n == toPos) System.arraycopy(b[B_X][n - 1], 0, state.x, 0, dim);
         }
         return finishLogits(state);
+    }
+
+    /**
+     * Prompt through the GPU pass in chunks ({@link LayerGpuForwardPass#prefillBatch}): the
+     * projections of each layer as one GEMM per chunk instead of one matmul per token. Returns
+     * null when the pass failed before anything ran on the device past position 0 (the caller then
+     * takes the CPU path); a failure later throws {@link GpuFailureException}, as in decode.
+     */
+    private float[] prefillGpuBatched(Qwen35State state, int[] tokens, int fromPos, int toPos) {
+        LayerGpuForwardPass pass = gpuForwardPass;
+        gpuMoeState = state;
+        if (moe != null && !decodeKernelsWarm) {
+            warmDecodeKernels(); // decode runs the routed experts with the CPU dot kernels
+            decodeKernelsWarm = true;
+        }
+        int cap = pass.maxBatchTokens();
+        if (state.gpuPrefillX == null || state.gpuPrefillX.length < cap) state.gpuPrefillX = new float[cap][dim];
+        int base = fromPos;
+        try {
+            for (; base < toPos; base += cap) {
+                int n = Math.min(cap, toPos - base);
+                for (int t = 0; t < n; t++) {
+                    int token = tokens[base + t];
+                    float[] row = state.gpuPrefillX[t];
+                    for (int i = 0; i < dim; i++) row[i] = weights.tokenEmbedding().getFloat((long) token * dim + i);
+                }
+                noteToken(base + n - 1);
+                pass.prefillBatch(state.gpuPrefillX, base, n);
+            }
+            if (pass.forwardFinalLogits(state.logits)) return state.logits;
+            pass.downloadX(state.x);
+            return finishLogits(state);
+        } catch (Exception e) {
+            System.err.println("Qwen35 GPU batched prefill failed, falling back to CPU: " + GpuFailureException.describe(e));
+            gpuForwardPass = null;
+            try { pass.close(); } catch (Exception ignored) { }
+            it.denzosoft.llmplayer.gpu.GpuActivity.gpuPathDisabled();
+            if (fromPos > 0 || base > fromPos) {
+                throw new GpuFailureException("GPU batched prefill failed at position " + base, e);
+            }
+            return null;
+        }
     }
 
     /** Batched-prefill buffers, created on first use (warms the decode kernels once). */
@@ -445,7 +605,7 @@ public class Qwen35InferenceEngine {
             } else {
                 attentionBatch(state, b, lw, layer, base, n);
             }
-            ffnBatch(b, lw, layer, n);
+            ffnBatch(state, b, lw, layer, n);
         }
     }
 
@@ -462,8 +622,12 @@ public class Qwen35InferenceEngine {
                 FloatTensor.warmUpRows(lw.wk(), kvDim, dim);
                 FloatTensor.warmUpRows(lw.wo(), dim, qDim);
             }
-            FloatTensor.warmUpRows(lw.ffnGate(), ffnDim, dim);
-            FloatTensor.warmUpRows(lw.ffnDown(), dim, ffnDim);
+            if (lw.isMoe()) {
+                moe.warmUp(lw);
+            } else {
+                FloatTensor.warmUpRows(lw.ffnGate(), ffnDim, dim);
+                FloatTensor.warmUpRows(lw.ffnDown(), dim, ffnDim);
+            }
         }
         FloatTensor.warmUpRows(weights.output(), vocabSize, dim);
     }
@@ -522,7 +686,24 @@ public class Qwen35InferenceEngine {
     }
 
     /** Multi-token {@link #forwardFFN}: same norm, activation formula and residual per token. */
-    private void ffnBatch(float[][][] b, Qwen35LayerWeights lw, int layer, int n) {
+    private void ffnBatch(Qwen35State state, float[][][] b, Qwen35LayerWeights lw, int layer, int n) {
+        if (lw.isMoe()) {
+            // Routed experts grouped by expert over the chunk (each expert's weights read once)
+            for (int t = 0; t < n; t++) {
+                VectorOpsFactory.get().rmsnorm(b[B_XB][t], b[B_X][t], postAttnNormPerLayer[layer], dim, normEps);
+            }
+            if (state.moeBatch == null || state.moeBatch.cap < n) {
+                state.moeBatch = moe.newBatchScratch(Math.max(n, b[B_X].length), blockCount);
+            }
+            float[][] out = moeBatchOut(state, n);
+            long t0 = System.nanoTime();
+            moe.forwardBatch(state.moeBatch, lw, layer, b[B_XB], n, out);
+            prof.moe(System.nanoTime() - t0);
+            for (int t = 0; t < n; t++) {
+                for (int i = 0; i < dim; i++) b[B_X][t][i] += out[t][i];
+            }
+            return;
+        }
         for (int t = 0; t < n; t++) {
             VectorOpsFactory.get().rmsnorm(b[B_XB][t], b[B_X][t], postAttnNormPerLayer[layer], dim, normEps);
             Arrays.fill(b[B_HB][t], 0f);
@@ -816,6 +997,9 @@ public class Qwen35InferenceEngine {
         final int layerFinal = layer;
         final int positionFinal = position;
         final int headSizeFinal = headSize;
+        // Row stride of the score buffer: the state's own capacity, which may be smaller than the
+        // engine's context (the placement calibrator decodes on small states)
+        final int attStride = state.att.length / headCount;
         it.denzosoft.llmplayer.tensor.MatmulPool.forEach(headCount, h -> {
             int kvHead = h / kvMul;
             int qOff = h * headSizeFinal;
@@ -824,17 +1008,17 @@ public class Qwen35InferenceEngine {
             // Attention scores
             for (int t = 0; t <= positionFinal; t++) {
                 float score = kv.dotK(layerFinal, t, kvHeadOff, headSizeFinal, state.q, qOff);
-                state.att[h * maxSeqLen + t] = score * invSqrt;
+                state.att[h * attStride + t] = score * invSqrt;
             }
 
             // Softmax
-            softmax(state.att, h * maxSeqLen, positionFinal + 1);
+            softmax(state.att, h * attStride, positionFinal + 1);
 
             // Weighted sum of values
             int outOff = h * headSizeFinal;
             Arrays.fill(state.xb2, outOff, outOff + headSizeFinal, 0);
             for (int t = 0; t <= positionFinal; t++) {
-                float a = state.att[h * maxSeqLen + t];
+                float a = state.att[h * attStride + t];
                 kv.saxpyV(layerFinal, t, kvHeadOff, headSizeFinal, a, state.xb2, outOff);
             }
         });
@@ -850,6 +1034,10 @@ public class Qwen35InferenceEngine {
     private void forwardFFN(Qwen35State state, Qwen35LayerWeights lw, int layer) {
         // Post-attention / FFN norm (pre-cached)
         VectorOpsFactory.get().rmsnorm(state.xb, state.x, postAttnNormPerLayer[layer], dim, normEps);
+        if (lw.isMoe()) {
+            moeFFN(state, lw, layer, state.xb, state.x);
+            return;
+        }
 
         // SwiGLU FFN: h = SiLU(gate @ xb) * (up @ xb), output = down @ h
         Arrays.fill(state.hb, 0);
@@ -871,6 +1059,27 @@ public class Qwen35InferenceEngine {
         for (int i = 0; i < dim; i++) {
             state.x[i] += state.xb[i];
         }
+    }
+
+    /** qwen35moe FFN: {@code residual += MoE(xn)} ({@code xn} is the FFN-normed input). */
+    private void moeFFN(Qwen35State state, Qwen35LayerWeights lw, int layer, float[] xn, float[] residual) {
+        SoftmaxMoe.Scratch s = state.moeScratch;
+        if (s == null) state.moeScratch = s = moe.newScratch();
+        float[] out = moeOut(state);
+        long t = System.nanoTime();
+        moe.forward(s, lw, layer, xn, out);
+        prof.moe(System.nanoTime() - t);
+        for (int i = 0; i < dim; i++) residual[i] += out[i];
+    }
+
+    private float[][] moeBatchOut(Qwen35State state, int n) {
+        if (state.moeBatchOut == null || state.moeBatchOut.length < n) state.moeBatchOut = new float[Math.max(n, PREFILL_BATCH)][dim];
+        return state.moeBatchOut;
+    }
+
+    private float[] moeOut(Qwen35State state) {
+        if (state.moeOut == null) state.moeOut = new float[dim];
+        return state.moeOut;
     }
 
     // ==================== Utility ====================

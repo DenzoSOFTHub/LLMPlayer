@@ -66,7 +66,7 @@ public class IQ3_SCudaTensor extends CudaFloatTensor {
         int qsIdx = (j / 32) * 8 + 2 * l + gridQuad;
         int qsLow = Byte.toUnsignedInt(data.getByte(bo + OFF_QS + qsIdx));
 
-        int qhByte = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4 + (secondHalf ? 1 : 0)));
+        int qhByte = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 + (secondHalf ? 1 : 0)));
         int highBit;
         if (gridQuad == 0) {
             highBit = (qhByte << (8 - 2 * l)) & 256;
@@ -87,7 +87,7 @@ public class IQ3_SCudaTensor extends CudaFloatTensor {
     }
 
     @Override
-    public float dot(long thisOffset, float[] other, int otherOffset, int length) {
+    protected float dotScalar(long thisOffset, float[] other, int otherOffset, int length) {
         float result = 0f;
         int numBlocks = length / BLOCK_SIZE;
         long blockStart = (thisOffset / BLOCK_SIZE) * BLOCK_BYTES;
@@ -104,7 +104,7 @@ public class IQ3_SCudaTensor extends CudaFloatTensor {
                 float db1 = d * (1 + 2 * (scaleByte & 0x0F));
                 float db2 = d * (1 + 2 * ((scaleByte >> 4) & 0x0F));
 
-                int qhByte0 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4));
+                int qhByte0 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32));
                 int qsBase1 = ib32 * 8;
                 int signBase1 = ib32 * 4;
 
@@ -127,7 +127,7 @@ public class IQ3_SCudaTensor extends CudaFloatTensor {
                     }
                 }
 
-                int qhByte1 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 / 4 + 1));
+                int qhByte1 = Byte.toUnsignedInt(data.getByte(bo + OFF_QH + ib32 + 1));
                 int qsBase2 = (ib32 + 1) * 8;
                 int signBase2 = (ib32 + 1) * 4;
 

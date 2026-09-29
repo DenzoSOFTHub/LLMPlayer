@@ -118,6 +118,58 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         this.expertCache = cache;
     }
 
+    /** Attach the GPU expert cache (hybrid MoE experts in VRAM) so its counters can be read live. */
+    public void setGpuExpertCache(it.denzosoft.llmplayer.inference.GpuExpertCache cache) {
+        this.gpuExpertCache = cache;
+    }
+
+    private volatile it.denzosoft.llmplayer.inference.GpuExpertCache gpuExpertCache;
+
+    @Override public boolean isGpuExpertCacheActive() { return gpuExpertCache != null; }
+
+    @Override public double getGpuExpertCacheHitRate() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        if (c == null) return -1;
+        long h = c.hits(), m = c.misses();
+        return h + m == 0 ? 0 : 100.0 * h / (h + m);
+    }
+
+    @Override public long getGpuExpertCacheHits() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        return c == null ? 0 : c.hits();
+    }
+
+    @Override public long getGpuExpertCacheMisses() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        return c == null ? 0 : c.misses();
+    }
+
+    @Override public int getGpuExpertCacheResidentExperts() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        return c == null ? 0 : c.residentExperts();
+    }
+
+    @Override public int getGpuExpertCacheCapacityExperts() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        return c == null ? 0 : c.capacityExperts();
+    }
+
+    @Override public long getGpuExpertCacheSizeMB() {
+        it.denzosoft.llmplayer.inference.GpuExpertCache c = gpuExpertCache;
+        return c == null ? 0 : c.deviceBytes() >> 20;
+    }
+
+    private volatile String placementReport = "";
+
+    public void setPlacementReport(String report) { this.placementReport = report != null ? report : ""; }
+
+    @Override public String getPlacementReport() { return placementReport; }
+
+    @Override public String getVramGuardReport() {
+        String r = it.denzosoft.llmplayer.gpu.GpuActivity.vramReport();
+        return r != null ? r : "";
+    }
+
     /** Called after each generation to update stats. */
     public void recordGeneration(int genTokens, int promptTokens, double tokPerSec, long timeMs) {
         totalGenerations.incrementAndGet();
@@ -160,6 +212,8 @@ public class LLMPlayerMetrics implements LLMPlayerMXBean {
         lastGenerationTimeMs.set(0);
         cudaContext = null;
         expertCache = null;
+        gpuExpertCache = null;
+        placementReport = "";
         synchronized (samplesLock) { recentSamples.clear(); }
     }
 

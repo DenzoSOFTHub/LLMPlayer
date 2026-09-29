@@ -59,12 +59,33 @@ public class Attention {
         int headSize = config.headSize();
         int blockCount = allLayers.length;
         if (allLayers[0].qNorm() != null) {
+            // OLMo 2 ships attn_q_norm / attn_k_norm with qDim / kvDim weights: one RMSNorm over
+            // the whole projection before it is split into heads (llama.cpp olmo2.cpp), not a
+            // per-head norm. Using only the first headSize weights per head was wrong everywhere
+            // and turned long OLMo 2 generations into gibberish.
+            int qDim = config.headCount() * headSize;
+            fullQkNorm = allLayers[0].qNorm().size() == qDim && qDim > headSize;
+            int qn = fullQkNorm ? qDim : headSize;
+            int kn = fullQkNorm ? config.kvDim() : headSize;
             cachedQNorm = new float[blockCount][];
             cachedKNorm = new float[blockCount][];
             for (int i = 0; i < blockCount; i++) {
-                cachedQNorm[i] = RMSNorm.cacheWeights(allLayers[i].qNorm(), headSize);
-                cachedKNorm[i] = RMSNorm.cacheWeights(allLayers[i].kNorm(), headSize);
+                cachedQNorm[i] = RMSNorm.cacheWeights(allLayers[i].qNorm(), qn);
+                cachedKNorm[i] = RMSNorm.cacheWeights(allLayers[i].kNorm(), kn);
             }
+        }
+    }
+
+    /** OLMo 2: Q/K norm over the whole projection instead of per head (see initNormCaches). */
+    private boolean fullQkNorm;
+
+    private void applyQkNorm(float[] q, float[] k, int layer, int headCount, int headCountKV, int headSize) {
+        if (fullQkNorm) {
+            applyPerHeadNorm(q, cachedQNorm[layer], 1, headCount * headSize, config.normEps());
+            applyPerHeadNorm(k, cachedKNorm[layer], 1, headCountKV * headSize, config.normEps());
+        } else {
+            applyPerHeadNorm(q, cachedQNorm[layer], headCount, headSize, config.normEps());
+            applyPerHeadNorm(k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
         }
     }
 
@@ -253,8 +274,7 @@ public class Attention {
 
         // Apply per-head QK-norm if present (Qwen3, Gemma3)
         if (cachedQNorm != null && !normAfterRope) {
-            applyPerHeadNorm(state.q, cachedQNorm[layer], headCount, headSize, config.normEps());
-            applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
+            applyQkNorm(state.q, state.k, layer, headCount, headCountKV, headSize);
         }
 
         // Apply RoPE to Q and K (skip for NoPE layers in Llama4 iRoPE / Cohere2 NoPE-on-global)
@@ -288,8 +308,7 @@ public class Attention {
 
         // Hunyuan: QK-norm after RoPE (llama.cpp hunyuan-vl.cpp)
         if (cachedQNorm != null && normAfterRope) {
-            applyPerHeadNorm(state.q, cachedQNorm[layer], headCount, headSize, config.normEps());
-            applyPerHeadNorm(state.k, cachedKNorm[layer], headCountKV, headSize, config.normEps());
+            applyQkNorm(state.q, state.k, layer, headCount, headCountKV, headSize);
         }
     }
 
@@ -309,6 +328,15 @@ public class Attention {
             for (int i = 0; i < headSize; i++) state.xb2[off + i] *= s;
         }
     }
+
+    /** RoPE of the sliding-window (local) layers, or null when every layer uses {@link #getRope()}. */
+    public RoPE getRopeLocal() { return ropeLocal; }
+
+    /** Whether the M-RoPE (Qwen-VL) path is active: see {@link #getMropeMap()}. */
+    public int[] getMropeMap() { return mropeMap; }
+
+    /** True for full-attention layers, false for sliding-window (local) layers. */
+    public boolean isGlobalLayerAt(int layer) { return isGlobalLayer(layer); }
 
     private boolean isGlobalLayer(int layer) {
         // Gemma 2: alternating (even = local/sliding, odd = global/full)

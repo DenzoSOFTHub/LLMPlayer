@@ -15,7 +15,7 @@ import java.lang.foreign.*;
  * CUDA GPU-resident forward pass for Nemotron-H hybrid Mamba-2 + Attention + FFN architecture.
  * Supports CUDA graph for all layer types.
  */
-public class NemotronHCudaForwardPass implements AutoCloseable {
+public class NemotronHCudaForwardPass implements LayerGpuForwardPass {
 
     private final CudaContext cudaContext;
     private final CudaBufferManager bufferManager;
@@ -69,7 +69,11 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
     private final MemorySegment hostLogits;
 
     // Compiled CUDA functions
-    private final MemorySegment rmsnormFunc, siluFunc, ropeFunc, kvUpdateFunc, attnFunc;
+    private final MemorySegment rmsnormFunc, siluFunc, ropeFunc, kvUpdateFunc;
+    // FP16 KV cache (-Dcuda.kv.fp16, also set by the KV-aware VRAM budget); inline-init so the
+    // constructor body sees it when sizing the KV buffers.
+    private final boolean useFp16Kv = "true".equals(System.getProperty("cuda.kv.fp16", "false"));
+    private FlashAttention flashAttn;
     private final MemorySegment siluMulFunc;   // silu_mul for integrated SwiGLU FFN
     private final MemorySegment accumulateFunc, conv1dSiluFunc, mamba2ScanFunc;
     // Opt-in shared-memory Mamba-2 scan variant (-Dcuda.mamba.smem=true): caches per-group B/C in smem.
@@ -120,7 +124,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         }
     }
 
-    private final ParamBuffer matmulPB, normPB, ropePB, kvPB, attnPB;
+    private final ParamBuffer matmulPB, normPB, ropePB, kvPB;
     private final ParamBuffer conv1dPB, scanPB, dtPB, gateNormPB, siluPB, sqreluPB, convBiasPB;
 
     // === dp4a path (mirrors CudaForwardPass extension) ===
@@ -172,8 +176,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     // CUDA graph
     private MemorySegment graphExec;
-    private final boolean graphAvailable;
-    private final int graphAttnSharedMem;
+    private boolean graphAvailable; // cleared after a failed capture (no retry per token)
 
     // Pre-computed grid sizes
     private final int normSharedMem, normNumWarps;
@@ -275,7 +278,7 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 gpuConvState[i] = bufferManager.createBuffer(convBytes);
                 cudaContext.fillBufferZero(gpuConvState[i], convBytes);
             } else if (layerTypes[i] == 1) { // Attention
-                long kvBytes = (long) maxSeqLen * kvDim * fb;
+                long kvBytes = (long) maxSeqLen * kvDim * (useFp16Kv ? 2L : fb);
                 gpuKeyCache[i] = bufferManager.createBuffer(kvBytes);
                 gpuValueCache[i] = bufferManager.createBuffer(kvBytes);
                 cudaContext.fillBufferZero(gpuKeyCache[i], kvBytes);
@@ -288,8 +291,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         siluFunc = cudaContext.compileKernel("kernels/cuda/silu.cu", "silu");
         siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         ropeFunc = cudaContext.compileKernel("kernels/cuda/rope.cu", "rope_apply");
-        kvUpdateFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
-        attnFunc = cudaContext.compileKernel("kernels/cuda/attention.cu", "attention_full");
+        kvUpdateFunc = useFp16Kv
+            ? cudaContext.compileKernel("kernels/cuda/attention_f16.cu", "kv_cache_update_f16")
+            : cudaContext.compileKernel("kernels/cuda/attention.cu", "kv_cache_update");
         accumulateFunc = cudaContext.compileKernel("kernels/cuda/accumulate.cu", "accumulate");
         conv1dSiluFunc = cudaContext.compileKernel("kernels/cuda/conv1d_short.cu", "conv1d_short");
         mamba2ScanFunc = cudaContext.compileKernel("kernels/cuda/mamba2_scan.cu", "mamba2_scan");
@@ -442,11 +446,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         // attention_full takes 10 args: arg9 = slidingWindow (0 = full attention).
         // Nemotron-H attention layers always use full attention; arg9 must still be present
         // since attention.cu reads 10 params (regression fix: was 9, crashed cuLaunchKernel).
-        attnPB = new ParamBuffer(arena, 10);
-        attnPB.setLong(0, gpuXb2); attnPB.setLong(1, gpuQ);
-        attnPB.setInt(4, headCount); attnPB.setInt(5, headCountKV);
-        attnPB.setInt(6, headSize); attnPB.setInt(7, kvDim); attnPB.setLong(8, gpuTokenParams);
-        attnPB.setInt(9, 0);
+        flashAttn = new FlashAttention(cudaContext, bufferManager, arena, headCount, headSize, maxSeqLen,
+            useFp16Kv, gpuTokenParams);
 
         conv1dPB = new ParamBuffer(arena, 6);
         conv1dPB.setLong(0, gpuXBC); conv1dPB.setInt(3, convChannels);
@@ -553,14 +554,52 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             }
         }
 
+        // Granite Hybrid MoE (granite-4.0-h-tiny): routed + shared experts on the GPU when every
+        // expert tensor is GPU-resident (the model fits in VRAM). The router's logits are
+        // downloaded for the top-K selection, which stays on the CPU as in the engine.
+        moeLayer = new boolean[gpuLayerCount];
+        gpuMoeNorm = new long[gpuLayerCount];
+        boolean anyMoE = false;
+        for (int i = 0; i < gpuLayerCount; i++) {
+            NemotronHLayerWeights lw = weights.layers()[i];
+            if (lw.isMoE()) {
+                moeLayer[i] = true;
+                anyMoE = true;
+                gpuMoeNorm[i] = uploadNormWeights(lw.ffnNorm() != null ? lw.ffnNorm() : lw.attnNorm(), dim);
+            }
+        }
+        this.hasMoE = anyMoE;
+        this.moeWeights = anyMoE ? weights : null;
+        if (anyMoE) {
+            this.config = config;
+            experts = config.expertCount();
+            eFfn = config.expertFfnLength() > 0 ? config.expertFfnLength() : config.intermediateSize();
+            shFfn = Math.max(1, config.expertSharedFeedForwardLength());
+            int maxFfn = Math.max(eFfn, shFfn);
+            long fbm = Float.BYTES;
+            gpuRouter = bufferManager.createBuffer((long) experts * fbm);
+            hostRouter = arena.allocate((long) Math.max(experts, dim) * fbm, 16);
+            gpuMoeGate = bufferManager.createBuffer((long) maxFfn * fbm);
+            gpuMoeUp = bufferManager.createBuffer((long) maxFfn * fbm);
+            gpuMoeTmp = bufferManager.createBuffer((long) dim * fbm);
+            gpuMoeAcc = bufferManager.createBuffer((long) dim * fbm);
+            moeInMm = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, dim);
+            moeDownMm = new it.denzosoft.llmplayer.gpu.Dp4aMatmul(cudaContext, bufferManager, arena, maxFfn);
+            axpyFunc = cudaContext.compileKernel("kernels/cuda/batch_ops.cu", "axpy");
+            axpyPB = new ParamBuffer(arena, 4);
+            moeSiluPB = new ParamBuffer(arena, 3);
+            routerLogits = new float[experts];
+            routerIn = new float[dim];
+        }
+
         // CUDA graph
-        graphAttnSharedMem = (maxSeqLen + 32) * Float.BYTES;
         // CUDA graph: Mamba layers use DtoD copies (split zxBCdt into xBC and dt). These go through
         // cuMemcpyDtoDAsync on the captured stream, which IS recordable as a memcpy node. The
         // previous "disabled" comment was conservative — in practice graph capture works. We can
         // still force per-layer mode via -Dcuda.nograph=true if needed.
         boolean graphDisabled = "true".equals(System.getProperty("cuda.nograph"));
-        graphAvailable = !graphDisabled;
+        graphAvailable = !graphDisabled && flashAttn.graphCompatible()
+            && !hasMoE; // the MoE router decides on the host every layer
 
         System.err.println("NemotronH CUDA: " + gpuLayerCount + "/" + blockCount + " layers on GPU"
                 + " (graph: " + (graphAvailable ? "available" : "unavailable") + ")");
@@ -573,7 +612,15 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         // Granite Hybrid MoE (e.g. granite-4.0-h-tiny): the GPU-resident forward pass has no MoE
         // expert routing, so fall back to the CPU engine (which handles MoE; dense projections
         // still run on GPU via per-tensor matmul). Detect via the router tensor on layer 0.
-        if (config.expertCount() > 0 || weights.layers()[0].isMoE()) return false;
+        // Granite Hybrid MoE runs here when every expert tensor is GPU-resident (full offload);
+        // the router may stay on the CPU.
+        for (NemotronHLayerWeights lw : weights.layers()) {
+            if (lw.isMoE() && !(lw.ffnGateExps() instanceof CudaFloatTensor
+                    && lw.ffnUpExps() instanceof CudaFloatTensor && lw.ffnDownExps() instanceof CudaFloatTensor
+                    && (lw.ffnGateShexp() == null || lw.ffnGateShexp() instanceof CudaFloatTensor))) {
+                return false;
+            }
+        }
         // Granite Hybrid fully supported as of 2026-04-14:
         //   - scale factors (embed/logit/residual/attention)
         //   - integrated SwiGLU FFN inside Mamba/Attention layers
@@ -603,7 +650,22 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
 
     public int getGpuLayerCount() { return gpuLayerCount; }
 
+    /**
+     * A token at position 0 starts a new sequence: zero the recurrent (SSM) states of the layers.
+     * The kernels carry them from token to token and never read the position (the short conv does,
+     * so its history needs no reset), so without this a second generation in the same process (the
+     * web server, interactive mode, the placement calibrator) started from the previous sequence's
+     * state.
+     */
+    private void resetRecurrentState() {
+        long stateBytes = (long) ssmTimeStepRank * headDim * ssmStateSize * Float.BYTES;
+        for (int i = 0; i < gpuLayerCount; i++) {
+            if (gpuSsmState[i] != 0) cudaContext.fillBufferZero(gpuSsmState[i], stateBytes);
+        }
+    }
+
     public void uploadXAndUpdateParams(float[] x, int position) {
+        if (position == 0) resetRecurrentState();
         // Note: Granite Hybrid embeddingScale is applied by NemotronHInferenceEngine
         // on the CPU side BEFORE calling uploadX (see NemotronHInferenceEngine.forward).
         // Doing it again here would double-scale. Only logit scaling happens GPU-side.
@@ -698,8 +760,9 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
                 cudaContext.destroyGraph(graph);
                 System.err.println("NemotronH CUDA graph: captured " + gpuLayerCount + " layers");
             } catch (Exception e) {
-                if (capturing) try { cudaContext.endCapture(); } catch (Exception ignored) {}
+                if (capturing) try { MemorySegment partial = cudaContext.endCapture(); if (partial != null && partial.address() != 0) cudaContext.destroyGraph(partial); } catch (Exception ignored) {}
                 System.err.println("NemotronH CUDA graph failed: " + e.getMessage());
+                graphAvailable = false; // a failed capture would fail again: stay on per-layer mode
                 return false;
             }
         }
@@ -820,9 +883,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
         launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
         kvPB.setLong(0, gpuKeyCache[li]); kvPB.setLong(1, gpuValueCache[li]);
         launchKernel(kvUpdateFunc, kvUpdateGridDim, (int) blockSize, 0, kvPB.ptrs);
-        attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
-        int attnSM = (position + 1 + 32) * Float.BYTES;
-        launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), attnSM, attnPB.ptrs);
+        flashAttn.launch(defaultStream, gpuXb2, gpuQ, gpuKeyCache[li], gpuValueCache[li],
+            headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, position);
         // wo via dp4a: gpuXb2 → gpuXb2Q8 then int8 matmul.
         quantizeXb2();
         launchMatmulDp4a(ml[3]); // wo — standard: accumulate; Granite: write to gpuXb + saxpy
@@ -867,8 +929,8 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
             launchKernel(ropeFunc, ropeKGridDim, (int) blockSize, 0, ropePB.ptrs);
             kvPB.setLong(0, gpuKeyCache[li]); kvPB.setLong(1, gpuValueCache[li]);
             launchKernel(kvUpdateFunc, kvUpdateGridDim, (int) blockSize, 0, kvPB.ptrs);
-            attnPB.setLong(2, gpuKeyCache[li]); attnPB.setLong(3, gpuValueCache[li]);
-            launchKernel(attnFunc, headCount, Math.min(256, (int) blockSize), graphAttnSharedMem, attnPB.ptrs);
+            flashAttn.launch(defaultStream, gpuXb2, gpuQ, gpuKeyCache[li], gpuValueCache[li],
+                headCountKV, headSize, kvDim, 0, (float) (1.0 / Math.sqrt(headSize)), 0f, -1);
             quantizeXb2();
             launchMatmulDp4a(ml[3]);
             graniteResidualAdd();
@@ -941,7 +1003,102 @@ public class NemotronHCudaForwardPass implements AutoCloseable {
      *   ffnDown(gpuHbQ8) → gpuXb (or gpuX when no residual scaling)
      *   [if residual scale] saxpy: gpuX += residualScale * gpuXb
      */
+    // Granite Hybrid MoE state (see constructor)
+    private boolean[] moeLayer;
+    private long[] gpuMoeNorm;
+    private boolean hasMoE;
+    private NemotronHWeights moeWeights;
+    private ModelConfig config;
+    private int experts, eFfn, shFfn;
+    private long gpuRouter, gpuMoeGate, gpuMoeUp, gpuMoeTmp, gpuMoeAcc;
+    private MemorySegment hostRouter, axpyFunc;
+    private it.denzosoft.llmplayer.gpu.Dp4aMatmul moeInMm, moeDownMm;
+    private ParamBuffer axpyPB, moeSiluPB;
+    private float[] routerLogits, routerIn;
+    private final int[] moeIds = new int[64];
+    private final float[] moeW = new float[64];
+
+    /**
+     * Granite Hybrid MoE FFN of one layer, on the GPU: ffn norm, router (GPU, or CPU when the tiny
+     * router matrix stayed on the host), softmax → top-K → renormalise on the CPU (the engine's
+     * runIntegratedMoEFFN), routed experts through offset weight pointers plus the shared expert,
+     * then the residual with the Granite scale.
+     */
+    private void runIntegratedMoE(int li) {
+        NemotronHLayerWeights lw = moeWeights.layers()[li];
+        long fb = Float.BYTES;
+        normPB.setLong(2, gpuMoeNorm[li]);
+        launchKernel(rmsnormFunc, 1, (int) blockSize, normSharedMem, normPB.ptrs); // gpuX -> gpuXb
+        if (lw.ffnGateInp() instanceof CudaFloatTensor) {
+            moeInMm.invalidate();
+            moeInMm.matmul((CudaFloatTensor) lw.ffnGateInp(), 0, gpuXb, gpuRouter, experts, dim, false);
+            cudaContext.readBuffer(gpuRouter, hostRouter, (long) experts * fb);
+            MemorySegment.copy(hostRouter, ValueLayout.JAVA_FLOAT, 0, routerLogits, 0, experts);
+        } else {
+            cudaContext.readBuffer(gpuXb, hostRouter, (long) dim * fb);
+            MemorySegment.copy(hostRouter, ValueLayout.JAVA_FLOAT, 0, routerIn, 0, dim);
+            java.util.Arrays.fill(routerLogits, 0f);
+            lw.ffnGateInp().matmul(routerIn, routerLogits, experts, dim);
+        }
+        // softmax -> top-K (same insertion order as NemotronHInferenceEngine.selectTopK) -> renormalise
+        float max = Float.NEGATIVE_INFINITY;
+        for (int e = 0; e < experts; e++) max = Math.max(max, routerLogits[e]);
+        float sum = 0f;
+        for (int e = 0; e < experts; e++) { routerLogits[e] = (float) Math.exp(routerLogits[e] - max); sum += routerLogits[e]; }
+        for (int e = 0; e < experts; e++) routerLogits[e] /= sum;
+        int k = MoERouting.effectiveTopK(config.expertUsedCount());
+        for (int i = 0; i < k; i++) { moeIds[i] = -1; moeW[i] = Float.NEGATIVE_INFINITY; }
+        for (int e = 0; e < experts; e++) {
+            float v = routerLogits[e];
+            int pos = -1;
+            for (int i = 0; i < k; i++) { if (v > moeW[i]) { pos = i; break; } }
+            if (pos >= 0) {
+                for (int j = k - 1; j > pos; j--) { moeW[j] = moeW[j - 1]; moeIds[j] = moeIds[j - 1]; }
+                moeW[pos] = v; moeIds[pos] = e;
+            }
+        }
+        float wsum = 0f;
+        for (int i = 0; i < k; i++) wsum += moeW[i];
+        if (wsum > 6.103515625e-5f) for (int i = 0; i < k; i++) moeW[i] /= wsum;
+
+        cudaContext.fillBufferZero(gpuMoeAcc, (long) dim * fb);
+        moeInMm.invalidate(); // gpuXb holds this layer's normed input
+        CudaFloatTensor g = (CudaFloatTensor) lw.ffnGateExps(), u = (CudaFloatTensor) lw.ffnUpExps(),
+                        d = (CudaFloatTensor) lw.ffnDownExps();
+        long gB = g.getWeightsBytes() / experts, uB = u.getWeightsBytes() / experts, dB = d.getWeightsBytes() / experts;
+        for (int j = 0; j < k; j++) {
+            int e = moeIds[j];
+            if (e < 0) continue;
+            expertSwiGlu(g, (long) e * gB, u, (long) e * uB, d, (long) e * dB, eFfn);
+            axpy(gpuMoeAcc, gpuMoeTmp, moeW[j]);
+        }
+        if (lw.ffnGateShexp() instanceof CudaFloatTensor) {
+            expertSwiGlu((CudaFloatTensor) lw.ffnGateShexp(), 0, (CudaFloatTensor) lw.ffnUpShexp(), 0,
+                (CudaFloatTensor) lw.ffnDownShexp(), 0, shFfn);
+            axpy(gpuMoeAcc, gpuMoeTmp, 1.0f);
+        }
+        // residual (Granite scale when set)
+        axpy(gpuX, gpuMoeAcc, graniteResidualScale > 0f ? graniteResidualScale : 1.0f);
+    }
+
+    /** gpuMoeTmp = down(silu(gate · xb) * (up · xb)) for one expert (weights at the given offsets). */
+    private void expertSwiGlu(CudaFloatTensor g, long gOff, CudaFloatTensor u, long uOff,
+                              CudaFloatTensor d, long dOff, int ffn) {
+        moeInMm.matmul(g, gOff, gpuXb, gpuMoeGate, ffn, dim, false);
+        moeInMm.matmul(u, uOff, gpuXb, gpuMoeUp, ffn, dim, false);
+        moeSiluPB.setLong(0, gpuMoeGate); moeSiluPB.setLong(1, gpuMoeUp); moeSiluPB.setInt(2, ffn);
+        launchKernel(siluMulFunc, (int) ((ffn + blockSize - 1) / blockSize), (int) blockSize, 0, moeSiluPB.ptrs);
+        moeDownMm.invalidate();
+        moeDownMm.matmul(d, dOff, gpuMoeGate, gpuMoeTmp, dim, ffn, false);
+    }
+
+    private void axpy(long y, long x, float a) {
+        axpyPB.setLong(0, y); axpyPB.setLong(1, x); axpyPB.setFloat(2, a); axpyPB.setInt(3, dim);
+        launchKernel(axpyFunc, scaleDimGridDim, (int) blockSize, 0, axpyPB.ptrs);
+    }
+
     private void runIntegratedFFN(int layerIdx) {
+        if (moeLayer != null && moeLayer[layerIdx]) { runIntegratedMoE(layerIdx); return; }
         MatmulLaunch[] iff = integratedFfnMatmuls[layerIdx];
         if (iff == null) return;
         int ffnDim = iff[0].rows;

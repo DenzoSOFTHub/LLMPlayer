@@ -414,6 +414,19 @@ public class ApiHandler {
         expertCache.put("sizeMB", m.getExpertCacheSizeMB());
         result.put("expertCache", expertCache);
 
+        // GPU expert cache (hybrid CPU/GPU MoE experts in VRAM)
+        Map<String, Object> gpuExpertCache = new LinkedHashMap<>();
+        gpuExpertCache.put("active", m.isGpuExpertCacheActive());
+        gpuExpertCache.put("hitRatePercent", Math.round(m.getGpuExpertCacheHitRate() * 10.0) / 10.0);
+        gpuExpertCache.put("hits", m.getGpuExpertCacheHits());
+        gpuExpertCache.put("misses", m.getGpuExpertCacheMisses());
+        gpuExpertCache.put("residentExperts", m.getGpuExpertCacheResidentExperts());
+        gpuExpertCache.put("capacityExperts", m.getGpuExpertCacheCapacityExperts());
+        gpuExpertCache.put("sizeMB", m.getGpuExpertCacheSizeMB());
+        result.put("gpuExpertCache", gpuExpertCache);
+        result.put("placement", m.getPlacementReport());
+        result.put("vramGuard", m.getVramGuardReport());
+
         // GPU
         Map<String, Object> gpu = new LinkedHashMap<>();
         gpu.put("enabled", m.isGpuEnabled());

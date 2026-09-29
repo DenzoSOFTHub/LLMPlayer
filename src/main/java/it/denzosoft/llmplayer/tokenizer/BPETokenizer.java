@@ -43,6 +43,12 @@ public class BPETokenizer implements Tokenizer {
     private static final Pattern[] PRE_BAILINGMOE = {
         Pattern.compile("'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]|\\s+(?!\\S)|\\s+"),
     };
+    // MiniMax-M2 (llama.cpp PRE_TYPE_MINIMAX_M2; the tokenizer.json regex, which Java supports as is)
+    private static final Pattern[] PRE_MINIMAX_M2 = {
+        Pattern.compile("[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+            + "|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+            + "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"),
+    };
     private Pattern[] preTokenizers;
 
     /**
@@ -56,8 +62,23 @@ public class BPETokenizer implements Tokenizer {
             preTokenizers = PRE_BAILINGMOE;
         } else if ("spark2_5".equals(pre)) {
             preTokenizers = PRE_SPARK2_5;
+        } else if ("minimax-m2".equals(pre)) {
+            preTokenizers = PRE_MINIMAX_M2;
         } else {
             preTokenizers = null;
+        }
+    }
+
+    /**
+     * Treat every CONTROL token (GGUF token type 3) as special when it appears in the text, as
+     * llama.cpp does: besides the {@code <...>} forms registered in the constructor this covers
+     * control tokens of other shapes, e.g. MiniMax-M2's {@code ]~b]} / {@code [e~[} turn markers
+     * and GLM's {@code [gMASK]}, which were otherwise split into ordinary BPE pieces.
+     */
+    public void registerControlTokens(int[] tokenTypes) {
+        if (tokenTypes == null) return;
+        for (int i = 0; i < Math.min(tokenTypes.length, vocab.length); i++) {
+            if (tokenTypes[i] == 3 && vocab[i] != null && !vocab[i].isEmpty()) specialTokenMap.put(vocab[i], i);
         }
     }
 

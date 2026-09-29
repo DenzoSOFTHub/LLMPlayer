@@ -55,4 +55,19 @@ public interface LLMPlayerMXBean {
     long getExpertCacheReadTimeMs();
     int getExpertCacheSlots();
     long getExpertCacheSizeMB();
+
+    // --- GPU expert cache (hybrid CPU/GPU MoE experts in VRAM); zeros when not active ---
+    boolean isGpuExpertCacheActive();
+    double getGpuExpertCacheHitRate();    // 0..100, -1 when inactive
+    long getGpuExpertCacheHits();
+    long getGpuExpertCacheMisses();
+    int getGpuExpertCacheResidentExperts();
+    int getGpuExpertCacheCapacityExperts();
+    long getGpuExpertCacheSizeMB();
+
+    // --- Placement calibration (--auto-tune / stored verdict); empty when none ---
+    String getPlacementReport();
+
+    /** Summary of the VRAM allocation guard (probes of low-memory allocations, rejections), or empty. */
+    String getVramGuardReport();
 }

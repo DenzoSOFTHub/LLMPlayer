@@ -185,6 +185,67 @@ public abstract class FloatTensor {
     }
 
     /**
+     * Whether this tensor's matmuls run on a GPU (CUDA or OpenCL tensor classes override it).
+     * Code that batches several tokens through {@code matmulRowsBatch} uses it to keep GPU-resident
+     * layers out of the CPU batch kernels.
+     */
+    public boolean isGpuResident() { return false; }
+
+    /**
+     * Whether any {@code FloatTensor} (or {@code FloatTensor[]}) field of the given weight holders
+     * is GPU-resident. The engines gate their batched CPU prefill on it (F4): the multi-token
+     * kernels would run a GPU tensor on its CPU twin, correct but slower than the per-token GPU path.
+     * Reflection over the declared fields, run once per engine.
+     */
+    public static boolean anyGpuResident(Object[] holders) {
+        if (holders == null) return false;
+        for (Object h : holders) {
+            if (h == null) continue;
+            for (Class<?> c = h.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    Class<?> t = f.getType();
+                    boolean single = FloatTensor.class.isAssignableFrom(t);
+                    boolean array = t.isArray() && FloatTensor.class.isAssignableFrom(t.getComponentType());
+                    if (!single && !array) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(h);
+                        if (single) {
+                            if (v != null && ((FloatTensor) v).isGpuResident()) return true;
+                        } else if (v != null) {
+                            for (Object e : (Object[]) v) {
+                                if (e != null && ((FloatTensor) e).isGpuResident()) return true;
+                            }
+                        }
+                    } catch (RuntimeException | IllegalAccessException e) {
+                        return true; // cannot tell: stay on the per-token path
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static volatile boolean gpuMatmulEnabled = true;
+
+    /**
+     * Process-wide switch: when false every GPU tensor runs its matmuls on its CPU twin (the
+     * placement calibrator's CPU candidate; a GPU placement that lost to the CPU).
+     */
+    public static void setGpuMatmulEnabled(boolean on) { gpuMatmulEnabled = on; }
+
+    public static boolean gpuMatmulEnabled() { return gpuMatmulEnabled; }
+
+    /**
+     * {@link #matmulParallel} forced onto the CPU: a GPU tensor runs its SIMD CPU twin. Used to
+     * route a projection to whichever device is faster at run time (see OutputRouter).
+     */
+    public void matmulParallelCpu(float[] input, float[] out, int rows, int cols) {
+        matmulParallel(input, out, rows, cols);
+    }
+
+    /**
      * Parallel matrix-vector multiply using ForkJoinPool,
      * or virtual threads on Java 25+ (avoids ForkJoinPool contention).
      * GpuFloatTensor overrides this to dispatch to GPU kernels directly.
@@ -260,12 +321,15 @@ public abstract class FloatTensor {
     private static volatile java.lang.reflect.Method cachedMatmulMethod;
 
     /**
-     * Force-disable virtual thread matmul (and the {@link MatmulPool}).
+     * Force-disable virtual thread matmul and the reflective fused kernels.
      * Called when GPU (OpenCL) is active because PoCL's native threads
      * conflict with the JVM's virtual thread carrier threads, causing segfaults.
+     * The {@link MatmulPool} stays on: its workers are platform threads, and the CPU share of a
+     * partial offload runs 1.26-1.8x faster with it (F4; Qwen3-Coder first 10 layers on the GPU:
+     * 284 against 367-734 ms per token). The engines gate their batched prefill on tensor
+     * residency ({@link #anyGpuResident}), not on the pool. {@code -Dmatmul.pool=false} still turns it off.
      */
     public static void disableVirtualThreadMatmul() {
-        MatmulPool.disable();
         virtualThreadAvailable = Boolean.FALSE;
         cachedMatmulMethod = null;
         fusedAvailable = Boolean.FALSE;

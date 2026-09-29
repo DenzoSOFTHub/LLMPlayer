@@ -41,9 +41,9 @@ public class Qwen3MoEInferenceEngine {
     private final float[][] cachedAttnSinks;
 
     // Expert GPU cache (loaded via reflection from java21, null if unavailable)
-    private Object expertGpuCache;
-    private java.lang.reflect.Method computeExpertsMethod;
+    private GpuExpertCache expertGpuCache;
     private int currentLayer; // tracks current layer for GPU cache keying
+    private int currentPosition;
 
     // SSD-streaming expert RAM cache (models larger than RAM), or null when the model is resident.
     private it.denzosoft.llmplayer.tensor.ExpertCache expertCache;
@@ -51,7 +51,15 @@ public class Qwen3MoEInferenceEngine {
     private final ExpertViews expertViews;
     private boolean cacheLayerReady;
 
-    private final boolean cpuProfile = "true".equals(System.getProperty("cpu.profile"));
+    // Phase timing: the attention and expert phases are always timed (the CUDA clock keeper reads
+    // them through GpuActivity); the rest, and the printed profile, only with -Dcpu.profile=true.
+    private static final int P_ATTN_NORM = 0, P_ATTN = 1, P_FFN_NORM = 2, P_DENSE = 3, P_MOE = 4,
+        P_RESIDUAL = 5, P_OUTPUT = 6;
+    private final DecodeProfile prof = new DecodeProfile("Qwen3MoE", new String[] {
+        "attn_norm", "attn(GQA)", "ffn_norm", "dense_ffn", "moe_ffn", "residual", "output" }, P_ATTN, P_MOE, P_OUTPUT);
+    private final boolean cpuProfile = prof.detailed;
+    private final java.util.function.Supplier<String> cacheStatsSupplier = this::getExpertCacheStats;
+    private OutputRouter outputRouter;
 
     // Phase 2.2a: MoE routing-frequency instrumentation (opt-in, -Dmoe.routing.stats=true).
     private final boolean routingStats = "true".equals(System.getProperty("moe.routing.stats", "false"));
@@ -61,8 +69,6 @@ public class Qwen3MoEInferenceEngine {
     // Phase 2.2b diagnostic: compare the GPU expert-cache output to the CPU path on the first MoE call.
     private final boolean debugCache = "true".equals(System.getProperty("moe.cache.debug", "false"));
     private boolean debugCacheDone;
-    private long profAttnNormNs, profAttnNs, profFfnNormNs, profDenseFfnNs, profMoeFfnNs, profResidualNs, profOutputNs;
-    private int profTokenCount;
 
     public Qwen3MoEInferenceEngine(ModelConfig config, Qwen3MoEWeights weights, int maxSeqLen,
                                     float[] ropeFreqFactors) {
@@ -70,7 +76,8 @@ public class Qwen3MoEInferenceEngine {
         this.weights = weights;
         this.maxSeqLen = maxSeqLen;
         this.isGptOss = config.architecture() == ModelArchitecture.GPT_OSS;
-        this.sigmoidRouting = config.architecture() == ModelArchitecture.GLM4 && config.expertGatingFunc() == 2;
+        this.sigmoidRouting = (config.architecture() == ModelArchitecture.GLM4
+            || config.architecture() == ModelArchitecture.MINIMAX_M2) && config.expertGatingFunc() == 2;
         this.slidingWindow = config.slidingWindow();
         this.noRopeLayerInterval = config.noRopeLayerInterval();
         this.expertViews = new ExpertViews(config.blockCount(), Math.max(1, config.expertCount()));
@@ -104,8 +111,11 @@ public class Qwen3MoEInferenceEngine {
             cachedAttnNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].attnNorm(), dim);
             cachedFfnNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].ffnNorm(), dim);
             if (weights.layers()[i].qNorm() != null) {
-                cachedQNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].qNorm(), headSize);
-                cachedKNorm[i] = RMSNorm.cacheWeights(weights.layers()[i].kNorm(), headSize);
+                // Per-head norm ([headSize] weights), or over the whole projection when the weight
+                // spans every head (MiniMax-M2: attn_q_norm [heads*headSize], as OLMo-2)
+                FloatTensor qn = weights.layers()[i].qNorm(), kn = weights.layers()[i].kNorm();
+                cachedQNorm[i] = RMSNorm.cacheWeights(qn, qn.size() > headSize ? (int) qn.size() : headSize);
+                cachedKNorm[i] = RMSNorm.cacheWeights(kn, kn.size() > headSize ? (int) kn.size() : headSize);
             }
         }
 
@@ -121,6 +131,7 @@ public class Qwen3MoEInferenceEngine {
             }
         }
 
+        this.outputRouter = new OutputRouter(weights.output(), "Output");
         this.outputNormCache = new float[dim];
         for (int i = 0; i < dim; i++) {
             outputNormCache[i] = weights.outputNorm().getFloat(i);
@@ -134,65 +145,18 @@ public class Qwen3MoEInferenceEngine {
      * @param maxCacheBytes maximum VRAM to use for expert caching
      */
     public void initExpertGpuCache(Object cudaContext, long maxCacheBytes) {
-        try {
-            // Phase 2.2b: the LRU expert GPU cache now supports Q4_K/Q5_K/Q6_K in addition to MXFP4,
-            // so big Q4_K MoE models (Qwen3-Coder-30B) get GPU-cached hot experts. Routing on the 30B
-            // is concentrated (top-32 of 128 experts capture ~79% of routing, Phase 2.2a), so the LRU
-            // hit rate is high and most expert matmuls run at GPU bandwidth instead of CPU.
-            it.denzosoft.llmplayer.tensor.GGMLType expertType = null;
-            for (Qwen3MoELayerWeights lw : weights.layers()) {
-                if (lw.ffnGateExps() != null) { expertType = lw.ffnGateExps().type(); break; }
-            }
-            // MXFP4 (GPT-OSS) is validated. The Q4_K/Q5_K/Q6_K paths are EXPERIMENTAL
-            // (-Dmoe.expert.cache.experimental=true): the type-aware cache infrastructure works but
-            // the K-quant matmul-in-cache currently produces incorrect output (byte offsets + kernel
-            // signatures match the CPU path, but a subtle issue remains). It is also neutral on
-            // models that fit RAM (GPU per-expert matmul ~ CPU SIMD for small/numerous experts); its
-            // real value would be for models LARGER than RAM, keeping hot experts in VRAM to avoid
-            // paging them from disk. Default OFF so big Q4_K MoE models use the correct CPU path.
-            boolean experimentalKQuant = "true".equals(System.getProperty("moe.expert.cache.experimental", "false"));
-            String kRes, kName;
-            if (expertType == it.denzosoft.llmplayer.tensor.GGMLType.MXFP4) { kRes = "kernels/cuda/matmul_mxfp4.cu"; kName = "matmul_mxfp4"; }
-            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q4_K) { kRes = "kernels/cuda/matmul_q4_k.cu"; kName = "matmul_q4_k"; System.out.println("  Expert GPU cache: EXPERIMENTAL Q4_K path (may produce incorrect output)"); }
-            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q5_K) { kRes = "kernels/cuda/matmul_q5_k.cu"; kName = "matmul_q5_k"; }
-            else if (experimentalKQuant && expertType == it.denzosoft.llmplayer.tensor.GGMLType.Q6_K) { kRes = "kernels/cuda/matmul_q6_k.cu"; kName = "matmul_q6_k"; }
-            else {
-                System.out.println("  Expert GPU cache: experts are " + expertType
-                    + " — using CPU expert path (GPU cache validated for MXFP4 only)");
-                return;
-            }
-            int blockSize = expertType.getBlockSize();
-            int blockBytes = expertType.getTypeSize();
-            int expertFfnDim = config.expertFfnLength();
-            int dim = config.embeddingLength();
-            long elementsPerSlice = (long) expertFfnDim * dim;
-            long bytesPerSlice = (elementsPerSlice / blockSize) * blockBytes;
-            int maxSlots = (int) (maxCacheBytes / bytesPerSlice);
-            if (maxSlots < 12) { // need at least 3 projections × 4 experts
-                System.out.println("  Expert GPU cache: not enough VRAM (" + maxSlots + " slots)");
-                return;
-            }
-
-            Class<?> cacheClass = Class.forName("it.denzosoft.llmplayer.gpu.ExpertGpuCache");
-            Class<?> ctxClass = Class.forName("it.denzosoft.llmplayer.gpu.CudaContext");
-            Object cache = cacheClass.getConstructor(ctxClass, int.class, long.class,
-                    int.class, int.class, String.class, String.class)
-                .newInstance(cudaContext, maxSlots, elementsPerSlice, blockSize, blockBytes, kRes, kName);
-            System.out.println("  Expert GPU cache: " + expertType + " experts, " + maxSlots
-                + " slots — Phase 2.2b hot-expert LRU cache over " + config.expertCount() + " experts");
-            computeExpertsMethod = cacheClass.getMethod("computeExperts",
-                FloatTensor.class, FloatTensor.class, FloatTensor.class,
-                float[].class, int[].class, float[].class,
-                int.class, int.class, int.class, int.class,
-                float[][].class, float[][].class, float[][].class,
-                boolean.class,
-                FloatTensor.class, FloatTensor.class, FloatTensor.class);
-            expertGpuCache = cache;
-        } catch (ClassNotFoundException e) {
-            // java21 classes not available
-        } catch (Exception e) {
-            System.out.println("  Expert GPU cache init failed: " + e.getMessage());
+        // Every expert quant type with an FP32-input kernel is eligible. The K-quant paths used to
+        // be opt-in because they produced wrong output: the cache took the gate tensor's geometry
+        // and kernel for up and down too, and Q4_K_M ships ffn_down_exps as Q6_K in many layers.
+        // With per-projection geometry the output matches the CPU expert path token for token
+        // (Qwen3-Coder-30B Q4_K_M), at ~1.1-2x the decode speed.
+        FloatTensor[][] ex = new FloatTensor[weights.layers().length][];
+        for (int i = 0; i < ex.length; i++) {
+            Qwen3MoELayerWeights lw = weights.layers()[i];
+            if (lw.ffnGateExps() != null) ex[i] = new FloatTensor[] { lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps() };
         }
+        expertGpuCache = GpuExpertCache.create(cudaContext, maxCacheBytes, ex, config.expertFfnLength(),
+            config.embeddingLength(), config.expertCount());
     }
 
     /** Attach the SSD-streaming expert cache (models larger than RAM). */
@@ -200,15 +164,116 @@ public class Qwen3MoEInferenceEngine {
         this.expertCache = cache;
     }
 
+    /** The GPU expert cache, or null (for metrics and close). */
+    public GpuExpertCache getGpuExpertCache() { return expertGpuCache != null ? expertGpuCache : parkedCache; }
+
     /**
      * Get expert GPU cache statistics, or null if cache not active.
      */
     public String getExpertCacheStats() {
         if (expertGpuCache == null) return null;
         try {
-            return (String) expertGpuCache.getClass().getMethod("getStats").invoke(expertGpuCache);
+            return expertGpuCache.getStats();
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    // GPU-resident attention (MoE-optimized placement); null when unavailable or disabled
+    private volatile GpuAttentionPass gpuAttention;
+
+    /**
+     * Run the attention half of every layer with GPU-resident attention weights on the device
+     * (MoeAttentionCudaPass): one upload and one download per layer instead of a synchronous round
+     * trip per projection, and the attention itself (with its KV cache) on the GPU. The experts
+     * stay on the CPU. Disable with {@code -Dmoe.gpu.attention=false}.
+     */
+    public void tryInitGpuAttention(Object bufferManager) {
+        if ("false".equals(System.getProperty("moe.gpu.attention", "true"))) return;
+        try {
+            Class<?> cls = Class.forName("it.denzosoft.llmplayer.inference.MoeAttentionCudaPass");
+            java.lang.reflect.Method isSup = cls.getMethod("isSupported", ModelConfig.class, Qwen3MoEWeights.class);
+            if (!(Boolean) isSup.invoke(null, config, weights)) return;
+            int blocks = config.blockCount();
+            int[] sw = new int[blocks];
+            for (int i = 0; i < blocks; i++) sw[i] = (slidingWindow > 0 && !isSwaGlobalLayer(i)) ? slidingWindow : 0;
+            gpuAttention = (GpuAttentionPass) cls.getConstructor(ModelConfig.class, Qwen3MoEWeights.class,
+                    bufferManager.getClass(), RoPE.class, int.class, int[].class)
+                .newInstance(config, weights, bufferManager, rope, maxSeqLen, sw);
+        } catch (Throwable e) {
+            System.err.println("MoE GPU attention: unavailable — " + GpuFailureException.describe(e));
+            gpuAttention = null;
+        }
+    }
+
+    /**
+     * Upload (and compile the kernels of) every GPU tensor the CPU-side code reaches through the
+     * per-tensor path — shared experts, dense leading layers — by running one matmul on each. Done
+     * before the expert cache is sized: lazily, on the first forward, they would be allocated after
+     * the cache has taken the free VRAM, which under WDDM means shared system memory.
+     */
+    public void warmGpuTensors() {
+        int dim = config.embeddingLength();
+        int sharedFfn = config.expertSharedCount() * config.expertFfnLength();
+        int ffn = config.intermediateSize();
+        for (int i = 0; i < weights.layers().length; i++) {
+            Qwen3MoELayerWeights lw = weights.layers()[i];
+            warmGpu(lw.ffnGateShexp(), sharedFfn, dim);
+            warmGpu(lw.ffnUpShexp(), sharedFfn, dim);
+            warmGpu(lw.ffnDownShexp(), dim, sharedFfn);
+            if (i < config.leadingDenseBlockCount()) {
+                warmGpu(lw.wGate(), ffn, dim);
+                warmGpu(lw.wUp(), ffn, dim);
+                warmGpu(lw.wDown(), dim, ffn);
+            }
+        }
+    }
+
+    private static void warmGpu(FloatTensor t, int rows, int cols) {
+        if (t == null || !t.isGpuResident() || rows <= 0 || cols <= 0) return;
+        try {
+            t.matmulParallel(new float[cols], new float[rows], rows, cols);
+        } catch (RuntimeException ignored) {
+            // the tensor falls back to its CPU twin on its own
+        }
+    }
+
+    private GpuAttentionPass parkedAttention;
+    private GpuExpertCache parkedCache;
+
+    /**
+     * Park (or restore) the GPU attention pass without closing it, for the placement calibrator:
+     * while parked the attention runs on the CPU path. A sequence must restart at position 0.
+     */
+    public synchronized void setGpuAttentionParked(boolean park) {
+        if (park && gpuAttention != null) { parkedAttention = gpuAttention; gpuAttention = null; }
+        else if (!park && parkedAttention != null) { gpuAttention = parkedAttention; parkedAttention = null; }
+    }
+
+    public boolean hasParkedAttention() { return parkedAttention != null; }
+
+    /** Park (or restore) the GPU expert cache (placement calibrator). */
+    public synchronized void setExpertGpuCacheParked(boolean park) {
+        if (park && expertGpuCache != null) { parkedCache = expertGpuCache; expertGpuCache = null; }
+        else if (!park && parkedCache != null) { expertGpuCache = parkedCache; parkedCache = null; }
+    }
+
+    /** True when a GPU-resident attention pass (which owns the device KV cache) is active. */
+    public boolean hasGpuForwardPass() {
+        return gpuAttention != null;
+    }
+
+    private void gpuAttentionFailed(RuntimeException e, int position, int layer) {
+        GpuAttentionPass failed = gpuAttention;
+        gpuAttention = null;
+        System.err.println("MoE GPU attention failed, disabling it — " + GpuFailureException.describe(e));
+        try { failed.close(); } catch (Exception ignored) { }
+        it.denzosoft.llmplayer.gpu.GpuActivity.gpuPathDisabled();
+        // The device held the KV cache of every earlier (position, layer) it ran — including the
+        // earlier layers at this position, and in layer-outer prefill the earlier tokens of this
+        // layer. Only the very first GPU call of a sequence (layer 0, position 0) can move to the CPU.
+        if (position > 0 || layer > 0) {
+            throw new GpuFailureException("MoE GPU attention failed at layer " + layer + ", position " + position, e);
         }
     }
 
@@ -272,9 +337,22 @@ public class Qwen3MoEInferenceEngine {
      * Chunked at {@link #PREFILL_BATCH} tokens to bound both the residual-stream buffer and the
      * per-layer expert union. Disable with {@code -Dprefill.batched=false}.
      */
+    // F4: whether any layer weight is GPU-resident (scanned once). The batched CPU prefill used to
+    // be gated on the matmul pool, which GPU init switched off; the pool now stays on.
+    private volatile Boolean layersGpuResident;
+
+    private boolean layersGpuResident() {
+        Boolean b = layersGpuResident;
+        if (b == null) layersGpuResident = b = it.denzosoft.llmplayer.tensor.FloatTensor.anyGpuResident(weights.layers());
+        // GPU matmuls switched off (the placement calibrator's CPU candidate): the tensors run
+        // on their CPU twins, so the batched prefill applies as in a CPU-only run
+        return b && it.denzosoft.llmplayer.tensor.FloatTensor.gpuMatmulEnabled();
+    }
+
     public float[] forwardPrefill(Qwen3MoEState state, int[] tokens, int fromPos, int toPos) {
         int count = toPos - fromPos;
         if (count <= 0) return null;
+        prof.startGeneration(); // a second generation in the same process starts clean too
         if (!PREFILL_BATCHED || count == 1) {
             float[] logits = null;
             for (int i = fromPos; i < toPos; i++) {
@@ -283,10 +361,27 @@ public class Qwen3MoEInferenceEngine {
             }
             return logits;
         }
-        if (ExpertViews.active() && expertGpuCache == null) return prefillBatched(state, tokens, fromPos, toPos);
+        // Batched prefill: the CPU layers attend over the CPU KV cache; the GPU-resident attention
+        // layers run through the pass's batched attention (their KV lives on the device), and the
+        // routed experts run batched on the CPU (the GPU expert cache only counts the routing).
+        // A pass without batched attention keeps the layer-outer per-token path below.
+        GpuAttentionPass gpu = gpuAttention;
+        // Without an attention pass, a first-N placement (explicit --gpu-layers) keeps its GPU
+        // layers on the per-token path (F4 residency gate).
+        if (ExpertViews.active() && (gpu == null ? !layersGpuResident() : gpu.maxBatchTokens() > 0)) {
+            return prefillBatched(state, tokens, fromPos, toPos);
+        }
+        // The per-token path below already runs the routed experts through the dot kernels decode
+        // uses, so C2 code is in place before the first decoded token; this call only moves the
+        // compilation ahead of the prompt. Measured like for like it is worth at most 5-8% of the
+        // first window (docs/optimization/gpu-slower-than-cpu.md, section 6.2); an earlier
+        // "3111 vs 1414 ms/token" comparison here was the profiler folding the prompt into the
+        // decode averages.
+        warmDecodeKernels();
 
         int dim = config.embeddingLength();
         int blockCount = config.blockCount();
+        long tStart = System.nanoTime();
         for (int base = fromPos; base < toPos; base += PREFILL_BATCH) {
             int n = Math.min(PREFILL_BATCH, toPos - base);
             float[][] xs = new float[n][];
@@ -303,6 +398,10 @@ public class Qwen3MoEInferenceEngine {
             }
             // Carry the last token of the final chunk into the output projection.
             System.arraycopy(xs[n - 1], 0, state.x, 0, dim);
+        }
+        if (cpuProfile) {
+            System.out.printf("[prefill-profile Qwen3MoE] %d tokens per token (layer-outer): %.0f ms (%.1f ms per token)%n",
+                count, (System.nanoTime() - tStart) / 1e6, (System.nanoTime() - tStart) / 1e6 / count);
         }
         return outputProjection(state);
     }
@@ -327,7 +426,10 @@ public class Qwen3MoEInferenceEngine {
         warmDecodeKernels();
         int dim = config.embeddingLength();
         int cap = ExpertViews.prefillChunk(expertCache, PREFILL_BATCH);
+        GpuAttentionPass gpu0 = gpuAttention;
+        if (gpu0 != null) cap = Math.min(cap, gpu0.maxBatchTokens());
         float[][][] b = prefillBuffers(state, cap);
+        long attnNs = 0, ffnNs = 0, t0;
         for (int base = fromPos; base < toPos; base += cap) {
             int n = Math.min(cap, toPos - base);
             for (int t = 0; t < n; t++) {
@@ -335,10 +437,20 @@ public class Qwen3MoEInferenceEngine {
                 System.arraycopy(state.x, 0, b[B_X][t], 0, dim);
             }
             for (int layer = 0; layer < config.blockCount(); layer++) {
-                attentionBatch(state, b, layer, base, n);
-                ffnBatch(state, b, layer, n);
+                t0 = System.nanoTime();
+                boolean normed = attentionBatch(state, b, layer, base, n);
+                long t1 = System.nanoTime();
+                ffnBatch(state, b, layer, n, normed);
+                attnNs += t1 - t0;
+                ffnNs += System.nanoTime() - t1;
             }
             if (base + n == toPos) System.arraycopy(b[B_X][n - 1], 0, state.x, 0, dim);
+        }
+        if (cpuProfile) {
+            int total = toPos - fromPos;
+            System.out.printf("[prefill-profile Qwen3MoE] %d tokens batched (chunk %d%s): attention %.0f ms, ffn %.0f ms (%.1f + %.1f ms per token)%n",
+                total, cap, gpuAttention != null ? ", GPU attention" : "", attnNs / 1e6, ffnNs / 1e6,
+                attnNs / 1e6 / total, ffnNs / 1e6 / total);
         }
         return outputProjection(state);
     }
@@ -363,6 +475,8 @@ public class Qwen3MoEInferenceEngine {
             state.prefillGroupStart = new int[experts + 1];
             state.prefillGroupSlots = new int[slots];
             state.prefillUsed = new int[experts];
+            state.prefillCpuUsed = new int[experts];
+            state.prefillOnGpu = new boolean[experts];
         }
         return state.prefillBuffers;
     }
@@ -402,8 +516,26 @@ public class Qwen3MoEInferenceEngine {
         FloatTensor.warmUpRows(weights.output(), config.vocabSize(), dim);
     }
 
-    /** Multi-token {@link #gqaAttention} plus its residual, for the chunk's tokens at one layer. */
-    private void attentionBatch(Qwen3MoEState state, float[][][] b, int layer, int basePos, int n) {
+    /**
+     * Multi-token {@link #gqaAttention} plus its residual, for the chunk's tokens at one layer.
+     * Returns true when the GPU pass ran it and already wrote the FFN-normed input to {@code b[B_XN]}.
+     */
+    private boolean attentionBatch(Qwen3MoEState state, float[][][] b, int layer, int basePos, int n) {
+        GpuAttentionPass gpu = gpuAttention;
+        if (gpu != null && gpu.isLayerOnGpu(layer)) {
+            try {
+                gpu.attentionLayerBatch(layer, b[B_X], b[B_XN], basePos, n);
+                return true;
+            } catch (RuntimeException e) {
+                // Throws GpuFailureException unless this is the sequence's very first GPU call
+                gpuAttentionFailed(e, basePos, layer);
+            }
+        }
+        cpuAttentionBatch(state, b, layer, basePos, n);
+        return false;
+    }
+
+    private void cpuAttentionBatch(Qwen3MoEState state, float[][][] b, int layer, int basePos, int n) {
         Qwen3MoELayerWeights lw = weights.layers()[layer];
         int dim = config.embeddingLength();
         int qDim = config.headCount() * config.headSize();
@@ -432,13 +564,18 @@ public class Qwen3MoEInferenceEngine {
         }
     }
 
-    /** Multi-token FFN half of {@link #forwardLayer}: norm, dense or MoE FFN, residual. */
-    private void ffnBatch(Qwen3MoEState state, float[][][] b, int layer, int n) {
+    /**
+     * Multi-token FFN half of {@link #forwardLayer}: norm (unless {@code normed}: the GPU pass wrote
+     * it), dense or MoE FFN, residual.
+     */
+    private void ffnBatch(Qwen3MoEState state, float[][][] b, int layer, int n, boolean normed) {
         Qwen3MoELayerWeights lw = weights.layers()[layer];
         int dim = config.embeddingLength();
         float[][] x = b[B_X], xn = b[B_XN], xb = b[B_XB];
-        for (int t = 0; t < n; t++) {
-            RMSNorm.apply(xn[t], x[t], cachedFfnNorm[layer], dim, config.normEps());
+        if (!normed) {
+            for (int t = 0; t < n; t++) {
+                RMSNorm.apply(xn[t], x[t], cachedFfnNorm[layer], dim, config.normEps());
+            }
         }
         if (layer < config.leadingDenseBlockCount()) {
             int ffn = config.intermediateSize();
@@ -491,6 +628,8 @@ public class Qwen3MoEInferenceEngine {
             routeExperts(state, lw);
             System.arraycopy(state.selectedExperts, 0, sel, t * k, k);
             System.arraycopy(state.selectedWeights, 0, selW, t * k, k);
+            GpuExpertCache gc = expertGpuCache;
+            if (gc != null) gc.noteRouting(layer, state.selectedExperts, k); // warm the LFU counts
         }
 
         // 2. Group the (token, slot) pairs by expert
@@ -503,10 +642,46 @@ public class Qwen3MoEInferenceEngine {
             if (sel[s] < 0) Arrays.fill(b[B_EOUT][s], 0, dim, 0f);
         }
 
-        // 3. Compute the experts (grouped for the SSD cache, the next group read while one computes)
-        expertViews.forEachExpert(expertCache, layer, used, nUsed, lw.ffnGateExps(), lw.ffnUpExps(),
+        // 3. Compute the experts: the ones resident in the GPU expert cache on the GPU over all
+        // their tokens, queued first; the others on the CPU meanwhile (grouped for the SSD cache,
+        // the next group read while one computes)
+        GpuExpertCache gc = expertGpuCache;
+        int[] cpuUsed = used;
+        int nCpu = nUsed;
+        int onGpu = 0;
+        if (gc != null && lw.ffnGateExpsBias() == null) {
+            try {
+                onGpu = gc.launchResidentBatch(layer, lw.ffnGateExps(), lw.ffnUpExps(), lw.ffnDownExps(), xn, n,
+                    used, nUsed, start, grouped, k, state.prefillOnGpu, isGptOss);
+            } catch (RuntimeException e) {
+                System.err.println("Expert GPU cache error: " + GpuFailureException.describe(e) + " — using the CPU experts");
+                expertGpuCache = null;
+                gc = null;
+                onGpu = 0;
+            }
+            if (onGpu > 0) {
+                cpuUsed = state.prefillCpuUsed;
+                nCpu = 0;
+                for (int i = 0; i < nUsed; i++) if (!state.prefillOnGpu[used[i]]) cpuUsed[nCpu++] = used[i];
+            }
+        }
+        expertViews.forEachExpert(expertCache, layer, cpuUsed, nCpu, lw.ffnGateExps(), lw.ffnUpExps(),
             lw.ffnDownExps(), elementsPerSlice,
             (e, gate, up, down) -> expertBatch(b, lw, e, gate, up, down, start, grouped, k, efd, dim));
+        if (onGpu > 0) {
+            try {
+                gc.finishResidentBatch(b[B_EOUT]);
+            } catch (RuntimeException e) {
+                // the GPU experts' outputs are lost: compute them on the CPU
+                System.err.println("Expert GPU cache error: " + GpuFailureException.describe(e) + " — using the CPU experts");
+                expertGpuCache = null;
+                nCpu = 0;
+                for (int i = 0; i < nUsed; i++) if (state.prefillOnGpu[used[i]]) cpuUsed[nCpu++] = used[i];
+                expertViews.forEachExpert(expertCache, layer, cpuUsed, nCpu, lw.ffnGateExps(), lw.ffnUpExps(),
+                    lw.ffnDownExps(), elementsPerSlice,
+                    (e2, gate, up, down) -> expertBatch(b, lw, e2, gate, up, down, start, grouped, k, efd, dim));
+            }
+        }
 
         // 4. Per token: weighted sum of its expert outputs in slot order, then the shared expert
         for (int t = 0; t < n; t++) {
@@ -572,64 +747,64 @@ public class Qwen3MoEInferenceEngine {
     private void forwardLayer(Qwen3MoEState state, int layer, int position) {
         int dim = config.embeddingLength();
         int leadingDenseCount = config.leadingDenseBlockCount();
-        long t0 = 0, t1;
-        {
-            Qwen3MoELayerWeights layerWeights = weights.layers()[layer];
+        final boolean d = cpuProfile;
+        Qwen3MoELayerWeights layerWeights = weights.layers()[layer];
+        long t0 = System.nanoTime(), t1;
 
-            if (cpuProfile) t0 = System.nanoTime();
+        GpuAttentionPass gpu = gpuAttention;
+        if (gpu != null && gpu.isLayerOnGpu(layer)) {
+            // Whole attention half on the GPU: x += Attn(norm(x)), xb = ffnNorm(x)
+            try {
+                gpu.attentionLayer(layer, state.x, state.xb, position);
+            } catch (RuntimeException e) {
+                gpuAttentionFailed(e, position, layer);
+                forwardLayer(state, layer, position); // first GPU call of a sequence: redo on the CPU
+                return;
+            }
+            t1 = System.nanoTime(); prof.add(P_ATTN, t1 - t0); t0 = t1;
+        } else {
             RMSNorm.apply(state.xb, state.x, cachedAttnNorm[layer], dim, config.normEps());
-            if (cpuProfile) { t1 = System.nanoTime(); profAttnNormNs += t1 - t0; t0 = t1; }
+            if (d) { t1 = System.nanoTime(); prof.add(P_ATTN_NORM, t1 - t0); t0 = t1; }
 
             gqaAttention(state, layerWeights, layer, position);
-            if (cpuProfile) { t1 = System.nanoTime(); profAttnNs += t1 - t0; t0 = t1; }
+            t1 = System.nanoTime(); prof.add(P_ATTN, t1 - t0); t0 = t1;
 
             VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
-            if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; t0 = t1; }
+            if (d) { t1 = System.nanoTime(); prof.add(P_RESIDUAL, t1 - t0); t0 = t1; }
 
             RMSNorm.apply(state.xb, state.x, cachedFfnNorm[layer], dim, config.normEps());
-            if (cpuProfile) { t1 = System.nanoTime(); profFfnNormNs += t1 - t0; t0 = t1; }
-
-            if (layer < leadingDenseCount) {
-                denseFFN(state, layerWeights);
-                if (cpuProfile) { t1 = System.nanoTime(); profDenseFfnNs += t1 - t0; t0 = t1; }
-            } else {
-                System.arraycopy(state.xb, 0, state.xbSaved, 0, dim);
-                currentLayer = layer;
-                moeFFN(state, layerWeights);
-                if (cpuProfile) { t1 = System.nanoTime(); profMoeFfnNs += t1 - t0; t0 = t1; }
-            }
-
-            VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
-            if (cpuProfile) { t1 = System.nanoTime(); profResidualNs += t1 - t0; }
+            if (d) { t1 = System.nanoTime(); prof.add(P_FFN_NORM, t1 - t0); t0 = t1; }
         }
+
+        if (layer < leadingDenseCount) {
+            denseFFN(state, layerWeights);
+            if (d) { t1 = System.nanoTime(); prof.add(P_DENSE, t1 - t0); t0 = t1; }
+        } else {
+            System.arraycopy(state.xb, 0, state.xbSaved, 0, dim);
+            currentLayer = layer;
+            GpuExpertCache gc = expertGpuCache;
+            if (gc != null) gc.noteToken(position);
+            currentPosition = position;
+            moeFFN(state, layerWeights);
+            t1 = System.nanoTime(); prof.add(P_MOE, t1 - t0); t0 = t1;
+        }
+
+        VectorOpsFactory.get().accumulate(state.x, state.xb, dim);
+        if (d) prof.add(P_RESIDUAL, System.nanoTime() - t0);
     }
 
     /** Final norm + logit projection over the current residual stream. */
     private float[] outputProjection(Qwen3MoEState state) {
         int dim = config.embeddingLength();
-        long t0 = 0;
-        if (cpuProfile) t0 = System.nanoTime();
+        long t0 = System.nanoTime();
         RMSNorm.apply(state.xb, state.x, outputNormCache, dim, config.normEps());
         int vocabSize = config.vocabSize();
         Arrays.fill(state.logits, 0);
-        weights.output().matmulParallel(state.xb, state.logits, vocabSize, dim);
-        if (cpuProfile) {
-            profOutputNs += System.nanoTime() - t0;
-            profTokenCount++;
-            if (profTokenCount % 10 == 0) printProfile();
-        }
-
+        outputRouter.matmul(state.xb, state.logits, vocabSize, dim);
+        // The first projection after a prefill closes the prompt; DecodeProfile drops the prompt's
+        // layer time there, so every average is per decoded token.
+        prof.endToken(System.nanoTime() - t0, cacheStatsSupplier);
         return state.logits;
-    }
-
-    private void printProfile() {
-        int n = profTokenCount;
-        double ms = 1e6;
-        long total = profAttnNormNs + profAttnNs + profFfnNormNs + profDenseFfnNs + profMoeFfnNs + profResidualNs + profOutputNs;
-        System.out.printf("[cpu-profile Qwen3MoE] %d tokens, per-token avg (ms): attn_norm=%.1f attn(GQA)=%.1f ffn_norm=%.1f dense_ffn=%.1f moe_ffn=%.1f residual=%.1f output=%.1f | total=%.1f%n",
-            n, profAttnNormNs / ms / n, profAttnNs / ms / n, profFfnNormNs / ms / n,
-            profDenseFfnNs / ms / n, profMoeFfnNs / ms / n, profResidualNs / ms / n,
-            profOutputNs / ms / n, total / ms / n);
     }
 
     /**
@@ -774,14 +949,17 @@ public class Qwen3MoEInferenceEngine {
         int expertFfnDim = config.expertFfnLength();
         int sharedFfnDim = config.expertSharedCount() * expertFfnDim;
 
+        final boolean d = cpuProfile;
+        long tRoute = d ? System.nanoTime() : 0;
         // 1. Router: expert logits and top-K selection
         routeExperts(state, weights);
+        if (d) tRoute = System.nanoTime() - tRoute;
 
         // SSD streaming: the top-K experts for this layer are now known. Prefer L1 — read the whole
         // slices into the RAM cache with explicit positional reads — and fall back to the L0
         // read-ahead hint when there is no cache. Both are no-ops when the model fits RAM. Skipped
         // entirely when the GPU expert cache owns this path, which reads from the mapping itself.
-        boolean gpuOwnsExperts = expertGpuCache != null && computeExpertsMethod != null;
+        boolean gpuOwnsExperts = expertGpuCache != null && !GpuExpertCache.hybrid();
         cacheLayerReady = !gpuOwnsExperts && expertCache != null
             && expertCache.prepare(currentLayer, state.selectedExperts, expertUsedCount,
                 weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
@@ -797,7 +975,26 @@ public class Qwen3MoEInferenceEngine {
         // Capture for lambda
         final boolean useSwigluOai = isGptOss;
 
-        if (expertGpuCache != null && computeExpertsMethod != null) {
+        if (expertGpuCache != null && GpuExpertCache.hybrid()) {
+            // Hybrid: resident experts on the GPU, the others on the CPU at the same time
+            GpuExpertCache cache = expertGpuCache;
+            int mask = 0;
+            try {
+                long ta = d ? System.nanoTime() : 0;
+                mask = cache.launchResident(weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
+                    state.xbSaved, state.selectedExperts, expertUsedCount, currentLayer, dim, expertFfnDim,
+                    useSwigluOai, weights.ffnGateExpsBias(), weights.ffnUpExpsBias(), weights.ffnDownExpsBias());
+                long tb = d ? System.nanoTime() : 0;
+                cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai, mask);
+                long tc = d ? System.nanoTime() : 0;
+                cache.finishResident(mask, state.expertOutPerExpert);
+                if (d) prof.moeSplit(tRoute, tb - ta, tc - tb, System.nanoTime() - tc);
+            } catch (RuntimeException e) {
+                System.err.println("Expert GPU cache error: " + GpuFailureException.describe(e) + " — using the CPU experts");
+                expertGpuCache = null;
+                cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
+            }
+        } else if (expertGpuCache != null) {
             // GPU-accelerated path: batch all experts on GPU with LRU caching
             try {
                 // Zero per-expert buffers
@@ -806,7 +1003,7 @@ public class Qwen3MoEInferenceEngine {
                     Arrays.fill(state.moeHb2PerExpert[k], 0, expertFfnDim, 0f);
                     Arrays.fill(state.expertOutPerExpert[k], 0, dim, 0f);
                 }
-                computeExpertsMethod.invoke(expertGpuCache,
+                expertGpuCache.computeExperts(
                     weights.ffnGateExps(), weights.ffnUpExps(), weights.ffnDownExps(),
                     state.xbSaved, state.selectedExperts, state.selectedWeights,
                     expertUsedCount, currentLayer, dim, expertFfnDim,
@@ -834,12 +1031,13 @@ public class Qwen3MoEInferenceEngine {
                 System.err.println("Expert GPU cache error: " + c + " — falling back to CPU");
                 if ("true".equals(System.getProperty("cuda.debug", "false"))) c.printStackTrace();
                 expertGpuCache = null;
-                computeExpertsMethod = null;
                 cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
             }
         } else {
             // CPU parallel path
+            long ta = d ? System.nanoTime() : 0;
             cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai);
+            if (d) prof.moeSplit(tRoute, 0, System.nanoTime() - ta, 0);
         }
 
         // Sequential accumulation of weighted expert outputs
@@ -847,8 +1045,18 @@ public class Qwen3MoEInferenceEngine {
             VectorOpsFactory.get().saxpy(state.selectedWeights[k], state.expertOutPerExpert[k], 0, state.xb, 0, dim);
         }
 
-        // 3. Shared expert
-        if (weights.ffnGateShexp() != null) {
+        // 3. Shared expert: computed by the GPU attention pass when it holds it (-Dmoe.attn.shared)
+        GpuAttentionPass gpuSh = gpuAttention;
+        boolean sharedDone = false;
+        if (weights.ffnGateShexp() != null && gpuSh != null && gpuSh.isLayerOnGpu(currentLayer)) {
+            try {
+                sharedDone = gpuSh.takeSharedExpert(currentLayer, state.expertOut);
+            } catch (RuntimeException e) {
+                gpuAttentionFailed(e, currentPosition, currentLayer); // throws past the first GPU call
+            }
+            if (sharedDone) VectorOpsFactory.get().accumulate(state.xb, state.expertOut, dim);
+        }
+        if (weights.ffnGateShexp() != null && !sharedDone) {
             float[] shGate = state.sharedHb;
             float[] shUp = state.sharedHb2;
             Arrays.fill(shGate, 0, sharedFfnDim, 0f);
@@ -950,71 +1158,98 @@ public class Qwen3MoEInferenceEngine {
         }
     }
 
+    /** Minimum rows per parallel chunk of the routed-expert loops. */
+    private static final int EXPERT_ROW_CHUNK = 16;
+
     /**
-     * CPU parallel expert computation (original path).
+     * CPU routed experts. The gate/up rows of all K experts form one parallel range and the down
+     * rows a second one, so every core works on each projection (a loop over the K experts alone
+     * keeps only K threads busy).
      */
     private void cpuExpertCompute(Qwen3MoEState state, Qwen3MoELayerWeights weights,
                                    int expertUsedCount, int expertFfnDim, int dim,
                                    boolean useSwigluOai) {
-        it.denzosoft.llmplayer.tensor.MatmulPool.forEach(expertUsedCount, new java.util.function.IntConsumer() {
-            @Override
-            public void accept(int k) {
-                int e = state.selectedExperts[k];
+        cpuExpertCompute(state, weights, expertUsedCount, expertFfnDim, dim, useSwigluOai, 0);
+    }
 
-                float[] gate = state.moeHbPerExpert[k];
-                float[] up = state.moeHb2PerExpert[k];
-                float[] out = state.expertOutPerExpert[k];
-
-                // Guard against an unfilled routing slot (selectTopK leaves -1 when router logits
-                // contain NaN): treat it as a zero-contribution expert instead of reading a negative
-                // tensor offset (IndexOutOfBounds). Its routing weight is renormalised away anyway.
-                if (e < 0) { Arrays.fill(out, 0, dim, 0f); return; }
-
-                Arrays.fill(gate, 0, expertFfnDim, 0f);
-                Arrays.fill(up, 0, expertFfnDim, 0f);
-
-                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate, e, dim, expertFfnDim,
+    /** As above, skipping the slots in {@code gpuMask} (computed by the GPU expert cache). */
+    private void cpuExpertCompute(Qwen3MoEState state, Qwen3MoELayerWeights weights,
+                                   int expertUsedCount, int expertFfnDim, int dim,
+                                   boolean useSwigluOai, int gpuMask) {
+        if (gpuMask == (1 << expertUsedCount) - 1) return;
+        final int[] sel = state.selectedExperts;
+        final float[][] gate = state.moeHbPerExpert, up = state.moeHb2PerExpert, out = state.expertOutPerExpert;
+        final int efd = expertFfnDim;
+        // F11: the parallel ranges cover only the CPU slots, so no chunk lands on a slot the GPU
+        // computes (those finished instantly and left their worker idle). Bit-identical: each row
+        // is one independent dot. An unfilled routing slot (selectTopK leaves -1 when the router
+        // logits contain NaN) contributes nothing; its output is zeroed here, outside the loops.
+        final int[] slots = new int[expertUsedCount];
+        int nCpu = 0;
+        for (int k = 0; k < expertUsedCount; k++) {
+            if ((gpuMask & (1 << k)) != 0) continue;
+            if (sel[k] < 0) { Arrays.fill(out[k], 0, dim, 0f); continue; }
+            slots[nCpu++] = k;
+        }
+        if (nCpu == 0) return;
+        final int m = nCpu;
+        it.denzosoft.llmplayer.tensor.MatmulPool.forRange(m * efd, EXPERT_ROW_CHUNK, (from, to) -> {
+            for (int u = from; u < to; ) {
+                int j = u / efd, slot = slots[j], r0 = u - j * efd, r1 = Math.min(efd, r0 + (to - u));
+                int e = sel[slot];
+                expertMatmul(weights.ffnGateExps(), state.xbSaved, gate[slot], e, dim, efd, r0, r1,
                     it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_GATE);
-                expertMatmul(weights.ffnUpExps(), state.xbSaved, up, e, dim, expertFfnDim,
+                expertMatmul(weights.ffnUpExps(), state.xbSaved, up[slot], e, dim, efd, r0, r1,
                     it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_UP);
-
-                if (weights.ffnGateExpsBias() != null) addExpertBias(gate, weights.ffnGateExpsBias(), e, expertFfnDim);
-                if (weights.ffnUpExpsBias() != null) addExpertBias(up, weights.ffnUpExpsBias(), e, expertFfnDim);
-
-                if (useSwigluOai) {
-                    swigluOai(gate, up, expertFfnDim);
-                } else {
-                    VectorOpsFactory.get().silu(gate, expertFfnDim);
-                    VectorOpsFactory.get().elementwiseMul(gate, up, gate, expertFfnDim);
-                }
-
-                Arrays.fill(out, 0, dim, 0f);
-                expertMatmul(weights.ffnDownExps(), gate, out, e, expertFfnDim, dim,
-                    it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_DOWN);
-                if (weights.ffnDownExpsBias() != null) addExpertBias(out, weights.ffnDownExpsBias(), e, dim);
+                u += r1 - r0;
             }
         });
+        for (int k = 0; k < expertUsedCount; k++) {
+            int e = sel[k];
+            if (e < 0 || (gpuMask & (1 << k)) != 0) continue;
+            if (weights.ffnGateExpsBias() != null) addExpertBias(gate[k], weights.ffnGateExpsBias(), e, efd);
+            if (weights.ffnUpExpsBias() != null) addExpertBias(up[k], weights.ffnUpExpsBias(), e, efd);
+            if (useSwigluOai) {
+                swigluOai(gate[k], up[k], efd);
+            } else {
+                VectorOpsFactory.get().silu(gate[k], efd);
+                VectorOpsFactory.get().elementwiseMul(gate[k], up[k], gate[k], efd);
+            }
+        }
+        it.denzosoft.llmplayer.tensor.MatmulPool.forRange(m * dim, EXPERT_ROW_CHUNK, (from, to) -> {
+            for (int u = from; u < to; ) {
+                int j = u / dim, slot = slots[j], r0 = u - j * dim, r1 = Math.min(dim, r0 + (to - u));
+                expertMatmul(weights.ffnDownExps(), gate[slot], out[slot], sel[slot], efd, dim, r0, r1,
+                    it.denzosoft.llmplayer.tensor.ExpertCache.PROJ_DOWN);
+                u += r1 - r0;
+            }
+        });
+        if (weights.ffnDownExpsBias() != null) {
+            for (int k = 0; k < expertUsedCount; k++) {
+                if (sel[k] >= 0 && (gpuMask & (1 << k)) == 0) addExpertBias(out[k], weights.ffnDownExpsBias(), sel[k], dim);
+            }
+        }
     }
 
     /**
-     * Matrix-vector multiply for a single expert slice from a 3D tensor.
+     * Rows {@code [r0, r1)} of one expert slice of a 3D tensor: {@code output[row] = W[row]·input}.
      */
     private void expertMatmul(FloatTensor weights3D, float[] input, float[] output,
-                              int expert, int inDim, int outDim, int projection) {
+                              int expert, int inDim, int outDim, int r0, int r1, int projection) {
         // When the slice is cached, it is a standalone tensor holding just this expert, so the rows
         // start at 0 instead of the expert's base offset inside the 3D tensor.
         if (cacheLayerReady) {
             FloatTensor cached = expertCache.tensorFor(currentLayer, expert, projection);
             if (cached != null) {
-                for (int row = 0; row < outDim; row++) {
-                    output[row] += cached.dot((long) row * inDim, input, 0, inDim);
+                for (int row = r0; row < r1; row++) {
+                    output[row] = cached.dot((long) row * inDim, input, 0, inDim);
                 }
                 return;
             }
         }
         long expertOffset = (long) expert * outDim * inDim;
-        for (int row = 0; row < outDim; row++) {
-            output[row] += weights3D.dot(expertOffset + (long) row * inDim, input, 0, inDim);
+        for (int row = r0; row < r1; row++) {
+            output[row] = weights3D.dot(expertOffset + (long) row * inDim, input, 0, inDim);
         }
     }
 
@@ -1138,6 +1373,10 @@ public class Qwen3MoEInferenceEngine {
      * Apply RMSNorm per-head.
      */
     private static void applyPerHeadNorm(float[] vec, float[] normWeights, int nHeads, int headSize, float eps) {
+        if (normWeights.length == nHeads * headSize && nHeads > 1) {
+            RMSNorm.apply(vec, vec, normWeights, nHeads * headSize, eps); // whole-projection norm
+            return;
+        }
         for (int h = 0; h < nHeads; h++) {
             int offset = h * headSize;
             float ss = 0f;

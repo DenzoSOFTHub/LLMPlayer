@@ -109,7 +109,7 @@ public class ModelLoader {
         } else if (arch == ModelArchitecture.GEMMA4 || arch == ModelArchitecture.GEMMA3N) {
             weights = loadWeights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.LFM2) {
-            lfm2Weights = loadLFM2Weights(gguf, config, gpuLayers);
+            lfm2Weights = loadLFM2Weights(gguf, config, gpuLayers, moeOptimizedGpu);
         } else if (arch == ModelArchitecture.FALCON_H1) {
             falconH1Weights = loadFalconH1Weights(gguf, config, gpuLayers);
         } else if (arch == ModelArchitecture.NEMOTRON_H || arch == ModelArchitecture.GRANITE_HYBRID) {
@@ -121,7 +121,8 @@ public class ModelLoader {
         } else if (arch == ModelArchitecture.QWEN3MOE
                 || (arch == ModelArchitecture.LLAMA4 && isMoEArch)
                 || (arch == ModelArchitecture.GPT_OSS && isMoEArch)
-                || (arch == ModelArchitecture.GLM4 && isMoEArch)) {
+                || (arch == ModelArchitecture.GLM4 && isMoEArch)
+                || arch == ModelArchitecture.MINIMAX_M2) {
             // Qwen3MoE weight format works for any GQA + MoE architecture
             q3moeWeights = loadQwen3MoEWeights(gguf, config, gpuLayers, moeOptimizedGpu);
         } else {
@@ -175,9 +176,10 @@ public class ModelLoader {
 
             FloatTensor attnNorm = loadTensor(gguf, ArchitectureRegistry.attnNorm(i));
             FloatTensor postAttnNorm = loadTensor(gguf, ArchitectureRegistry.postAttnNormWeight(i));
-            FloatTensor ffnGate = loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
-            FloatTensor ffnUp = loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
-            FloatTensor ffnDown = loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
+            boolean moe = gguf.findTensor(ArchitectureRegistry.ffnGateInp(i)) != null;
+            FloatTensor ffnGate = moe ? null : loadTensor(gguf, ArchitectureRegistry.ffnGate(i));
+            FloatTensor ffnUp = moe ? null : loadTensor(gguf, ArchitectureRegistry.ffnUp(i));
+            FloatTensor ffnDown = moe ? null : loadTensor(gguf, ArchitectureRegistry.ffnDown(i));
 
             if (isDeltaNet) {
                 layers[i] = new Qwen35LayerWeights(attnNorm, postAttnNorm, ffnGate, ffnUp, ffnDown,
@@ -198,6 +200,23 @@ public class ModelLoader {
                     loadTensor(gguf, ArchitectureRegistry.attnOutput(i)),
                     tryLoadTensor(gguf, ArchitectureRegistry.attnQNorm(i)),
                     tryLoadTensor(gguf, ArchitectureRegistry.attnKNorm(i)));
+            }
+            if (moe) {
+                // Shared expert and its gate follow the layer's placement; the routed experts and
+                // the router stay on the CPU (the experts are most of the model and only top-k run
+                // per token; the router is only used through a CPU matmul).
+                FloatTensor gateSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i));
+                FloatTensor upSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
+                FloatTensor downSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
+                FloatTensor gateInpSh = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateInpShexp(i));
+                Object layerGpu = TensorFactory.getGpuBufferManager();
+                TensorFactory.setGpuBufferManager(null);
+                FloatTensor gateInp = loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
+                FloatTensor gateExps = loadTensor(gguf, ArchitectureRegistry.ffnGateExps(i));
+                FloatTensor upExps = loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i));
+                FloatTensor downExps = loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i));
+                TensorFactory.setGpuBufferManager(layerGpu);
+                layers[i].setMoe(gateInp, gateExps, upExps, downExps, gateSh, upSh, downSh, gateInpSh);
             }
         }
 
@@ -370,9 +389,11 @@ public class ModelLoader {
                 FloatTensor ffnUpExps = loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i));
                 FloatTensor ffnDownExps = loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i));
 
-                // GPU ON for router + shared experts (small)
-                TensorFactory.setGpuBufferManager(savedGpuManager);
+                // Router on the CPU: it is only ever used through FloatTensor.matmul (a CPU dot per
+                // expert), so a GPU copy was never uploaded but still charged to the VRAM plan.
                 FloatTensor ffnGateInp = loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
+                // GPU ON for the shared experts (small)
+                TensorFactory.setGpuBufferManager(savedGpuManager);
                 FloatTensor ffnGateShexp = loadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i));
                 FloatTensor ffnUpShexp = loadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
                 FloatTensor ffnDownShexp = loadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
@@ -512,10 +533,11 @@ public class ModelLoader {
                 FloatTensor ffnUpExpsBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpExpsBias(i));
                 FloatTensor ffnDownExpsBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownExpsBias(i));
 
-                // GPU ON for router + shared experts (small)
-                TensorFactory.setGpuBufferManager(savedGpuManager);
+                // Router on the CPU (see the DeepSeek2 loader above)
                 FloatTensor ffnGateInp = loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
                 FloatTensor ffnGateInpBias = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateInpBias(i));
+                // GPU ON for the shared experts (small)
+                TensorFactory.setGpuBufferManager(savedGpuManager);
                 FloatTensor ffnGateShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnGateShexp(i));
                 FloatTensor ffnUpShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnUpShexp(i));
                 FloatTensor ffnDownShexp = tryLoadTensor(gguf, ArchitectureRegistry.ffnDownShexp(i));
@@ -612,7 +634,8 @@ public class ModelLoader {
             + " (also tried " + ArchitectureRegistry.postAttnNorm(layer) + ")");
     }
 
-    private static LFM2Weights loadLFM2Weights(GGUFFile gguf, ModelConfig config, int gpuLayers) {
+    private static LFM2Weights loadLFM2Weights(GGUFFile gguf, ModelConfig config, int gpuLayers,
+                                               boolean moeOptimizedGpu) {
         // Embedding on CPU (lookup only)
         Object savedGpuForEmb = TensorFactory.getGpuBufferManager();
         TensorFactory.setGpuBufferManager(null);
@@ -660,15 +683,19 @@ public class ModelLoader {
                     ffnGate, ffnUp, ffnDown);
             }
             if (moeLayer) {
-                // Router and expert weights stay on CPU: only top-K experts run per token
+                // The router stays on the CPU (a tiny F32 matrix). The experts follow the layer's
+                // backend when the whole model is on the GPU (it fits in VRAM, so the placement is
+                // not MoE-optimized); otherwise they stay on the CPU, where only top-K run per token.
                 Object gpuForLayer = TensorFactory.getGpuBufferManager();
                 TensorFactory.setGpuBufferManager(null);
-                layers[i].setMoE(
-                    loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i)),
+                FloatTensor gateInp = loadTensor(gguf, ArchitectureRegistry.ffnGateInp(i));
+                FloatTensor bias = tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i));
+                if (!moeOptimizedGpu) TensorFactory.setGpuBufferManager(gpuForLayer);
+                layers[i].setMoE(gateInp,
                     loadTensor(gguf, ArchitectureRegistry.ffnGateExps(i)),
                     loadTensor(gguf, ArchitectureRegistry.ffnUpExps(i)),
                     loadTensor(gguf, ArchitectureRegistry.ffnDownExps(i)),
-                    tryLoadTensor(gguf, ArchitectureRegistry.expProbsBias(i)));
+                    bias);
                 TensorFactory.setGpuBufferManager(gpuForLayer);
             }
         }

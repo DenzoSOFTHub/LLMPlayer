@@ -31,22 +31,14 @@ public class InferenceEngine {
     private final boolean useLayerNorm; // Command-R: centered LayerNorm instead of RMSNorm
 
     // GPU-resident forward pass (null if not available or not supported)
-    private AutoCloseable gpuForwardPass;
+    private DenseGpuForwardPass gpuForwardPass;
     private boolean gpuChainEnabled;
+    // The state whose token history the GPU KV cache currently holds (see gpuHoldsHistoryOf)
+    private volatile Object gpuKvOwner;
 
     // Next-layer mmap prefetcher for lazy (>RAM) loads; null when not applicable
     private LayerPrefetcher layerPrefetcher;
 
-    // Cached reflection Method handles for GPU hot path (avoids per-token getMethod lookups)
-    private java.lang.reflect.Method cachedUploadX;
-    private java.lang.reflect.Method cachedUpdateTokenParams;
-    private java.lang.reflect.Method cachedUploadXAndUpdateParams;
-    private java.lang.reflect.Method cachedForwardGraph;
-    private java.lang.reflect.Method cachedForwardGraphArgmax;
-    private java.lang.reflect.Method cachedForwardLayer;
-    private java.lang.reflect.Method cachedForwardFinalLogits;
-    private java.lang.reflect.Method cachedForwardFinalArgmax;
-    private java.lang.reflect.Method cachedDownloadX;
     private int gpuLayerCount;  // number of layers on GPU (for partial offload)
 
     public InferenceEngine(ModelConfig config, ModelWeights weights, int maxSeqLen) {
@@ -137,26 +129,21 @@ public class InferenceEngine {
             // Try 5-param constructor (with Attention + maxSeqLen for GPU attention)
             java.lang.reflect.Constructor<?>[] ctors = fpClass.getConstructors();
             if (ctors.length > 0 && ctors[0].getParameterCount() == 5) {
-                gpuForwardPass = (AutoCloseable) ctors[0]
+                gpuForwardPass = (DenseGpuForwardPass) ctors[0]
                     .newInstance(config, weights, bufferManager, attention, maxSeqLen);
             } else {
-                gpuForwardPass = (AutoCloseable) ctors[0]
+                gpuForwardPass = (DenseGpuForwardPass) ctors[0]
                     .newInstance(config, weights, bufferManager);
             }
-            // Get GPU layer count for partial offload support
-            try {
-                java.lang.reflect.Method getGpuLayerCount = fpClass.getMethod("getGpuLayerCount");
-                gpuLayerCount = (int) getGpuLayerCount.invoke(gpuForwardPass);
-            } catch (NoSuchMethodException ignored) {
-                gpuLayerCount = config.blockCount(); // fallback: assume full offload
-            }
+            gpuLayerCount = gpuForwardPass.getGpuLayerCount();
+            // Set up the batched prefill now (cuBLAS handle, chunk buffers) rather than inside the
+            // first long prompt's time to first token.
+            if (gpuLayerCount == config.blockCount()) gpuForwardPass.maxPrefillBatch();
             if (gpuLayerCount < config.blockCount()) {
                 System.out.println("GPU chain: enabled — " + label + " partial offload (" + gpuLayerCount + "/" + config.blockCount() + " layers on GPU)");
             } else {
                 System.out.println("GPU chain: enabled — " + label + " GPU-resident forward pass active");
             }
-            // Cache Method handles for hot path (avoids per-token getMethod overhead)
-            cacheGpuMethods(fpClass);
             return true;
         } catch (ClassNotFoundException e) {
             // Not on classpath — expected on Java 8 or when backend not available
@@ -174,11 +161,61 @@ public class InferenceEngine {
      * the CPU path supports; must be called before any state is created.
      */
     public void disableGpuForwardPass() {
+        if (parkedPass != null) setGpuForwardPassParked(false);
         if (gpuForwardPass != null) {
             try { gpuForwardPass.close(); } catch (Exception ignored) { }
             gpuForwardPass = null;
+            gpuKvOwner = null;
             System.out.println("GPU chain: disabled (vision input needs the CPU layer path)");
         }
+    }
+
+    /** True when a GPU-resident forward pass (which owns the KV cache of its layers) is active. */
+    private DenseGpuForwardPass parkedPass;
+
+    /**
+     * Park (or restore) the GPU-resident pass without closing it, for the placement calibrator:
+     * while parked every layer runs on the CPU path. The device KV history is dropped either way,
+     * so a sequence must restart from position 0 after a switch.
+     */
+    public synchronized void setGpuForwardPassParked(boolean park) {
+        if (park && gpuForwardPass != null) {
+            parkedPass = gpuForwardPass;
+            gpuForwardPass = null;
+        } else if (!park && parkedPass != null) {
+            gpuForwardPass = parkedPass;
+            parkedPass = null;
+        }
+        gpuKvOwner = null;
+    }
+
+    public boolean hasParkedPass() { return parkedPass != null; }
+
+    public boolean hasGpuForwardPass() {
+        return gpuForwardPass != null;
+    }
+
+    /**
+     * Whether {@code state}'s token history is fully available to the next forward step. With a
+     * GPU-resident pass the KV cache of the GPU layers lives on the device and holds the history of
+     * only the state that ran last; a different state (another conversation resumed from the
+     * conversation cache, a concurrent request) must be prefilled again from position 0.
+     */
+    public boolean gpuHoldsHistoryOf(Object state) {
+        DenseGpuForwardPass gpu = gpuForwardPass;
+        if (gpu == null) return true;
+        if (gpu instanceof GpuKvOwner && !((GpuKvOwner) gpu).ownsKvCache()) return true;
+        return gpuKvOwner == state;
+    }
+
+    /**
+     * Final-norm output of the last processed token (the embedding API): downloads the residual
+     * stream first when the GPU pass computed it and kept it on the device.
+     */
+    public void finalHidden(InferenceState state, float[] out) {
+        DenseGpuForwardPass gpu = gpuForwardPass;
+        if (gpu != null && gpuLayerCount == config.blockCount()) gpu.downloadX(state.x);
+        normedHidden(state, out);
     }
 
     /**
@@ -240,6 +277,11 @@ public class InferenceEngine {
     public float[] forwardPrefill(InferenceState state, int[] tokens, int fromPos, int toPos) {
         int count = toPos - fromPos;
         if (count <= 0) return null;
+        if (count > GPU_PREFILL_MIN && gpuPrefillBatched(state, tokens, fromPos, toPos - 1)) {
+            // every prompt token but the last went through the GPU in chunks; the last one runs
+            // the normal single-token path, which also produces the logits
+            return forward(state, tokens[toPos - 1], toPos - 1);
+        }
         if (count == 1 || !canBatchPrefill()) {
             float[] logits = null;
             for (int i = fromPos; i < toPos; i++) {
@@ -268,6 +310,49 @@ public class InferenceEngine {
             if (base + n == toPos) System.arraycopy(b.x[n - 1], 0, state.x, 0, dim);
         }
         return finishLogits(state, false);
+    }
+
+    private boolean gpuPrefillFailed;
+    // Below this many prompt tokens the per-token graph replay is as fast as a chunk and the
+    // batched path would only add its one-time setup (cuBLAS handle, buffers) to the first request.
+    private static final int GPU_PREFILL_MIN = Integer.getInteger("cuda.prefill.min", 32);
+
+    /**
+     * Batched GPU prefill of {@code tokens[fromPos..toPos)} (see DenseGpuForwardPass#prefillBatch):
+     * chunks of up to maxPrefillBatch tokens, each weight read once per chunk. Returns false when
+     * not applicable (no GPU pass, partial offload, pass without batched prefill), in which case
+     * nothing was run. A failure falls back to the per-token path, which rewrites the same KV slots.
+     */
+    private boolean gpuPrefillBatched(InferenceState state, int[] tokens, int fromPos, int toPos) {
+        DenseGpuForwardPass gpu = gpuForwardPass;
+        if (gpu == null || gpuPrefillFailed || gpuLayerCount != config.blockCount()) return false;
+        if (gpu instanceof GpuKvOwner && !((GpuKvOwner) gpu).ownsKvCache()) return false;
+        int maxB = gpu.maxPrefillBatch();
+        if (maxB < 2) return false;
+        if (fromPos > 0 && gpuKvOwner != state) {
+            throw new IllegalStateException("GPU KV cache holds another sequence; this state must be "
+                + "prefilled from position 0 (check gpuHoldsHistoryOf before resuming)");
+        }
+        gpuKvOwner = state;
+        int dim = config.embeddingLength();
+        float[] buf = new float[maxB * dim];
+        float[] row = new float[dim];
+        try {
+            for (int base = fromPos; base < toPos; base += maxB) {
+                int n = Math.min(maxB, toPos - base);
+                for (int t = 0; t < n; t++) {
+                    embed(tokens[base + t], row);
+                    System.arraycopy(row, 0, buf, t * dim, dim);
+                }
+                gpu.prefillBatch(buf, base, n);
+            }
+            return true;
+        } catch (RuntimeException e) {
+            gpuPrefillFailed = true;
+            System.err.println("GPU batched prefill failed, using the per-token path — "
+                + GpuFailureException.describe(e));
+            return false;
+        }
     }
 
     /**
@@ -362,18 +447,30 @@ public class InferenceEngine {
 
     /**
      * Batched prefill needs the CPU layer loop (no GPU-resident pass, no lazy >RAM prefetcher),
-     * the CPU matmul pool (it is disabled once a GPU backend is initialised, so GPU tensors never
-     * reach the batched kernels), and a layer shape {@link TransformerBlock#forwardBatch} covers.
+     * the CPU matmul pool, no GPU-resident layer weight (the batched kernels would run it on its
+     * CPU twin), and a layer shape {@link TransformerBlock#forwardBatch} covers.
      */
     private boolean canBatchPrefill() {
         if (!PREFILL_BATCHED || gpuForwardPass != null || layerPrefetcher != null
-                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled()) {
+                || !it.denzosoft.llmplayer.tensor.MatmulPool.enabled() || layersGpuResident()) {
             return false;
         }
         for (int layer = 0; layer < config.blockCount(); layer++) {
             if (!block.supportsBatch(weights.layers()[layer], layer)) return false;
         }
         return true;
+    }
+
+    // F4: whether any layer weight is GPU-resident (scanned once). The batched CPU prefill used to
+    // be gated on the matmul pool, which GPU init switched off; the pool now stays on.
+    private volatile Boolean layersGpuResident;
+
+    private boolean layersGpuResident() {
+        Boolean b = layersGpuResident;
+        if (b == null) layersGpuResident = b = it.denzosoft.llmplayer.tensor.FloatTensor.anyGpuResident(weights.layers());
+        // GPU matmuls switched off (the placement calibrator's CPU candidate): the tensors run
+        // on their CPU twins, so the batched prefill applies as in a CPU-only run
+        return b && it.denzosoft.llmplayer.tensor.FloatTensor.gpuMatmulEnabled();
     }
 
     private float[] forwardInternal(InferenceState state, int token, int position, boolean computeLogits) {
@@ -388,7 +485,7 @@ public class InferenceEngine {
         // 2. Forward through all transformer layers
         boolean logitsDone = false;
         if (gpuForwardPass != null) {
-            logitsDone = forwardGpu(state, position);
+            logitsDone = forwardGpu(state, position, computeLogits);
         } else {
             for (int layer = 0; layer < config.blockCount(); layer++) {
                 // Lazy (>RAM) load: kick the async page-in of layer N+1 while computing layer N
@@ -558,88 +655,77 @@ public class InferenceEngine {
     }
 
     /**
-     * Cache reflection Method handles once at init time.
-     * Eliminates per-token getMethod() overhead in the hot path.
+     * GPU-resident forward pass through all layers (zero reflection, zero allocation).
+     *
+     * <p>With every layer on the GPU: a token that needs logits replays the full graph (layers +
+     * output projection); a prefill token whose logits are discarded replays the layers-only
+     * graph and downloads nothing, so neither the output projection (the largest weight) nor the
+     * 0.5 MB logits transfer is paid per prompt token. With a partial offload the GPU prefix also
+     * runs as one graph replay, then the residual stream is downloaded for the CPU layers.
+     *
+     * <p>Returns true if logits were computed on GPU (caller skips CPU RMSNorm + matmul).
      */
-    private void cacheGpuMethods(Class<?> fpClass) {
-        try {
-            cachedUploadX = fpClass.getMethod("uploadX", float[].class);
-            cachedForwardLayer = fpClass.getMethod("forwardLayer",
-                InferenceState.class,
-                it.denzosoft.llmplayer.model.TransformerLayerWeights.class,
-                int.class, int.class, Attention.class);
-            cachedDownloadX = fpClass.getMethod("downloadX", float[].class);
-            try { cachedUpdateTokenParams = fpClass.getMethod("updateTokenParams", int.class); }
-            catch (NoSuchMethodException ignored) {}
-            try { cachedUploadXAndUpdateParams = fpClass.getMethod("uploadXAndUpdateParams", float[].class, int.class); }
-            catch (NoSuchMethodException ignored) {}
-            try { cachedForwardGraph = fpClass.getMethod("forwardGraph", float[].class); }
-            catch (NoSuchMethodException ignored) {}
-            try { cachedForwardGraphArgmax = fpClass.getMethod("forwardGraphArgmax"); }
-            catch (NoSuchMethodException ignored) {}
-            try { cachedForwardFinalLogits = fpClass.getMethod("forwardFinalLogits", float[].class); }
-            catch (NoSuchMethodException ignored) {}
-            try { cachedForwardFinalArgmax = fpClass.getMethod("forwardFinalArgmax"); }
-            catch (NoSuchMethodException ignored) {}
-        } catch (NoSuchMethodException e) {
-            throw new RuntimeException("GPU forward pass missing required methods", e);
+    private boolean forwardGpu(InferenceState state, int position, boolean computeLogits) {
+        DenseGpuForwardPass gpu = gpuForwardPass;
+        boolean ownsKv = gpu instanceof GpuKvOwner ? ((GpuKvOwner) gpu).ownsKvCache() : true;
+        if (ownsKv && position > 0 && gpuKvOwner != state) {
+            // The device KV holds another sequence: running this token would attend over it.
+            throw new IllegalStateException("GPU KV cache holds another sequence; this state must be "
+                + "prefilled from position 0 (check gpuHoldsHistoryOf before resuming)");
         }
-    }
-
-    /**
-     * GPU-resident forward pass through all layers.
-     * Uses cached reflection Method handles to minimize per-token overhead.
-     * Returns true if logits were computed on GPU (caller skips CPU RMSNorm + matmul).
-     */
-    private boolean forwardGpu(InferenceState state, int position) {
+        gpuKvOwner = state;
+        boolean full = gpuLayerCount == config.blockCount();
         try {
-            // Combined upload: embedding + token params in single cuMemcpyHtoD
-            if (cachedUploadXAndUpdateParams != null) {
-                cachedUploadXAndUpdateParams.invoke(gpuForwardPass, state.x, position);
+            gpu.uploadXAndUpdateParams(state.x, position);
+
+            boolean layersDone = false;
+            if (full && computeLogits) {
+                if (gpu.forwardGraph(state.logits)) return true;
             } else {
-                cachedUploadX.invoke(gpuForwardPass, state.x);
-                if (cachedUpdateTokenParams != null) {
-                    cachedUpdateTokenParams.invoke(gpuForwardPass, position);
+                layersDone = gpu.forwardGraphLayers();
+            }
+            if (!layersDone) {
+                for (int layer = 0; layer < gpuLayerCount; layer++) {
+                    gpu.forwardLayer(state, weights.layers()[layer], layer, position, attention);
                 }
             }
 
-            // Try CUDA graph mode first (all GPU layers + output in single API call)
-            if (cachedForwardGraph != null && gpuLayerCount == config.blockCount()) {
-                boolean done = (boolean) cachedForwardGraph.invoke(gpuForwardPass, state.logits);
-                if (done) return true;
-            }
-
-            // Per-layer mode: run GPU layers via CudaForwardPass
-            for (int layer = 0; layer < gpuLayerCount; layer++) {
-                cachedForwardLayer.invoke(gpuForwardPass, state, weights.layers()[layer], layer, position, attention);
-            }
-
-            // If all layers are on GPU, try final RMSNorm + output projection on GPU
-            if (gpuLayerCount == config.blockCount() && cachedForwardFinalLogits != null) {
-                boolean done = (boolean) cachedForwardFinalLogits.invoke(gpuForwardPass, state.logits);
-                if (done) return true;
+            if (full) {
+                // Prefill token: the residual stays on the device, the next token overwrites it.
+                if (!computeLogits) return false;
+                if (gpu.forwardFinalLogits(state.logits)) return true;
             }
 
             // Download X from GPU for CPU layers or final steps
-            cachedDownloadX.invoke(gpuForwardPass, state.x);
-
-            // Run remaining CPU layers (partial offload)
-            for (int layer = gpuLayerCount; layer < config.blockCount(); layer++) {
-                block.forward(state, weights.layers()[layer], layer, position);
-            }
-
-            return false;
-        } catch (Exception e) {
+            gpu.downloadX(state.x);
+        } catch (RuntimeException e) {
+            // The GPU owned the KV cache (and residual stream) of its layers for every earlier
+            // position, so the CPU cannot simply take over mid-sequence: it would attend over an
+            // empty history and produce garbage. Drop the GPU pass so later requests run on the
+            // CPU from position 0, and fail this generation loudly.
             Throwable cause = e;
             while (cause.getCause() != null) cause = cause.getCause();
-            System.err.println("GPU chain: forward failed, permanently disabling GPU forward pass — " + cause);
+            System.err.println("GPU chain: forward failed, disabling GPU forward pass — " + cause);
             cause.printStackTrace(System.err);
-            gpuForwardPass = null;  // Prevent repeated GPU failures on subsequent tokens
-            for (int layer = 0; layer < config.blockCount(); layer++) {
-                block.forward(state, weights.layers()[layer], layer, position);
+            gpuForwardPass = null;
+            gpuKvOwner = null;
+            try { gpu.close(); } catch (Exception ignored) { }
+            if (position == 0) {
+                // Nothing was lost yet: this token can run on the CPU.
+                for (int layer = 0; layer < config.blockCount(); layer++) {
+                    block.forward(state, weights.layers()[layer], layer, position);
+                }
+                return false;
             }
-            return false;
+            throw new GpuFailureException("GPU forward pass failed at position " + position
+                + "; the generation cannot continue on the CPU without re-prefilling", e);
         }
+
+        // Run remaining CPU layers (partial offload)
+        for (int layer = gpuLayerCount; layer < config.blockCount(); layer++) {
+            block.forward(state, weights.layers()[layer], layer, position);
+        }
+        return false;
     }
 
     /**

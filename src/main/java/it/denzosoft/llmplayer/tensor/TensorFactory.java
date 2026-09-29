@@ -48,6 +48,8 @@ public final class TensorFactory {
     private static volatile Constructor<?> simdIQ3XXSCtor;
     private static volatile Constructor<?> simdIQ3SCtor;
     private static volatile Constructor<?> simdIQ2SCtor;
+    private static volatile Constructor<?> simdIQ1MCtor;
+    private static volatile Constructor<?> simdIQ2XXSCtor;
 
     public static FloatTensor create(GGMLType type, TensorData data, long elementCount) {
         // Try GPU tensor first
@@ -56,6 +58,15 @@ public final class TensorFactory {
             if (gpuTensor != null) return gpuTensor;
         }
 
+        return createCpu(type, data, elementCount);
+    }
+
+    /**
+     * CPU-only tensor for {@code type}: the SIMD variant when the Vector API is available, the
+     * scalar one otherwise. GPU tensors use it as their CPU twin, so that a CPU fallback or a
+     * {@code dot()} call on a GPU-backed weight runs the fast kernel instead of the scalar one.
+     */
+    public static FloatTensor createCpu(GGMLType type, TensorData data, long elementCount) {
         // Try SIMD-optimized tensors (Java 21+ with Vector API and MemorySegment)
         FloatTensor simdTensor = tryCreateSimdTensor(type, data, elementCount);
         if (simdTensor != null) return simdTensor;
@@ -78,16 +89,18 @@ public final class TensorFactory {
         if (type == GGMLType.IQ3_XXS) return new IQ3_XXSFloatTensor(data, elementCount);
         if (type == GGMLType.IQ3_S) return new IQ3_SFloatTensor(data, elementCount);
         if (type == GGMLType.IQ2_S) return new IQ2_SFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ2_XXS) return new IQ2_XXSFloatTensor(data, elementCount);
+        if (type == GGMLType.IQ1_M) return new IQ1_MFloatTensor(data, elementCount);
         if (type == GGMLType.MXFP4) return new MXFP4FloatTensor(data, elementCount);
         // Declared in GGMLType enum but no FloatTensor implementation:
-        // Q4_1, Q8_1, Q8_K, IQ2_XXS, IQ2_XS, IQ1_S, IQ1_M.
+        // Q4_1, Q8_1, Q8_K, IQ2_XS, IQ1_S.
         // These types appear in some legacy or experimental GGUF files; if you hit
         // this, the model uses a quantization format LLMPlayer does not implement.
         throw new UnsupportedOperationException(
             "Unsupported tensor type: " + type +
             " (no FloatTensor implementation). Supported: F32, F16, BF16, "
             + "Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, "
-            + "IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4.");
+            + "IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4.");
     }
 
     private static FloatTensor tryCreateSimdTensor(GGMLType type, TensorData data, long elementCount) {
@@ -99,7 +112,8 @@ public final class TensorFactory {
             && type != GGMLType.Q6_K && type != GGMLType.Q4_0 && type != GGMLType.Q5_0
             && type != GGMLType.Q5_K && type != GGMLType.Q3_K
             && type != GGMLType.IQ4_NL && type != GGMLType.IQ4_XS
-            && type != GGMLType.IQ3_XXS && type != GGMLType.IQ3_S && type != GGMLType.IQ2_S) return null;
+            && type != GGMLType.IQ3_XXS && type != GGMLType.IQ3_S && type != GGMLType.IQ2_S
+            && type != GGMLType.IQ1_M && type != GGMLType.IQ2_XXS) return null;
 
         // Probe SIMD availability on first call
         if (avail == null) {
@@ -122,6 +136,8 @@ public final class TensorFactory {
             else if (type == GGMLType.IQ3_XXS) ctor = simdIQ3XXSCtor;
             else if (type == GGMLType.IQ3_S) ctor = simdIQ3SCtor;
             else if (type == GGMLType.IQ2_S) ctor = simdIQ2SCtor;
+            else if (type == GGMLType.IQ1_M) ctor = simdIQ1MCtor;
+            else if (type == GGMLType.IQ2_XXS) ctor = simdIQ2XXSCtor;
             if (ctor == null) return null;
             return (FloatTensor) ctor.newInstance(data, elementCount);
         } catch (Exception e) {
@@ -148,6 +164,8 @@ public final class TensorFactory {
             simdIQ3XXSCtor = probeCtor(base + "SimdIQ3_XXSFloatTensor");
             simdIQ3SCtor = probeCtor(base + "SimdIQ3_SFloatTensor");
             simdIQ2SCtor = probeCtor(base + "SimdIQ2_SFloatTensor");
+            simdIQ1MCtor = probeCtor(base + "SimdIQ1_MFloatTensor");
+            simdIQ2XXSCtor = probeCtor(base + "SimdIQ2_XXSFloatTensor");
 
             simdAvailable = (simdQ4KCtor != null || simdQ8_0Ctor != null || simdQ6KCtor != null
                 || simdQ4_0Ctor != null || simdQ5_0Ctor != null || simdQ5KCtor != null || simdQ3KCtor != null
@@ -167,6 +185,8 @@ public final class TensorFactory {
                 if (simdIQ3XXSCtor != null) sb.append(" IQ3_XXS");
                 if (simdIQ3SCtor != null) sb.append(" IQ3_S");
                 if (simdIQ2SCtor != null) sb.append(" IQ2_S");
+                if (simdIQ1MCtor != null) sb.append(" IQ1_M");
+                if (simdIQ2XXSCtor != null) sb.append(" IQ2_XXS");
                 System.out.println(sb);
             }
         } catch (ClassNotFoundException e) {
@@ -220,6 +240,9 @@ public final class TensorFactory {
         if (type == GGMLType.IQ3_XXS && cuda) return base + "IQ3_XXSCudaTensor";
         if (type == GGMLType.IQ3_S && cuda) return base + "IQ3_SCudaTensor";
         if (type == GGMLType.IQ2_S && cuda) return base + "IQ2_SCudaTensor";
+        if (type == GGMLType.IQ2_XXS && cuda) return base + "IQ2_XXSCudaTensor";
+        if (type == GGMLType.IQ1_M && cuda) return base + "IQ1_MCudaTensor";
+        if (type == GGMLType.Q2_K && cuda) return base + "Q2_KCudaTensor";
         if (type == GGMLType.MXFP4 && cuda) return base + "MXFP4CudaTensor";
         return null; // No GPU version for this type
     }

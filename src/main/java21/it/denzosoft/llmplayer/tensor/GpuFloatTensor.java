@@ -60,6 +60,9 @@ public abstract class GpuFloatTensor extends FloatTensor {
     }
 
     @Override
+    public boolean isGpuResident() { return true; }
+
+    @Override
     public void matmulParallel(float[] input, float[] out, int rows, int cols) {
         try {
             gpuMatmul(input, out, rows, cols);
