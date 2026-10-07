@@ -1,6 +1,15 @@
-# LLMPlayer v1.19.1
+# LLMPlayer v1.20.0
 
-Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 30 architectures (plus the Qwen-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE and Qwen3-TTS variants), with **image input** for Qwen3-VL, Qwen3.5 and Qwen2.5-VL and **text-to-speech** with Qwen3-TTS, including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), **Falcon-H1** (parallel Mamba-2 + attention hybrid), and **MiniMax-M2**. 20 quantized formats (IQ1_M and IQ2_XXS included), every one with a dedicated CUDA kernel. Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Qwen3.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, the attention half of MoE models on the GPU with a hybrid GPU expert cache, batched GPU prefill through cuBLAS, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads), **lazy mmap for models larger than RAM** and **SSD streaming with a hot-expert RAM cache** (`--ssd-streaming`) for MoE models that exceed it, an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+Pure Java LLM inference engine for running GGUF models locally. Zero external dependencies — uses only the JDK. Supports 31 architectures (plus the Qwen-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE and Qwen3-TTS variants), with **image input** for Qwen3-VL, Qwen3.5 and Qwen2.5-VL and **text-to-speech** with Qwen3-TTS, including Llama, Qwen2/3/3.5, SmolLM3, DeepSeek2, Gemma 2/3/3n/4, Phi-3/4, Mistral3/Devstral, Falcon3, Granite 3.3, **Granite Hybrid**, **Nemotron-H** (hybrid Mamba-2 + Transformer), **Olmo 3** (ChatML variant), **ERNIE 4.5**, **LFM2** (gated short-convolution + GQA hybrid), **Falcon-H1** (parallel Mamba-2 + attention hybrid), **MiniMax-M2**, and **MiniCPM** (MiniCPM4/4.1 and MiniCPM5). 20 quantized formats (IQ1_M and IQ2_XXS included), every one with a dedicated CUDA kernel. Includes CUDA GPU acceleration with graph mode (~80+ tok/s on RTX 4050 for Llama-3.2-1B after the v1.12/v1.13 sprints), dedicated GPU-resident forward passes for the dense, ERNIE 4.5, Qwen3.5, Nemotron-H/Granite Hybrid, LFM2, Falcon-H1, and Gemma 4 architectures, the attention half of MoE models on the GPU with a hybrid GPU expert cache, batched GPU prefill through cuBLAS, **placement auto-tuning** (KV-aware VRAM budget, `--auto-tune`, physical-core threads), **lazy mmap for models larger than RAM** and **SSD streaming with a hot-expert RAM cache** (`--ssd-streaming`) for MoE models that exceed it, an optional FP16 KV cache, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX runtime metrics with rolling window, smoke test suite for all architectures, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
+
+### What's new in v1.20.0
+
+**MiniCPM support.** MiniCPM4 and MiniCPM4.1 (`minicpm`) run on the standard engine with their muP scaling (embedding, residual and logit scales, as for Granite), NORM RoPE and LongRoPE factors; MiniCPM5, which ships as plain `llama`, gets its `minicpm5` BPE pre-tokenizer and its ChatML template. Tested on the CPU with MiniCPM4-0.5B, MiniCPM5-2B and MiniCPM4.1-8B, including retrieval from prompts of 1,400 to 1,700 tokens; the GPU path was not re-run, because the reference machine has no GPU. MiniCPM3 (`minicpm3`, MLA) is not supported.
+
+- **ChatML on the `llama` architecture.** A `llama` GGUF whose template uses `<|im_start|>` is now prompted in ChatML instead of with Llama 3 headers. Besides MiniCPM5 this fixes Yi (Yi-Coder-9B-Chat), which had been prompted in the wrong format. Templates that honour `enable_thinking` (MiniCPM5, MiniCPM4.1) enable `--thinking`.
+- **MoE on the GPU.** The GPU expert cache sizes its slots per layer (Qwen3-Coder-30B keeps 1116 experts instead of 1047 in the same memory), the shared expert of Qwen3-MoE-family models runs inside the GPU attention pass by default, and MoE GPU attention with a rope dimension of 1 no longer fails to start.
+
+Full details are in `WHATS-NEW.md`.
 
 ### What's new in v1.19.1
 
@@ -710,6 +719,8 @@ engine.close();
 | Nanbeige 4.2 (looped depth) | `nanbeige` | SentencePiece | `<\|im_start\|>user` |
 | Spark-X2.5 (SWA + gated attention) | `spark2_5` | BPE (gpt2, multi-regex) | `<\|User\|>` |
 | Ling 3.0 (KDA + gated MLA + MoE) | `bailingmoe3` | BPE (gpt2) | `<role>HUMAN</role>` |
+| MiniCPM 1/2/4/4.1 (muP scaling, LongRoPE) | `minicpm` | SentencePiece | `<\|im_start\|>user` |
+| MiniCPM5 | `llama` (ChatML template auto-detected) | BPE (gpt2, `minicpm5` pre-tokenizer) | `<\|im_start\|>user` |
 | Qwen3-TTS talker (text-to-speech, `--tts`) | `qwen3tts` | BPE (gpt2) | — |
 
 The architecture is automatically detected from the `general.architecture` field in GGUF metadata.

@@ -1045,7 +1045,7 @@ public class Qwen3MoEInferenceEngine {
             VectorOpsFactory.get().saxpy(state.selectedWeights[k], state.expertOutPerExpert[k], 0, state.xb, 0, dim);
         }
 
-        // 3. Shared expert: computed by the GPU attention pass when it holds it (-Dmoe.attn.shared)
+        // 3. Shared expert: computed by the GPU attention pass when it holds it (-Dmoe.attn.shared=false disables)
         GpuAttentionPass gpuSh = gpuAttention;
         boolean sharedDone = false;
         if (weights.ffnGateShexp() != null && gpuSh != null && gpuSh.isLayerOnGpu(currentLayer)) {

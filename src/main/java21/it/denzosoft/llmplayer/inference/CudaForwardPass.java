@@ -638,7 +638,7 @@ public class CudaForwardPass implements DenseGpuForwardPass {
         // Granite scaling
         graniteResidualScale = config.residualScale();
         graniteAttentionScale = config.attentionScale();
-        graniteLogitScale = config.logitScale() > 0 && config.architecture() == it.denzosoft.llmplayer.model.ModelArchitecture.GRANITE
+        graniteLogitScale = config.logitScale() > 0 && config.logitScaleDivides()
             ? (1.0f / config.logitScale()) : 0;
         boolean needScaleKernel = graniteResidualScale > 0 || graniteLogitScale > 0
             || (graniteAttentionScale > 0 && !attnScaleInKernel);

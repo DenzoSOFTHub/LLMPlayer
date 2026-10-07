@@ -884,6 +884,12 @@ public class ModelLoader {
         if (ropeFreqsInfo == null) {
             ropeFreqsInfo = gguf.findTensor(ArchitectureRegistry.ropeFreqs(0));
         }
+        // MiniCPM LongRoPE: rope_factors_short/long divide the frequencies like rope_freqs. llama.cpp
+        // switches to the long factors only past the original context length, which is the trained
+        // context for MiniCPM (no rope.scaling.original_context_length key), so the short ones apply.
+        if (ropeFreqsInfo == null && config.architecture() == ModelArchitecture.MINICPM) {
+            ropeFreqsInfo = gguf.findTensor("rope_factors_short.weight");
+        }
         if (ropeFreqsInfo != null) {
             FloatTensor ropeFreqsTensor = createTensor(gguf, ropeFreqsInfo);
             // Load ALL frequency factors from the tensor (for Gemma 4, full attention layers

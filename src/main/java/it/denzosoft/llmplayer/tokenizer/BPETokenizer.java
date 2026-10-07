@@ -49,7 +49,17 @@ public class BPETokenizer implements Tokenizer {
             + "|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
             + "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"),
     };
+    // MiniCPM5 (llama.cpp PRE_TYPE_MINICPM5): digits in groups of up to three are split off first,
+    // then the tokenizer.json regex runs on the rest (its \p{N}+ then never sees more than 3 digits).
+    private static final Pattern[] PRE_MINICPM5 = {
+        Pattern.compile("\\p{N}{1,3}"),
+        Pattern.compile("(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+"
+            + "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"),
+    };
     private Pattern[] preTokenizers;
+    // llama.cpp ignore_merges: a pre-token that is itself in the vocabulary is emitted as one token
+    // without running the merges (set for MiniCPM5, whose merge table does not rebuild every word).
+    private boolean ignoreMerges;
 
     /**
      * Select the pre-tokenizer from {@code tokenizer.ggml.pre}. Only the multi-regex families that
@@ -64,9 +74,12 @@ public class BPETokenizer implements Tokenizer {
             preTokenizers = PRE_SPARK2_5;
         } else if ("minimax-m2".equals(pre)) {
             preTokenizers = PRE_MINIMAX_M2;
+        } else if ("minicpm5".equals(pre)) {
+            preTokenizers = PRE_MINICPM5;
         } else {
             preTokenizers = null;
         }
+        ignoreMerges = "minicpm5".equals(pre);
     }
 
     /**
@@ -240,6 +253,16 @@ public class BPETokenizer implements Tokenizer {
     private List<Integer> bpeEncode(String word) {
         // Convert to byte-level tokens
         List<Integer> tokens;
+        if (ignoreMerges && useGpt2ByteMapping) {
+            StringBuilder mapped = new StringBuilder();
+            for (byte b : word.getBytes(StandardCharsets.UTF_8)) mapped.append(byteToToken(b));
+            Integer whole = tokenToId.get(mapped.toString());
+            if (whole != null) {
+                tokens = new ArrayList<>(1);
+                tokens.add(whole);
+                return tokens;
+            }
+        }
         if (useGpt2ByteMapping) {
             byte[] bytes = word.getBytes(StandardCharsets.UTF_8);
             tokens = new ArrayList<>(bytes.length);

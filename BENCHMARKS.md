@@ -15,6 +15,24 @@
 
 **Note on GPU auto-detection:** LLMPlayer automatically detects and enables CUDA GPU when an NVIDIA GPU is present. GPU benchmarks below use this default behavior. CPU benchmarks use `--no-gpu` to force CPU-only mode.
 
+## v1.20.0 — MiniCPM, CPU only (2026-10-07)
+
+Shared 8-vCPU VirtualBox VM (15 GB RAM, no GPU) with other heavy workloads running (load average 8
+to 13), so the speeds are indicative only and must not be compared with other sections. `--no-gpu`,
+greedy decoding. The retrieval prompt hides a badge number and a city in about 60 log lines.
+
+| Model | Quant | Architecture | Test | Speed | Result |
+|-------|-------|--------------|------|-------|--------|
+| MiniCPM4-0.5B | Q4_K_M | minicpm | Factual question | 3.3 tok/s | Correct, PPL 1.01, natural EOS |
+| MiniCPM4-0.5B | Q4_K_M | minicpm | Retrieval, 1691 prompt tokens | 142 s total | Correct badge number and city |
+| MiniCPM5-2B | Q4_K_M | llama (ChatML) | Java prompt, 200 generated | 0.9 tok/s | PPL 2.20; one wrong identifier in the greedy draft |
+| MiniCPM5-2B | Q4_K_M | llama (ChatML) | Retrieval, 1380 prompt tokens | 831 s total | Correct badge number and city |
+| MiniCPM4.1-8B | Q4_K_M | minicpm | Java prompt, 120 generated | 0.4 tok/s | PPL 2.26, coherent |
+| Yi-Coder-9B-Chat | Q4_K_M | llama (ChatML, now detected) | Factual question | 0.6 tok/s | Correct, PPL 1.01, natural EOS |
+
+Per-model notes are in `docs/models/MiniCPM4-0.5B-Q4_K_M.md`, `docs/models/MiniCPM5-2B-Q4_K_M.md` and
+`docs/models/MiniCPM4.1-8B-Q4_K_M.md`.
+
 ## v1.17.0-dev — CPU forward-pass optimisations (2026-08-11)
 
 Same box as the SSD-streaming section below: **4 cores, 7.8 GB RAM, no GPU**, `vboxsf` volume.

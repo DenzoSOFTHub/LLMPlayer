@@ -70,8 +70,12 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
     private final int layers, experts, dim, efd;
 
     // Allocation
-    private final long[] projBytes;          // capacity of the gate / up / down slot
+    private final long[] projBytes;          // largest gate / up / down slice over all layers (staging)
     private final long unitBytes;
+    // Size classes (F2 step 4): one gate/up/down slot triple per distinct per-layer triple. Units of
+    // class c are [classStart[c], classStart[c + 1]); a layer only uses units of its own class.
+    private final long[][] classProj;
+    private final int[] layerClass, classStart, classUsed, unitClass;
     private final int units;
     private final long[] slotPtr;            // 3 per unit
     private final long[] chunkPtrs;
@@ -81,7 +85,7 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
     private final int[] count;
     private final int[] unitOf;              // unit, ABSENT or PENDING
     private final int[] unitKey;             // key held by a unit, or -1
-    private int unitsUsed;
+    private int unitsUsed;                   // over all classes
     private int selections;
 
     // Asynchronous promotion
@@ -167,9 +171,12 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
      * @param dim           model dimension
      * @param efd           expert FFN dimension
      * @param types         expert quant types (their kernels are compiled now)
+     * @param classProj     slot triple of each size class (null: one class of {@code projBytes})
+     * @param layerClass    size class of each layer, -1 for a layer without experts
      */
     public ExpertGpuCache(CudaContext cudaContext, long maxCacheBytes, long[] projBytes,
-                          int layers, int experts, int dim, int efd, GGMLType[] types) {
+                          int layers, int experts, int dim, int efd, GGMLType[] types,
+                          long[][] classProj, int[] layerClass) {
         this.cudaContext = cudaContext;
         this.stream = cudaContext.getStream();
         this.layers = layers;
@@ -178,6 +185,12 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
         this.efd = efd;
         this.projBytes = projBytes.clone();
         this.unitBytes = projBytes[0] + projBytes[1] + projBytes[2];
+        if (classProj == null || classProj.length == 0 || layerClass == null) {
+            classProj = new long[][] { projBytes.clone() };
+            layerClass = new int[layers];
+        }
+        this.classProj = classProj;
+        this.layerClass = layerClass.clone();
         this.cudaBlockSize = Math.min(256, cudaContext.getDeviceInfo().maxWorkGroupSize());
         this.siluMulFunc = cudaContext.compileKernel("kernels/cuda/silu_mul.cu", "silu_mul");
         this.swigluOaiFunc = cudaContext.compileKernel("kernels/cuda/swiglu_oai.cu", "swiglu_oai");
@@ -242,47 +255,87 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
             ringDone[r] = cudaContext.createEvent(false);
         }
 
-        // Expert weight chunks, each a whole number of units rounded up to the 2 MiB page
-        int perChunk = (int) Math.max(1, CHUNK_TARGET / unitBytes);
-        long chunkBytes = roundUp(perChunk * unitBytes, PAGE);
-        java.util.List<long[]> chunks = new java.util.ArrayList<>(); // [ptr, units]
-        long budget = maxCacheBytes, total = 0;
-        int totalUnits = 0;
+        // Expert weight chunks, each a whole number of one class's units rounded up to the 2 MiB
+        // page. The budget is split so that every layer gets about the same number of units: class
+        // c receives L_c x unitBytes_c of every sum(L x unitBytes) bytes. Chunks are allocated one
+        // class at a time in turn, so a verified allocation that fails (F7) cuts every class short
+        // in proportion rather than starving the last one.
+        int nc = classProj.length;
+        long[] cUnit = new long[nc], cBudget = new long[nc];
+        int[] cLayers = new int[nc];
+        for (int l = 0; l < this.layerClass.length; l++) if (this.layerClass[l] >= 0) cLayers[this.layerClass[l]]++;
+        double wsum = 0;
+        for (int c = 0; c < nc; c++) {
+            cUnit[c] = classProj[c][0] + classProj[c][1] + classProj[c][2];
+            wsum += (double) Math.max(1, cLayers[c]) * cUnit[c];
+        }
+        for (int c = 0; c < nc; c++) cBudget[c] = (long) (maxCacheBytes * (Math.max(1, cLayers[c]) * cUnit[c] / wsum));
+        @SuppressWarnings("unchecked")
+        java.util.List<long[]>[] cChunks = new java.util.List[nc];  // [ptr, units] per class
+        for (int c = 0; c < nc; c++) cChunks[c] = new java.util.ArrayList<>();
+        long total = 0;
         long[] before = cudaContext.getMemoryInfo();
-        while (budget >= unitBytes) {
-            int n = budget >= chunkBytes ? perChunk : (int) (budget / unitBytes);
-            long bytes = roundUp(n * unitBytes, PAGE);
-            while (n > 0 && bytes > budget) { n--; bytes = roundUp(n * unitBytes, PAGE); }
-            if (n <= 0) break;
-            long ptr;
-            try {
-                // Verified allocation: a chunk that lands in shared system memory (WSL2
-                // overcommit) is released and ends the cache there (F7).
-                ptr = cudaContext.allocBufferChecked(bytes, "expert cache chunk");
-            } catch (RuntimeException e) {
-                break; // out of device memory: keep what we have
+        boolean progress = true, full = false;
+        while (progress && !full) {
+            progress = false;
+            for (int c = 0; c < nc && !full; c++) {
+                long ub = cUnit[c];
+                if (cBudget[c] < ub) continue;
+                int perChunk = (int) Math.max(1, CHUNK_TARGET / ub);
+                int n = (int) Math.min(perChunk, cBudget[c] / ub);
+                long bytes = roundUp(n * ub, PAGE);
+                while (n > 0 && bytes > cBudget[c]) { n--; bytes = roundUp(n * ub, PAGE); }
+                if (n <= 0) { cBudget[c] = 0; continue; }
+                long ptr;
+                try {
+                    // Verified allocation: a chunk that lands in shared system memory (WSL2
+                    // overcommit) is released and ends the cache there (F7).
+                    ptr = cudaContext.allocBufferChecked(bytes, "expert cache chunk");
+                } catch (RuntimeException e) {
+                    full = true; // out of device memory: keep what we have
+                    break;
+                }
+                cChunks[c].add(new long[] { ptr, n });
+                cBudget[c] -= bytes;
+                total += bytes;
+                progress = true;
             }
-            chunks.add(new long[] { ptr, n });
-            budget -= bytes;
-            total += bytes;
-            totalUnits += n;
         }
         long[] after = cudaContext.getMemoryInfo();
+        int totalUnits = 0, totalChunks = 0;
+        for (int c = 0; c < nc; c++) {
+            totalChunks += cChunks[c].size();
+            for (long[] ch : cChunks[c]) totalUnits += (int) ch[1];
+        }
         this.units = totalUnits;
         this.deviceBytes = total;
-        this.chunkPtrs = new long[chunks.size()];
+        this.chunkPtrs = new long[totalChunks];
         this.slotPtr = new long[3 * units];
-        int u = 0;
-        for (int c = 0; c < chunks.size(); c++) {
-            long base = chunks.get(c)[0];
-            chunkPtrs[c] = base;
-            for (int i = 0; i < chunks.get(c)[1]; i++, u++) {
-                long off = base + i * unitBytes;
-                slotPtr[3 * u] = off;
-                slotPtr[3 * u + 1] = off + projBytes[0];
-                slotPtr[3 * u + 2] = off + projBytes[0] + projBytes[1];
+        this.unitClass = new int[units];
+        this.classStart = new int[nc + 1];
+        this.classUsed = new int[nc];
+        int u = 0, k = 0;
+        StringBuilder slots = new StringBuilder();
+        for (int c = 0; c < nc; c++) {
+            classStart[c] = u;
+            long[] cp = classProj[c];
+            for (long[] ch : cChunks[c]) {
+                long base = ch[0];
+                chunkPtrs[k++] = base;
+                for (int i = 0; i < ch[1]; i++, u++) {
+                    long off = base + i * cUnit[c];
+                    slotPtr[3 * u] = off;
+                    slotPtr[3 * u + 1] = off + cp[0];
+                    slotPtr[3 * u + 2] = off + cp[0] + cp[1];
+                    unitClass[u] = c;
+                }
             }
+            if (slots.length() > 0) slots.append(", ");
+            slots.append(cp[0]).append('/').append(cp[1]).append('/').append(cp[2]).append(" B");
+            if (nc > 1) slots.append(" x ").append(u - classStart[c]).append(" (").append(cLayers[c]).append(" layers)");
         }
+        classStart[nc] = u;
+        int chunkCount = totalChunks;
         this.count = new int[layers * experts];
         this.unitOf = new int[layers * experts];
         Arrays.fill(unitOf, ABSENT);
@@ -293,10 +346,9 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
         this.slowStreak = new int[layers];
         this.fastStreak = new int[layers];
 
-        System.out.println("  Expert GPU cache: " + units + " experts in " + chunks.size() + " chunks, "
+        System.out.println("  Expert GPU cache: " + units + " experts in " + chunkCount + " chunks, "
             + (total >> 20) + " MiB (cuMemGetInfo delta " + ((before[0] - after[0]) >> 20) + " MiB; slots "
-            + projBytes[0] + "/" + projBytes[1] + "/" + projBytes[2] + " B"
-            + (dp4aOk ? "; dp4a for " + dp4aTypes(types) : "") + ")");
+            + slots + (dp4aOk ? "; dp4a for " + dp4aTypes(types) : "") + ")");
         // Compile the multi-expert kernels now: lazily they would compile inside the first token
         for (GGMLType t : types) {
             if (t == null) continue;
@@ -483,7 +535,9 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
             if (c > bestCount) { bestCount = c; best = e; }
         }
         if (best < 0) return;
-        boolean free = unitsUsed < units;
+        int cls = layerClass[pLayer];
+        if (cls < 0) return;
+        boolean free = classUsed[cls] < classStart[cls + 1] - classStart[cls];
         int unit;
         if (free) {
             unit = victimUnit(Integer.MAX_VALUE, pSelected, pCount, pLayer);
@@ -759,7 +813,7 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
         int r = freeRingSlot(wait);
         if (r < 0) { promotionsSkipped++; return false; }
         int old = unitKey[unit];
-        if (old >= 0) unitOf[old] = ABSENT; else unitsUsed++;
+        if (old >= 0) unitOf[old] = ABSENT; else { unitsUsed++; classUsed[unitClass[unit]]++; }
         unitKey[unit] = key;
         unitOf[key] = PENDING;
         MemorySegment st = ring[r];
@@ -823,12 +877,15 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
     }
 
     /**
-     * A free unit, else the resident unit with the lowest routing count below {@code maxCount}
-     * that is neither in flight nor one of this call's experts; -1 when none qualifies.
+     * A free unit of {@code layer}'s size class, else its resident unit with the lowest routing
+     * count below {@code maxCount} that is neither in flight nor one of this call's experts; -1
+     * when none qualifies.
      */
     private int victimUnit(int maxCount, int[] selected, int n, int layer) {
         int best = -1, bestCount = Integer.MAX_VALUE;
-        for (int u = 0; u < units; u++) {
+        int cls = layer >= 0 && layer < layerClass.length ? layerClass[layer] : -1;
+        if (cls < 0) return -1;
+        for (int u = classStart[cls]; u < classStart[cls + 1]; u++) {
             int key = unitKey[u];
             if (key < 0) return u;
             if (unitOf[key] == PENDING) continue;
@@ -960,8 +1017,8 @@ public class ExpertGpuCache implements it.denzosoft.llmplayer.inference.GpuExper
             int layer = key / experts, e = key - layer * experts;
             FloatTensor[] t = layer < expertTensors.length ? expertTensors[layer] : null;
             if (t == null || unitOf[key] != ABSENT) continue;
-            int unit = victimUnit(Integer.MAX_VALUE, new int[0], 0, -1);
-            if (unit < 0 || unitKey[unit] >= 0) break; // full
+            int unit = victimUnit(Integer.MAX_VALUE, new int[0], 0, layer);
+            if (unit < 0 || unitKey[unit] >= 0) continue; // this layer's size class is full
             enqueue(unit, key, t[0], t[1], t[2], e, true);
             n++;
         }

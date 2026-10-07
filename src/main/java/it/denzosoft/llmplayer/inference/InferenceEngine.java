@@ -558,7 +558,7 @@ public class InferenceEngine {
 
     /**
      * Output bias (E12: optional output.bias for Qwen2 variants — see llama.cpp qwen2.cpp:119-121)
-     * and logit scaling (Command-R multiplies by logitScale; Granite divides by it, as llama.cpp's
+     * and logit scaling (Command-R multiplies by logitScale; Granite and MiniCPM divide by it, as llama.cpp's
      * 1.0f / f_logit_scale) of freshly projected logits.
      */
     private void biasAndScaleLogits(float[] logits) {
@@ -568,8 +568,7 @@ public class InferenceEngine {
             for (int i = 0; i < vocabSize; i++) logits[i] += ob.getFloat(i);
         }
         if (logitScale > 0f) {
-            float scale = (config.architecture() == ModelArchitecture.GRANITE)
-                ? (1.0f / logitScale) : logitScale;
+            float scale = config.logitScaleDivides() ? (1.0f / logitScale) : logitScale;
             for (int i = 0; i < vocabSize; i++) {
                 logits[i] *= scale;
             }

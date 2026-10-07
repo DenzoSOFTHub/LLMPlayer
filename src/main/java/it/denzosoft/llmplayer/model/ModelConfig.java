@@ -29,7 +29,7 @@ public final class ModelConfig {
     private final float yarnLogMultiplier;
     private final float finalLogitSoftCap;
     private final float attnLogitSoftCap;
-    private final float logitScale;
+    private float logitScale;
 
     // Granite-specific scaling factors (mutable — set after construction from metadata)
     private float embeddingScale;  // multiply embeddings after lookup (Granite: 12.0, Gemma: sqrt(dim))
@@ -261,6 +261,13 @@ public final class ModelConfig {
     public float finalLogitSoftCap() { return finalLogitSoftCap; }
     public float attnLogitSoftCap() { return attnLogitSoftCap; }
     public float logitScale() { return logitScale; }
+    /**
+     * True when the output logits are divided by {@link #logitScale()} (Granite, MiniCPM: llama.cpp
+     * {@code 1.0f / f_logit_scale}); otherwise they are multiplied by it (Command-R).
+     */
+    public boolean logitScaleDivides() {
+        return architecture == ModelArchitecture.GRANITE || architecture == ModelArchitecture.MINICPM;
+    }
     public int slidingWindow() { return slidingWindow; }
     public int ssmConvKernel() { return ssmConvKernel; }
     public int ssmStateSize() { return ssmStateSize; }
@@ -416,7 +423,7 @@ public final class ModelConfig {
                 || arch == ModelArchitecture.MISTRAL3 || arch == ModelArchitecture.COMMAND_R
                 || arch == ModelArchitecture.COHERE2
                 || arch == ModelArchitecture.LLAMA4 || arch == ModelArchitecture.SMOLLM3
-                || arch == ModelArchitecture.GRANITE
+                || arch == ModelArchitecture.GRANITE || arch == ModelArchitecture.MINICPM
                 || arch == ModelArchitecture.ERNIE4_5 || arch == ModelArchitecture.GLM4) {
             ropeType = 0;  // ROPE_TYPE_NORMAL
         } else if (arch == ModelArchitecture.QWEN2 || arch == ModelArchitecture.QWEN3
@@ -614,6 +621,16 @@ public final class ModelConfig {
         if (embeddingScale != 0) config.setEmbeddingScale(embeddingScale);
         if (attentionScale != 0) config.setAttentionScale(attentionScale);
         if (residualScale != 0) config.setResidualScale(residualScale);
+
+        // MiniCPM (llama.cpp src/models/minicpm.cpp): muP scaling as in Granite. Older GGUFs omit the
+        // keys, so fall back to scale_emb 12, scale_depth 1.4 and dim_model_base 256. The logits are
+        // divided by hidden_size / dim_model_base, as the Hugging Face model and the converter's
+        // logit_scale do (llama.cpp's fallback 256 / n_embd is the inverse of that).
+        if (arch == ModelArchitecture.MINICPM) {
+            if (embeddingScale == 0) config.setEmbeddingScale(12.0f);
+            if (residualScale == 0) config.setResidualScale((float) (1.4 / Math.sqrt(blockCount)));
+            if (logitScale == 0) config.logitScale = embeddingLength / 256.0f;
+        }
 
         // Gemma 4: attention scale = 1.0 (model handles scaling via QK-norm internally)
         if (arch == ModelArchitecture.GEMMA4 && config.attentionScale() == 0f) {

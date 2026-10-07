@@ -13,12 +13,30 @@ The engine is selected in `LLMEngine.load()` and `ModelLoader`, based on
 
 Handles Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2, Gemma 3, Phi-3/4, Mistral3, Command-R,
 OLMo2, Falcon3, GPT-OSS, Granite 3.3, ERNIE 4.5, Qwen2.5-VL and Qwen3-VL (text backbones),
-Hunyuan dense, Nanbeige, and Spark2.5.
+Hunyuan dense, Nanbeige, Spark2.5, and MiniCPM.
 
 The forward pass runs `TransformerBlock` → `Attention` (GQA with optional QK-norm and bias,
 sliding window, dual RoPE) followed by `SwiGLUFFN` (GeGLU for Gemma). Gemma 2 and Gemma 3 use
 pre- and post-attention/FFN norms plus embedding scaling. Granite 3.3 applies four custom scaling
 factors (embedding, attention, residual, logit) read from the GGUF `granite.*` metadata keys.
+
+**MiniCPM** (`minicpm`: MiniCPM 1/2, MiniCPM4, MiniCPM4.1) is a Llama-style decoder trained with
+muP, so it reuses the Granite scaling path: the embeddings are multiplied by `embedding_scale`
+(`scale_emb`, 12), every attention and FFN output by `residual_scale` (`scale_depth / sqrt(layers)`)
+before the residual add, and the logits are divided by `logit_scale` (`hidden_size /
+dim_model_base`). `ModelConfig.logitScaleDivides()` is the single switch for the division, shared
+by the CPU engine and the CUDA passes. When a GGUF omits the keys, `ModelConfig` falls back to the
+same defaults as llama.cpp for scale_emb and scale_depth, and to `hidden_size / 256` for the logit
+scale, which is what the Hugging Face model divides by. RoPE is NORM (the converter permutes Q/K as
+for Llama). The LongRoPE factors (`rope_factors_short.weight` / `rope_factors_long.weight`) divide
+the rotary frequencies; llama.cpp uses the long factors only past the original context length, which
+for MiniCPM is the trained context, so `ModelLoader` loads the short ones. MiniCPM3 (`minicpm3`,
+MLA attention) is a different architecture and is not supported.
+
+**MiniCPM5** ships as plain `llama` and needs no engine change. Two things differ from a Llama 3
+checkpoint: its BPE pre-tokenizer is `minicpm5` (llama.cpp splits digits into groups of three first,
+then applies the `tokenizer.json` regex, with `ignore_merges`), and its chat template is ChatML,
+which `ChatTemplate` detects from `<|im_start|>` in the template of a `llama` model.
 
 ERNIE 4.5 (`ernie4_5`) is a plain dense transformer that maps directly onto this path: RMSNorm,
 GQA with an explicit `head_dim=128` taken from `attention.key_length` rather than the implied
@@ -304,7 +322,7 @@ and OLMo2 (`<|user|>...<|assistant|>`).
 
 `BPETokenizer.setPreTokenizer` selects a llama.cpp multi-regex pre-tokenizer from
 `tokenizer.ggml.pre` for the models whose splitting the default pattern gets wrong: `hunyuan-dense`,
-`spark2_5` and `bailingmoe`/`bailingmoe2`. The regexes are applied in sequence, each splitting every
+`spark2_5`, `bailingmoe`/`bailingmoe2`, `minimax-m2` and `minicpm5`. The regexes are applied in sequence, each splitting every
 piece produced by the previous one, as llama.cpp's `unicode_regex_split` does.
 
 The templates added with these models: Hunyuan (`<｜hy_User｜>…<｜hy_Assistant｜>`), Spark2.5
@@ -313,6 +331,14 @@ Ling (`<role>HUMAN</role>…<|role_end|><role>ASSISTANT</role>` with `detailed t
 system turn), and Nanbeige (ChatML with its default system prompt and `<think>` handling). A Qwen3
 checkpoint whose template never mentions `<think>` (Qwen3-VL-Instruct, Qwen3-2507-Instruct) no longer
 receives the empty think block.
+
+**ChatML on the `llama` architecture**: MiniCPM5 and Yi ship `general.architecture = llama` with a
+ChatML template. When the template of a `llama` model contains `<|im_start|>`,
+`ChatTemplate.isLlamaChatML` routes it to the ChatML formatter instead of the Llama 3 headers. A
+ChatML template of MiniCPM or of such a `llama` model that honours `enable_thinking` makes the
+model thinking-capable, and the generation prompt then ends exactly as the template's does:
+MiniCPM5 appends `<think>\n` with `--thinking` and an empty `<think>\n\n</think>\n\n` block
+without it, while MiniCPM4.1 appends nothing with `--thinking` and `<think>\n\n</think>\n` without it.
 
 **Olmo 3 detection**: when the `chat_template` metadata contains `<|im_start|>`,
 `ChatTemplate.isOlmo3ChatML` is set to true and the OLMo2 format method switches to ChatML output

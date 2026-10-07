@@ -118,8 +118,16 @@ public interface GpuExpertCache {
         long elementsPerSlice = (long) expertFfnDim * dim;
         long[] proj = new long[3];
         GGMLType first = null;
-        for (FloatTensor[] layer : experts) {
+        // Per-layer slot sizes (F2 step 4): a Q4_K_M model ships some layers' ffn_down_exps as Q6_K
+        // and others as Q4_K, so one slot size for every layer (the largest) wastes the difference
+        // on the smaller layers. Each distinct gate/up/down triple becomes a size class.
+        java.util.List<long[]> classes = new java.util.ArrayList<>();
+        int[] layerClass = new int[experts.length];
+        java.util.Arrays.fill(layerClass, -1);
+        for (int l = 0; l < experts.length; l++) {
+            FloatTensor[] layer = experts[l];
             if (layer == null) continue;
+            long[] triple = new long[3];
             for (int p = 0; p < layer.length && p < 3; p++) {
                 FloatTensor t = layer[p];
                 if (t == null) continue;
@@ -129,11 +137,21 @@ public interface GpuExpertCache {
                     System.out.println("  Expert GPU cache: experts are " + ty + " — using CPU expert path");
                     return null;
                 }
-                proj[p] = Math.max(proj[p], (elementsPerSlice / ty.getBlockSize()) * ty.getTypeSize());
+                triple[p] = ((elementsPerSlice / ty.getBlockSize()) * ty.getTypeSize() + 255) & ~255L; // 256-byte aligned
+                proj[p] = Math.max(proj[p], triple[p]);
             }
+            int c = -1;
+            for (int i = 0; i < classes.size(); i++) if (java.util.Arrays.equals(classes.get(i), triple)) c = i;
+            if (c < 0) { classes.add(triple); c = classes.size() - 1; }
+            layerClass[l] = c;
         }
         if (proj[0] == 0 || proj[1] == 0 || proj[2] == 0) return null;
-        for (int p = 0; p < 3; p++) proj[p] = (proj[p] + 255) & ~255L; // keep every slot 256-byte aligned
+        if ("false".equals(System.getProperty("moe.expert.gpu.classes", "true")) || classes.size() > 8) {
+            // one class sized for the largest slice of every projection, as before
+            classes.clear();
+            classes.add(proj.clone());
+            for (int l = 0; l < layerClass.length; l++) if (layerClass[l] >= 0) layerClass[l] = 0;
+        }
         long unitBytes = proj[0] + proj[1] + proj[2];
         if (maxCacheBytes / unitBytes < 4) {
             System.out.println("  Expert GPU cache: not enough VRAM (" + (maxCacheBytes / unitBytes) + " experts)");
@@ -147,9 +165,9 @@ public interface GpuExpertCache {
                 if (layer != null) for (FloatTensor t : layer) if (t != null) types.add(t.type());
             }
             GpuExpertCache cache = (GpuExpertCache) cacheClass.getConstructor(ctxClass, long.class, long[].class,
-                    int.class, int.class, int.class, int.class, GGMLType[].class)
+                    int.class, int.class, int.class, int.class, GGMLType[].class, long[][].class, int[].class)
                 .newInstance(cudaContext, maxCacheBytes, proj, experts.length, expertCount, dim, expertFfnDim,
-                    types.toArray(new GGMLType[0]));
+                    types.toArray(new GGMLType[0]), classes.toArray(new long[0][]), layerClass);
             cache.bindExperts(experts);
             if (cache.capacityExperts() < 4) {
                 cache.close();

@@ -1,5 +1,27 @@
 # LLMPlayer — What's New
 
+## v1.20.0 — MiniCPM support, ChatML on the llama architecture, GPU expert cache size classes (2026-10-07)
+
+- **MiniCPM support.** The `minicpm` architecture (MiniCPM4, MiniCPM4.1 and the older MiniCPM 1/2)
+  runs on the standard engine. It reuses the Granite muP scaling (embedding × `embedding_scale`,
+  residual × `residual_scale`, logits ÷ `logit_scale`, with the Hugging Face defaults when a GGUF
+  omits the keys), NORM RoPE, and the LongRoPE short factors. MiniCPM5 ships as plain `llama`; it gets
+  the `minicpm5` BPE pre-tokenizer and its ChatML template. MiniCPM3 (`minicpm3`, MLA) is not
+  supported. See `docs/architecture/inference-engines.md`.
+- **ChatML templates on the `llama` architecture** are detected from the GGUF template and no longer
+  receive Llama 3 headers. This applies to MiniCPM5 and to Yi (Yi-Coder-9B-Chat), which had been
+  prompted in the wrong format. A ChatML template that honours `enable_thinking` (MiniCPM5,
+  MiniCPM4.1) enables `--thinking` and reproduces the template's own think-block suffixes.
+- **Size classes in the GPU expert cache.** Slots are sized per layer instead of for the largest
+  slice of any layer, with the budget split so that every layer gets about the same number of
+  units. Qwen3-Coder-30B, whose down projections are Q6_K in half of its layers and Q4_K in the
+  other half, keeps 1116 experts instead of 1047 in the same memory (`-Dmoe.expert.gpu.classes`).
+- **The shared expert of Qwen3-MoE-family models runs in the GPU attention pass by default**
+  (GLM4-MoE, Llama 4), overlapped with the routed experts on the CPU, as in the MLA pass. Validated
+  on a tiny GLM4-MoE model; `-Dmoe.attn.shared=false` restores the per-tensor path.
+- **MoE GPU attention with a rope dimension of 1** failed to start (a 0-byte allocation, then
+  0-block RoPE launches); it runs now.
+
 ## v1.19.1 — Attention score stride fix for Falcon-H1 and Gemma 4 (2026-09-29)
 
 - **Falcon-H1 and Gemma 4 (including Gemma 3n) CPU attention on small states.** Both engines indexed

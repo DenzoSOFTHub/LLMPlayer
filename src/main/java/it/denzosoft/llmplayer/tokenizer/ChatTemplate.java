@@ -13,6 +13,14 @@ public class ChatTemplate {
     private final boolean isGlmVariant;
     // Olmo 3 uses olmo2 GGUF architecture but ships a ChatML-style chat template
     private final boolean isOlmo3ChatML;
+    // MiniCPM5 and Yi ship the llama GGUF architecture with a ChatML template
+    private final boolean isLlamaChatML;
+    // ChatML templates whose generation prompt honours enable_thinking (MiniCPM5, MiniCPM4.1), with
+    // the suffixes they append when it is on and off: MiniCPM5 "<think>\n" / "<think>\n\n</think>\n\n",
+    // MiniCPM4.1 nothing / "<think>\n\n</think>\n"
+    private final boolean hasThinkingToggle;
+    private final String thinkOnSuffix;
+    private final String thinkOffSuffix;
     // Thinking/reasoning mode: when true, models with <think> support will reason before answering.
     // Affects SmolLM3 (/think system msg), Qwen3 (no suppressor), Qwen3.5 (remove suppressor).
     private boolean thinkingEnabled;
@@ -28,6 +36,16 @@ public class ChatTemplate {
         this.isOlmo3ChatML = architecture == ModelArchitecture.OLMO2
                 && chatTemplate != null
                 && chatTemplate.contains("<|im_start|>");
+        this.isLlamaChatML = architecture == ModelArchitecture.LLAMA
+                && chatTemplate != null
+                && chatTemplate.contains("<|im_start|>");
+        this.hasThinkingToggle = (isLlamaChatML || architecture == ModelArchitecture.MINICPM)
+                && chatTemplate != null
+                && chatTemplate.contains("enable_thinking") && chatTemplate.contains("<think>");
+        // Templates write the newlines either literally or as \n escapes inside Jinja strings
+        String t = hasThinkingToggle ? chatTemplate.replace("\\n", "\n") : "";
+        this.thinkOnSuffix = t.contains("enable_thinking is true") ? "<think>\n" : "";
+        this.thinkOffSuffix = t.contains("<think>\n\n</think>\n\n") ? "<think>\n\n</think>\n\n" : "<think>\n\n</think>\n";
     }
 
     public void setThinkingEnabled(boolean enabled) { this.thinkingEnabled = enabled; }
@@ -44,11 +62,12 @@ public class ChatTemplate {
                 || architecture == ModelArchitecture.NANBEIGE
                 || architecture == ModelArchitecture.SPARK2_5
                 || architecture == ModelArchitecture.BAILINGMOE3
+                || hasThinkingToggle
                 || isGlmHybridThinking();
     }
 
     public String formatUserMessage(String userMessage) {
-        if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
+        if ((architecture == ModelArchitecture.LLAMA && !isLlamaChatML) || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3(userMessage);
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35(userMessage);
@@ -56,7 +75,8 @@ public class ChatTemplate {
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
                 || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
-                || architecture == ModelArchitecture.NANBEIGE) {
+                || architecture == ModelArchitecture.NANBEIGE || architecture == ModelArchitecture.MINICPM
+                || isLlamaChatML) {
             return formatQwen(userMessage);
         } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
             return formatHunyuan(userMessage);
@@ -93,7 +113,7 @@ public class ChatTemplate {
     }
 
     public String formatChat(String systemMessage, String userMessage) {
-        if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
+        if ((architecture == ModelArchitecture.LLAMA && !isLlamaChatML) || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3Chat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Chat(systemMessage, userMessage);
@@ -101,7 +121,8 @@ public class ChatTemplate {
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
                 || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
-                || architecture == ModelArchitecture.NANBEIGE) {
+                || architecture == ModelArchitecture.NANBEIGE || architecture == ModelArchitecture.MINICPM
+                || isLlamaChatML) {
             return formatQwenChat(systemMessage, userMessage);
         } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
             return formatHunyuanChat(systemMessage, userMessage);
@@ -321,6 +342,9 @@ public class ChatTemplate {
         if (architecture == ModelArchitecture.NANBEIGE) {
             return thinkingEnabled ? "<think>\n" : "<think>\n\n</think>\n\n";
         }
+        if (hasThinkingToggle) {
+            return thinkingEnabled ? thinkOnSuffix : thinkOffSuffix;
+        }
         return "";
     }
 
@@ -423,7 +447,7 @@ public class ChatTemplate {
      * Returns the formatted prompt ready for tokenization (BOS is handled by the engine).
      */
     public String formatConversation(List<String[]> messages) {
-        if (architecture == ModelArchitecture.LLAMA || architecture == ModelArchitecture.LLAMA4) {
+        if ((architecture == ModelArchitecture.LLAMA && !isLlamaChatML) || architecture == ModelArchitecture.LLAMA4) {
             return formatLlama3Conversation(messages);
         } else if (architecture == ModelArchitecture.QWEN35) {
             return formatQwen35Conversation(messages);
@@ -431,7 +455,8 @@ public class ChatTemplate {
                 || architecture == ModelArchitecture.QWEN3MOE || architecture == ModelArchitecture.SMOLLM3
                 || architecture == ModelArchitecture.NEMOTRON_H
                 || architecture == ModelArchitecture.LFM2 || architecture == ModelArchitecture.FALCON_H1
-                || architecture == ModelArchitecture.NANBEIGE) {
+                || architecture == ModelArchitecture.NANBEIGE || architecture == ModelArchitecture.MINICPM
+                || isLlamaChatML) {
             return formatQwenConversation(messages);
         } else if (architecture == ModelArchitecture.HUNYUAN_DENSE) {
             return formatHunyuanConversation(messages);

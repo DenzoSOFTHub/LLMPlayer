@@ -82,10 +82,12 @@ public final class MoeAttentionCudaPass implements GpuAttentionPass {
     private KernelParams bNormPB, bRopePB, bKvPB, bBiasPB, bHeadPB;
     private GemmF16 gemm; // batched projections through cuBLAS; null: per-token dp4a loop
 
-    // Shared expert on the GPU (F9 step 3, opt-in -Dmoe.attn.shared=true; GLM-4.5 / Llama 4 class
-    // models): queued after the attention download, downloaded by takeSharedExpert after the routed
-    // experts, as MlaAttentionCudaPass does. Not validated on a real model (none available locally).
-    private static final boolean SHARED = "true".equals(System.getProperty("moe.attn.shared", "false"));
+    // Shared expert on the GPU (F9 step 3; GLM-4.5 / Llama 4 class models): queued after the
+    // attention download, so it runs while the CPU computes the routed experts, and downloaded by
+    // takeSharedExpert after them, as MlaAttentionCudaPass does. Validated with teacher-forced logits
+    // on a tiny GLM4-MoE model (relative difference 1.8e-7 against the CPU shared expert); no
+    // full-size model of the family was available to time it. -Dmoe.attn.shared=false disables it.
+    private static final boolean SHARED = !"false".equals(System.getProperty("moe.attn.shared", "true"));
     private boolean[] sharedOnGpu;
     private int sharedFfn;
     private long gpuSh, gpuShG, gpuShU;
@@ -476,7 +478,8 @@ public final class MoeAttentionCudaPass implements GpuAttentionPass {
             perHeadPB.setLong(0, gpuK).setLong(1, gpuKNorm[layer]);
             launch(perHeadFunc, headCountKV, perHeadBlock, perHeadShared, perHeadPB);
         }
-        if (noRopeLayerInterval == 0 || (layer % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
+        // halfRope == 0: no rotated dimension (a zero-sized grid is an invalid launch)
+        if (halfRope > 0 && (noRopeLayerInterval == 0 || (layer % noRopeLayerInterval) != (noRopeLayerInterval - 1))) {
             ropePB.setLong(0, gpuQ).setInt(3, headCount);
             launch(ropeFunc, (headCount * halfRope + blockSize - 1) / blockSize, blockSize, 0, ropePB);
             ropePB.setLong(0, gpuK).setInt(3, headCountKV);
@@ -548,7 +551,7 @@ public final class MoeAttentionCudaPass implements GpuAttentionPass {
                 headNormB(bK, gpuKNorm[layer], headSize, n * headCountKV);
             }
         }
-        if (noRopeLayerInterval == 0 || (layer % noRopeLayerInterval) != (noRopeLayerInterval - 1)) {
+        if (halfRope > 0 && (noRopeLayerInterval == 0 || (layer % noRopeLayerInterval) != (noRopeLayerInterval - 1))) {
             ropeB(bQ, headCount, qDim, n);
             ropeB(bK, headCountKV, kvDim, n);
         }
@@ -631,7 +634,10 @@ public final class MoeAttentionCudaPass implements GpuAttentionPass {
 
     private long uploadArray(CudaBufferManager bm, float[] data) {
         long bytes = (long) data.length * Float.BYTES;
-        long ptr = bm.createBuffer(bytes);
+        // An empty table (no rotated dimensions, e.g. a rope dimension of 1) still needs a valid
+        // pointer: cuMemAlloc rejects 0 bytes with CUDA_ERROR_INVALID_VALUE
+        long ptr = bm.createBuffer(Math.max(bytes, Float.BYTES));
+        if (bytes == 0) return ptr;
         try (Arena temp = Arena.ofConfined()) {
             MemorySegment host = temp.allocate(ValueLayout.JAVA_FLOAT, data.length);
             MemorySegment.copy(data, 0, host, ValueLayout.JAVA_FLOAT, 0, data.length);

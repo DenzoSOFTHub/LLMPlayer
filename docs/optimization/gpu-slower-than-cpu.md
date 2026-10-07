@@ -1635,7 +1635,14 @@ and were fixed after the v1.19.0 release.
   itself (off 163 ms, 1/8 172 ms, 1/4 199 ms).
 - **F2** — per-projection slot sizes (256-byte aligned), 128 MiB chunks, precomputed slot pointers,
   physical size and `cuMemGetInfo` delta printed, `-Dmoe.expert.gpu.cache.mb` / `--gpu-expert-cache`,
-  the cache closed from `LLMEngine.close`. The optional per-layer size class (step 4) was not done.
+  the cache closed from `LLMEngine.close`. The optional per-layer size class (step 4) was added
+  after the v1.19.1 release: every distinct per-layer gate/up/down triple is a size class, the
+  budget is split so that every layer gets about the same number of units, chunks are allocated
+  one class at a time in turn, and victims are searched only in the layer's class
+  (`-Dmoe.expert.gpu.classes=false` restores one class). Qwen3-Coder has 24 layers with a Q6_K down
+  projection and 24 with Q4_K: at the same 3066 MiB the cache holds 1116 experts instead of 1047
+  (+6.6%), with a hit rate of 76.0% against 70.6% and 73.8% in the A-B-A (the times drifted too
+  much to compare).
 - **F3** — per-layer graphs in `MoeAttentionCudaPass` and `MlaAttentionCudaPass` (captured on a
   layer's second call; graph replays checked bit-identical to per-launch runs on the same input with
   `-Dcuda.moe.check=true`, 912 of 960 layer calls in the check replayed a graph), page-locked host
@@ -1654,8 +1661,13 @@ and were fixed after the v1.19.0 release.
   `OutputRouter` times both devices for the output projection and switches with a 20% margin; the
   router tensor stays on the CPU; the per-tensor accumulate is a bulk copy plus a vector add; GPU
   tensors send `matmulRows` / `matmulRowsBatch` to their SIMD twin. The Qwen3-MoE-family shared
-  expert inside `MoeAttentionCudaPass` is implemented but opt-in (`-Dmoe.attn.shared=true`): no model
-  of that family with shared experts is available locally to validate it.
+  expert inside `MoeAttentionCudaPass` (step 3) was validated after the v1.19.1 release on the local
+  tiny GLM4-MoE test model: teacher-forced logits with the shared expert on the GPU and on the CPU
+  differ by 1.8e-7 relative (FP32 rounding), two GPU runs are bit-identical. It is now on by default
+  (`-Dmoe.attn.shared=false` disables it), as in the MLA pass; no full-size model of the family was
+  available to time it. Running the pass on that model also fixed two edge cases: an empty RoPE
+  table (a rope dimension of 1) allocated 0 bytes, which `cuMemAlloc` rejects, and the RoPE launches
+  then had a grid of 0 blocks.
 - **F5** — `int[]` routing tables instead of boxed maps; asynchronous promotion through a page-locked
   ring on a copy stream, the newcomer used only after its copy event; the per-token promotion budget
   keyed on the position (`noteToken`); resident-output downloads queued at launch; a per-layer
@@ -1788,11 +1800,27 @@ found 11 and 15 threads equal. It also exposed the Qwen3.5 CPU attention defect 
 - `--gpu-backend opencl` with the pool on: Llama-3.2-1B completed with correct output on the only
   OpenCL device of this machine, PoCL on the CPU (the signal-handler guard logged its restore).
 
-### 9.6 Not done
+### 9.6 Follow-up after v1.19.1
 
-- F2 step 4 (a per-layer slot size class): optional in the plan, not built.
-- F9 step 3 (the Qwen3-MoE-family shared expert inside `MoeAttentionCudaPass`): built but opt-in
-  (`-Dmoe.attn.shared=true`), because no model of that family with shared experts is available
-  locally to validate it.
-- The full `test-architectures.sh --gpu` sweep and a MiniMax-M2 re-measurement were not run, to
-  keep every test under five minutes; the eight-architecture smoke above replaces the sweep.
+F2 step 4 and F9 step 3 were completed (section 8.2). A GPU smoke over the local models, run in
+blocks of at most five minutes with a short prompt at temperature 0, gave correct answers from
+30 models: Llama-3.2-1B, Qwen2.5-3B, Qwen3-0.6B, Qwen3.5-0.8B, SmolLM3, Gemma-2-2B, Gemma-3-1B,
+Gemma-3n-E4B, Gemma-4-E2B, Phi-3-mini, Phi-4-mini, ERNIE-4.5-0.3B, Hy-MT2-1.8B, Spark-X2.5-1.7B,
+Nanbeige4.2-3B, Granite-3.3-2B, Granite-4.0-h-micro and h-tiny, Falcon3-3B, Falcon-H1-0.5B,
+Nemotron-3-Nano-4B, OLMo-2-1B, LFM2-1.2B, LFM2.5-8B-A1B, Ling-3.0-tiny, Qwen2.5-VL-3B, Qwen3-VL-4B,
+Mistral-7B, aya-23-8B and GLM-4-9B (plus Qwen3-Coder-30B, Qwen3.5-35B-A3B and
+DeepSeek-Coder-V2-Lite from the measurements above). The tiny GLM4-MoE model, whose weights are
+random, ran through the GPU attention pass.
+
+Found and not resolved:
+
+- **Olmo-3-7B answers with a single `<|im_start|>`.** The same happens on the CPU and with the GPU
+  build from before this work, so it is an older defect, most likely in its chat template (the
+  prompt carries an injected function-calling system message), not in the GPU path.
+- **aya-23-8B decodes at 1.7 tok/s** although the plan puts all 32 layers on the GPU (5334 MB of
+  6140 estimated). An 8B model on this GPU should be several times faster. The suspicion, not
+  verified, is that part of it lands in WSL2's shared memory (the 256K-token output projection is
+  large, and the VRAM guard does not cover every allocation of the dense pass).
+- **Gemma-3n-E4B decodes at 2.0 tok/s**; whether that is its usual speed was not checked.
+- The MiniMax-M2 re-measurement and the remaining large models (GLM-4.7-Flash, GPT-OSS-20B,
+  Devstral-24B) were not run in the smoke.

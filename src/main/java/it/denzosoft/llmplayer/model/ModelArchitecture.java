@@ -30,7 +30,8 @@ public enum ModelArchitecture {
     HUNYUAN_DENSE("hunyuan-dense"),
     NANBEIGE("nanbeige"),
     SPARK2_5("spark2_5"),
-    BAILINGMOE3("bailingmoe3");
+    BAILINGMOE3("bailingmoe3"),
+    MINICPM("minicpm");
 
     private final String ggufName;
 

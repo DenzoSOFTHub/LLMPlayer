@@ -8,7 +8,7 @@ When producing documentation (README, BENCHMARKS, REST-API, FINE-TUNING, TOOL-CA
 
 ## Project Overview
 
-LLMPlayer is a pure Java LLM inference engine (v1.19.1) that runs GGUF models locally with **zero external dependencies** — only the JDK. It supports 30 architectures (plus aliased variants: Qwen2.5-VL, Qwen3-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE, the Qwen3-TTS talker) across nine inference engines and 20 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). Every one of those formats has a dedicated CUDA tensor class for GPU acceleration.
+LLMPlayer is a pure Java LLM inference engine (v1.20.0) that runs GGUF models locally with **zero external dependencies** — only the JDK. It supports 31 architectures (plus aliased variants: Qwen2.5-VL, Qwen3-VL, Qwen3.5-MoE, LFM2-MoE, GLM4-MoE, the Qwen3-TTS talker) across nine inference engines and 20 quantized formats (F32, F16, BF16, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4). Every one of those formats has a dedicated CUDA tensor class for GPU acceleration.
 
 Beyond text generation it includes image input for Qwen3-VL, Qwen3.5 and Qwen2.5-VL (llama.cpp `mmproj` files), Qwen3-TTS text-to-speech, CUDA GPU acceleration with graph mode, thinking/reasoning mode, architecture-aware tool calling, HuggingFace model download, JMX metrics, automated kernel autosearch, and a built-in LoRA fine-tuning pipeline.
 
@@ -137,7 +137,7 @@ Selected in `LLMEngine.load()` and `ModelLoader`. **Full per-engine detail is in
 
 | Engine | Architectures | Shape |
 |---|---|---|
-| `InferenceEngine` | Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2/3, Phi-3/4, Mistral3, Command-R, OLMo2, Falcon3, GPT-OSS, Granite 3.3, ERNIE 4.5, Qwen2.5-VL/Qwen3-VL text, Hunyuan dense, Nanbeige (looped), Spark2.5 | Standard `TransformerBlock` → GQA `Attention` + `SwiGLUFFN` |
+| `InferenceEngine` | Llama, Qwen2, Qwen3, SmolLM3, GLM4, Gemma 2/3, Phi-3/4, Mistral3, Command-R, OLMo2, Falcon3, GPT-OSS, Granite 3.3, ERNIE 4.5, Qwen2.5-VL/Qwen3-VL text, Hunyuan dense, Nanbeige (looped), Spark2.5, MiniCPM | Standard `TransformerBlock` → GQA `Attention` + `SwiGLUFFN` |
 | `DeepSeek2InferenceEngine` | DeepSeek2, GLM-4.7-Flash | MLA + MoE FFN with shared expert |
 | `Qwen3MoEInferenceEngine` | Qwen3-Coder-30B-A3B, Llama 4 MoE, GLM4 MoE (`glm4moe`, GLM-4.5/4.6/4.7), MiniMax-M2 (`minimax-m2`) | GQA with QK-norm + MoE FFN with shared expert; sigmoid + `exp_probs_b` routing for GLM4 MoE and MiniMax-M2 (whose QK-norm spans the whole projection); attention half on the GPU via `MoeAttentionCudaPass` |
 | `Qwen35InferenceEngine` | Qwen3.5, Qwen3.5-MoE (`qwen35moe`) | Hybrid Gated DeltaNet + full attention, 3:1 ratio; softmax-routed MoE FFN (`SoftmaxMoe`) for the MoE variant |
@@ -320,6 +320,6 @@ Tool calling is architecture-aware: SmolLM3 uses Hermes-style XML (`<tool_call>`
 | `docs/models/*.md` | Per-model reports (37 files) — check here first when debugging a specific model |
 | `PERFORMANCE-ANALYSIS.md` | Detailed per-kernel profiling |
 
-**`ANALYSIS.md` is a historical document** (roughly v1.2, early 2026) and its counts are stale — it says 21 architectures and 16 CUDA kernels against today's 30 and 20. Its own header says as much. Do not treat it as current state.
+**`ANALYSIS.md` is a historical document** (roughly v1.2, early 2026) and its counts are stale — it says 21 architectures and 16 CUDA kernels against today's 31 and 20. Its own header says as much. Do not treat it as current state.
 
 Current best measured throughput: Llama-3.2-1B Q4_K_M at **55.8 tok/s** in CUDA graph mode on an RTX 4050 Laptop GPU.

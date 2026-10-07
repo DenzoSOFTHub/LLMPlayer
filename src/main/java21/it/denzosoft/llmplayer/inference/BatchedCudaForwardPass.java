@@ -310,8 +310,7 @@ public class BatchedCudaForwardPass implements AutoCloseable {
         if (config.noRopeLayerInterval() != 0) return false;    // NoPE layers out of scope
         if (config.residualScale() > 0 || config.attentionScale() > 0) return false; // Granite scaling
         if (config.embeddingScale() > 0f) return false;         // Gemma-style scaling out of scope
-        if (config.logitScale() > 0
-            && config.architecture() == it.denzosoft.llmplayer.model.ModelArchitecture.GRANITE) return false;
+        if (config.logitScale() > 0 && config.logitScaleDivides()) return false;
 
         if (weights.output() == null || !(weights.output() instanceof CudaFloatTensor)) return false;
 
